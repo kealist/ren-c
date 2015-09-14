@@ -137,6 +137,7 @@ extern int Do_Callback(REBSER *obj, u32 name, RXIARG *args, RXIARG *result);
 			"**         broken-case-semantics: false\n"
 			"**         do-runs-functions: false\n"
 			"**         do-raises-errors: false\n"
+			"**         refinements-true: false\n"
 			"**     ]\n"
 			"**\n"
 			"** Use `do <r3-legacy>` to enable more compatibility wrappers.\n"
