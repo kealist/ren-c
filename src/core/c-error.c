@@ -42,6 +42,12 @@
 //
 void Snap_State_Core(struct Reb_State *s)
 {
+    // See remarks in Set_Stack_Limit() for why this is needed as part of
+    // PUSH_UNHALTABLE_TRAP, in light of multithreading as in Ren Garden.
+    // It's not ideal, but it works around a problem for the moment.
+    //
+    s->stack_limit = Stack_Limit;
+
     s->dsp = DSP;
     s->top_chunk = TG_Top_Chunk;
 
@@ -56,7 +62,7 @@ void Snap_State_Core(struct Reb_State *s)
 
     s->manuals_len = SER_LEN(GC_Manuals);
     s->uni_buf_len = SER_LEN(UNI_BUF);
-    s->mold_loop_tail = ARR_LEN(MOLD_STACK);
+    s->mold_loop_tail = ARR_LEN(TG_Mold_Stack);
 
     // !!! Is this initialization necessary?
     s->error = NULL;
@@ -133,7 +139,7 @@ void Assert_State_Balanced_Debug(
     }
 
     assert(s->uni_buf_len == SER_LEN(UNI_BUF));
-    assert(s->mold_loop_tail == ARR_LEN(MOLD_STACK));
+    assert(s->mold_loop_tail == ARR_LEN(TG_Mold_Stack));
 
     assert(s->error == NULL); // !!! necessary?
 }
@@ -211,9 +217,10 @@ REBOOL Trapped_Helper_Halted(struct Reb_State *s)
     TG_Pushing_Mold = FALSE;
 #endif
 
-    TERM_ARRAY_LEN(MOLD_STACK, s->mold_loop_tail);
+    SET_SERIES_LEN(TG_Mold_Stack, s->mold_loop_tail);
 
     Saved_State = s->last_state;
+    Stack_Limit = s->stack_limit;
 
     return halted;
 }
@@ -330,7 +337,7 @@ ATTRIBUTE_NO_RETURN void Fail_Core(const void *p)
     // raised, then it had the thrown argument set.  Trash it in debug
     // builds.  (The value will not be kept alive, it is not seen by GC)
     //
-    SET_UNREADABLE_BLANK(&TG_Thrown_Arg);
+    Init_Unreadable_Blank(&TG_Thrown_Arg);
 
     LONG_JUMP(Saved_State->cpu_state, 1);
 }

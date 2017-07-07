@@ -2022,7 +2022,7 @@ static REBARR *Scan_Array(
                 //
                 DECLARE_LOCAL (cell);
                 PUSH_GUARD_ARRAY(array);
-                SET_UNREADABLE_BLANK(cell);
+                Init_Unreadable_Blank(cell);
                 PUSH_GUARD_VALUE(cell);
 
                 dispatcher(cell, kind, KNOWN(ARR_AT(array, 1))); // may fail()
@@ -2424,13 +2424,14 @@ const REBYTE *Scan_Issue(REBVAL *out, const REBYTE *cp, REBCNT len)
         case LEX_CLASS_SPECIAL: { // Flag all but first special char
             REBCNT c = GET_LEX_VALUE(*bp);
             if (!(LEX_SPECIAL_APOSTROPHE == c
-                || LEX_SPECIAL_COMMA  == c
+                || LEX_SPECIAL_COMMA == c
                 || LEX_SPECIAL_PERIOD == c
-                || LEX_SPECIAL_PLUS   == c
-                || LEX_SPECIAL_MINUS  == c
-                || LEX_SPECIAL_TILDE  == c
+                || LEX_SPECIAL_PLUS == c
+                || LEX_SPECIAL_MINUS == c
+                || LEX_SPECIAL_TILDE == c
                 || LEX_SPECIAL_BAR == c
                 || LEX_SPECIAL_BLANK == c
+                || LEX_SPECIAL_COLON == c
             )) {
                 return NULL; // will trigger error
             }}

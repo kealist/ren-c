@@ -802,25 +802,25 @@ static void Init_Root_Vars(void)
     // BUF_UTF8 not initialized, can't init function tags yet
     //(at least not how Init_Function_Tags() is written)
     //
-    SET_UNREADABLE_BLANK(ROOT_WITH_TAG);
-    SET_UNREADABLE_BLANK(ROOT_ELLIPSIS_TAG);
-    SET_UNREADABLE_BLANK(ROOT_OPT_TAG);
-    SET_UNREADABLE_BLANK(ROOT_END_TAG);
-    SET_UNREADABLE_BLANK(ROOT_LOCAL_TAG);
-    SET_UNREADABLE_BLANK(ROOT_DURABLE_TAG);
+    Init_Unreadable_Blank(ROOT_WITH_TAG);
+    Init_Unreadable_Blank(ROOT_ELLIPSIS_TAG);
+    Init_Unreadable_Blank(ROOT_OPT_TAG);
+    Init_Unreadable_Blank(ROOT_END_TAG);
+    Init_Unreadable_Blank(ROOT_LOCAL_TAG);
+    Init_Unreadable_Blank(ROOT_DURABLE_TAG);
 
     // Evaluator not initialized, can't do system construction yet
     //
-    SET_UNREADABLE_BLANK(ROOT_SYSTEM);
+    Init_Unreadable_Blank(ROOT_SYSTEM);
 
     // Data stack not initialized, can't do typeset construction yet
     // (at least not how Startup_Typesets() is written)
     //
-    SET_UNREADABLE_BLANK(ROOT_TYPESETS);
+    Init_Unreadable_Blank(ROOT_TYPESETS);
 
     // Symbols system not initialized, can't init the function meta shim yet
     //
-    SET_UNREADABLE_BLANK(ROOT_FUNCTION_META);
+    Init_Unreadable_Blank(ROOT_FUNCTION_META);
 
     TERM_ARRAY_LEN(root, ROOT_MAX);
     ASSERT_ARRAY(root);
@@ -954,8 +954,8 @@ static void Init_Break_Point(void)
         if(break_at > 0) {
             Debug_Str(
                 "**\n"
-                "** R3_ALWAYS_MALLOC is TRUE in environment variable!\n"
-                "** Memory allocations aren't pooled, expect slowness...\n"
+                "** R3_BREAK_AT is set in environment variable!\n"
+                "** Will break in Do_Core or crash (if not launched by a debugger)\n"
                 "**\n"
             );
             TG_Break_At = cast(REBUPT, break_at);
@@ -1010,7 +1010,7 @@ void Startup_Task(void)
     // seen by the GC.
     //
     Prep_Global_Cell(&TG_Thrown_Arg);
-    SET_UNREADABLE_BLANK(&TG_Thrown_Arg);
+    Init_Unreadable_Blank(&TG_Thrown_Arg);
 
     Startup_Raw_Print();
     Startup_Scanner();
@@ -1019,12 +1019,46 @@ void Startup_Task(void)
 
     // Symbols system not initialized, can't init the errors just yet
     //
-    SET_UNREADABLE_BLANK(TASK_HALT_ERROR);
-    SET_UNREADABLE_BLANK(TASK_STACK_ERROR);
+    Init_Unreadable_Blank(TASK_HALT_ERROR);
+    Init_Unreadable_Blank(TASK_STACK_ERROR);
 
     TERM_ARRAY_LEN(task, TASK_MAX);
     ASSERT_ARRAY(task);
     MANAGE_ARRAY(task);
+}
+
+
+//
+//  Set_Stack_Limit: C
+//
+// See C_STACK_OVERFLOWING for remarks on this **non-standard** technique of
+// stack overflow detection.  Note that each thread would have its own stack
+// address limits, so this has to be updated for threading.
+//
+// Note that R3-Alpha tried to use a trick to determine whether the stack grew
+// up or down.  This is even less likely to work, and the solutions that might
+// actually work are too wacky to justify using:
+//
+// http://stackoverflow.com/a/33222085/211160
+//
+// So it's better to go with a build configuration #define.  Note that stacks
+// growing up is uncommon (e.g. Debian hppa architecture)
+//
+// Currently, this is called every time PUSH_UNHALTABLE_TRAP() is called, and
+// hopefully only one instance of it per thread will be in effect (otherwise,
+// the bounds would add and be useless).
+//
+void Set_Stack_Limit(void *base) {
+    REBUPT bounds;
+    bounds = cast(REBUPT, OS_CONFIG(1, 0));
+    if (bounds == 0)
+        bounds = cast(REBUPT, STACK_BOUNDS);
+
+#ifdef OS_STACK_GROWS_UP
+    Stack_Limit = cast(REBUPT, base) + bounds;
+#else
+    Stack_Limit = cast(REBUPT, base) - bounds;
+#endif
 }
 
 
@@ -1059,29 +1093,17 @@ void Startup_Core(void)
 //
 //==//////////////////////////////////////////////////////////////////////==//
 
-    // See C_STACK_OVERFLOWING for remarks on this **non-standard** technique
-    // of stack overflow detection.  Note that each thread would have its
-    // own stack address limits, so this has to be updated for threading.
-    //
-    // Note that R3-Alpha tried to use a trick (which it got wrong) to
-    // determine whether the stack grew up or down.  This doesn't work, and
-    // the solutions that might actually work are too wacky to justify using:
-    //
-    // http://stackoverflow.com/a/33222085/211160
-    //
-    // So it's better to go with a build configuration #define.  Note that
-    // stacks growing up is uncommon (e.g. Debian hppa architecture)
+    // The general trick of the moment is to have PUSH_UNHALTABLE_TRAP reset
+    // the stack limit.  This is because even with a single evaluator used
+    // on multiple threads, you have to trap errors to make sure an attempt
+    // is not made to longjmp the state to an address from another thread--
+    // hence every thread switch must also be a site of trapping all errors.
+    // However, if we are to use any routines which call C_STACK_OVERFLOWING
+    // in the code below before we've actually pushed a trap, we must start
+    // up the stack limit to something valid.
 
-    REBUPT bounds;
-    bounds = cast(REBUPT, OS_CONFIG(1, 0));
-    if (bounds == 0)
-        bounds = cast(REBUPT, STACK_BOUNDS);
-
-#ifdef OS_STACK_GROWS_UP
-    Stack_Limit = cast(REBUPT, &bounds) + bounds;
-#else
-    Stack_Limit = cast(REBUPT, &bounds) - bounds;
-#endif
+    int dummy; // variable whose address acts as base of stack for below code
+    Set_Stack_Limit(&dummy);
 
 //==//////////////////////////////////////////////////////////////////////==//
 //
@@ -1238,7 +1260,7 @@ void Startup_Core(void)
     Add_Lib_Keys_R3Alpha_Cant_Make();
 
     Prep_Global_Cell(&Callback_Error);
-    SET_UNREADABLE_BLANK(&Callback_Error);
+    Init_Unreadable_Blank(&Callback_Error);
 
 //==//////////////////////////////////////////////////////////////////////==//
 //

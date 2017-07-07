@@ -79,7 +79,7 @@ to-c-name: function [
         true [ ;-- !!! See notes above, don't change to an ELSE!
             ;
             ; If these symbols occur composite in a longer word, they use a
-            ; shorthand; e.g. `true?` => `true_q`
+            ; shorthand; e.g. `foo?` => `foo_q`
 
             for-each [reb c] [
                 -   "_"
@@ -202,17 +202,11 @@ binary-to-c: function [
 ]
 
 
-; !!! WARNING: Bootstrap needs to stay working with R3-Alpha.  So don't
-; assume this is safe for using with RETURN...because under R3-Alpha that
-; will basically act as a BREAK, returning from the FOR-EACH-RECORD but not
-; respecting the intention of the RETURN at the callsite.  (Used to have
-; the alarmist name FOR-EACH-RECORD-NO-RETURN, but that was overkill.)
-;
 for-each-record: procedure [
     {Iterate a table with a header by creating an object for each row}
 
-    'record [word!]
-        {Word to set each time to the row made into an object}
+    'var [word!]
+        {Word to set each time to the row made into an object record}
     table [block!]
         {Table of values with header block as first element}
     body [block!]
@@ -244,9 +238,20 @@ for-each-record: procedure [
             ]
         ]
 
-        set record has spec
 
-        do body
+        eval func compose [(var) <local> return] compose [
+            ;
+            ; Instead of just DO body, deliberately override RETURN to avoid
+            ; mistakes using it in R3-Alpha.
+            ;
+            return: does [
+                fail [
+                    "RETURN can't work in R3-Alpha in FOR-EACH-RECORD"
+                    "(it is non-definitional, and returns from the wrapper)"
+                ]
+            ]
+            (body)
+        ] has spec
     ]
 
     ; In Ren-C, to return a result this would have to be marked as returning
@@ -306,7 +311,7 @@ parse-args: function [
 
 fix-win32-path: func [
     path [file!]
-    /local letter colon
+    <local> letter colon
 ][
     if 3 != fourth system/version [return path] ;non-windows system
 

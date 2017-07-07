@@ -52,7 +52,7 @@ core: [
     ; (F)???
     f-blocks.c
     f-deci.c
-    [f-dtoa.c <no-uninitialized> <implicit-fallthu>]
+    [f-dtoa.c <no-uninitialized> <implicit-fallthru>]
     f-enbase.c
     f-extension.c
     f-int.c
@@ -146,10 +146,10 @@ core: [
 
     ; (U)??? (3rd-party code extractions)
     u-compress.c
-    [u-md5.c <implicit-fallthu>]
+    [u-md5.c <implicit-fallthru>]
     u-parse.c
-    [u-sha1.c <implicit-fallthu>]
-    [u-zlib.c <no-make-header> <implicit-fallthu>]
+    [u-sha1.c <implicit-fallthru>]
+    [u-zlib.c <no-make-header> <implicit-fallthru>]
 ]
 
 ; Files created by the make-boot process
@@ -159,6 +159,13 @@ generated: [
     tmp-evaltypes.c
     tmp-maketypes.c
     tmp-comptypes.c
+]
+
+libuuid: [
+    ../extensions/uuid/libuuid/gen_uuid.c
+    ../extensions/uuid/libuuid/unpack.c
+    ../extensions/uuid/libuuid/pack.c
+    ../extensions/uuid/libuuid/randutils.c
 ]
 
 modules: [
@@ -195,6 +202,10 @@ modules: [
     BMP ../extensions/bmp/mod-bmp.c []
 
     Locale ../extensions/locale/mod-locale.c []
+
+    UUID ../extensions/uuid/mod-uuid.c [
+        ;if Linux
+    ]
 ]
 
 extensions: [
@@ -206,6 +217,7 @@ extensions: [
     + JPG ../extensions/jpg/ext-jpg.c [JPG] _
     + BMP ../extensions/bmp/ext-bmp.c [BMP] _
     + Locale ../extensions/locale/ext-locale.c [Locale] ../extensions/locale/ext-locale-init.reb
+    + UUID ../extensions/uuid/ext-uuid.c [UUID] ../extensions/uuid/ext-uuid-init.reb
 ]
 
 made: [

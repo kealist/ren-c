@@ -639,7 +639,7 @@ macro(add_module name source other)
         )
     add_custom_command(OUTPUT
         ${GENERATED_MOD_${u_name}_HEADER}
-        COMMAND ${REBOL} ${TOOLS_DIR}/make-ext-natives.r SRC=${source} MODULE=${name} OUTDIR=${TOP_GENERATED_SRC_DIR}
+        COMMAND ${REBOL} ${TOOLS_DIR}/make-ext-natives.r SRC=${source} MODULE=${name} OUTDIR=${TOP_GENERATED_SRC_DIR} OS_ID=${R3_OS_ID}
         DEPENDS
         ${TOOL_DEPENDS}
         ${TOOLS_DIR}/make-ext-natives.r
@@ -842,6 +842,19 @@ add_module(
 )
 add_extension(
     r3-locale Locale TRUE "${EXT_DIR}/locale/ext-locale.c" "Locale" "${EXT_DIR}/locale/ext-locale-init.reb"
+    "${TOP_GENERATED_SRC_DIR}/include;${TOP_SRC_DIR}/include;${FFI_INCLUDE_DIRS};${INC}"
+    "${COMMON_MACROS}"
+)
+
+# Locale extension
+#
+add_module(
+    UUID
+    "${EXT_DIR}/uuid/mod-uuid.c"
+    ""
+)
+add_extension(
+    r3-uuid UUID TRUE "${EXT_DIR}/uuid/ext-uuid.c" "UUID" "${EXT_DIR}/uuid/ext-uuid-init.reb"
     "${TOP_GENERATED_SRC_DIR}/include;${TOP_SRC_DIR}/include;${FFI_INCLUDE_DIRS};${INC}"
     "${COMMON_MACROS}"
 )

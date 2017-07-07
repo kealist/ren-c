@@ -106,7 +106,7 @@ assert-debug: function [
                     |
                 (blank? bad-result) "blank"
                     |
-                (false? bad-result) "false"
+                (bad-result = false) "false"
             ])
             ":"
             expr
@@ -172,7 +172,7 @@ delta-time: function [
 delta-profile: func [
     {Delta-profile of running a specific block.}
     block [block!]
-    /local start end
+    <local> start end
 ][
     start: values-of stats/profile
     do block

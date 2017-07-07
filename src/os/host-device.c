@@ -58,24 +58,24 @@
 **
 ***********************************************************************/
 
-extern REBDEV Dev_StdIO;
-extern REBDEV Dev_File;
-extern REBDEV Dev_Event;
-extern REBDEV Dev_Net;
-extern REBDEV Dev_DNS;
+EXTERN_C REBDEV Dev_StdIO;
+EXTERN_C REBDEV Dev_File;
+EXTERN_C REBDEV Dev_Event;
+EXTERN_C REBDEV Dev_Net;
+EXTERN_C REBDEV Dev_DNS;
 
 #ifdef TO_WINDOWS
-extern REBDEV Dev_Clipboard;
+EXTERN_C REBDEV Dev_Clipboard;
 #endif
 
 // There should be a better decoupling of these devices so the core
 // does not need to know about them...
 #if defined(TO_WINDOWS) || defined(TO_LINUX)
-extern REBDEV Dev_Serial;
+EXTERN_C REBDEV Dev_Serial;
 #endif
 
 #ifdef HAS_POSIX_SIGNAL
-extern REBDEV Dev_Signal;
+EXTERN_C REBDEV Dev_Signal;
 #endif
 
 REBDEV *Devices[RDI_LIMIT] =
@@ -355,24 +355,6 @@ int OS_Do_Device(REBREQ *req, REBCNT command)
 
 
 //
-//  OS_Devreq_Size: C
-//
-// Ask the Devreq size for the device
-//
-int OS_Devreq_Size(int device)
-{
-    REBDEV *dev;
-
-    // Validate device:
-    if (device >= RDI_MAX || !(dev = Devices[device]))
-        return 0;
-
-    return dev->commands[RDC_DEVREQ_SIZE](NULL);
-}
-
-
-
-//
 //  OS_Make_Devreq: C
 //
 REBREQ *OS_Make_Devreq(int device)
@@ -383,9 +365,8 @@ REBREQ *OS_Make_Devreq(int device)
     if (device >= RDI_MAX || !(dev = Devices[device]))
         return 0;
 
-    i32 size = OS_Devreq_Size(device);
-    REBREQ *req = cast (REBREQ *, OS_ALLOC_MEM(size));
-    memset(req, 0, size);
+    REBREQ *req = cast (REBREQ *, OS_ALLOC_MEM(dev->req_size));
+    memset(req, 0, dev->req_size);
     SET_FLAG(req->flags, RRF_ALLOC);
     req->device = device;
 
@@ -522,15 +503,4 @@ REBINT OS_Wait(REBCNT millisec, REBCNT res)
     OS_Do_Device(&req, RDC_QUERY); // wait for timer or other event
 
     return 1;  // layer above should check delta again
-}
-
-
-
-//
-//  Request_Size_Rebreq: C
-//
-i32 Request_Size_Rebreq(REBREQ *req)
-{
-    UNUSED(req);
-    return sizeof(REBREQ); //no special fields
 }

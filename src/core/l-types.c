@@ -42,7 +42,7 @@
 //
 
 #define return_NULL \
-    do { SET_UNREADABLE_BLANK(out); return NULL; } while (TRUE)
+    do { Init_Unreadable_Blank(out); return NULL; } while (TRUE)
 
 
 //
@@ -232,21 +232,6 @@ REBNATIVE(to)
         kind = VAL_TYPE_KIND(type);
     else
         kind = VAL_TYPE(type);
-
-    // !!! The only thing you can TO convert a blank into is a BLANK!.  This
-    // allows one to sort of opt-out:
-    //
-    //    kind: get-kind-maybe-blank x y z
-    //    if blank? converted: to kind value [...]
-    //
-    // Is this a good rule, or should types be able to have a custom behavior
-    // for the TO of a blank conversion into them?
-    //
-    if (IS_BLANK(arg)) {
-        if (kind == REB_BLANK)
-            return R_BLANK;
-        fail (arg);
-    }
 
     TO_FUNC dispatcher = To_Dispatch[kind];
     if (dispatcher == NULL)
@@ -1292,7 +1277,7 @@ REBNATIVE(scan_net_header)
                         SPECIFIED // no relative values added
                     );
                     val = Alloc_Tail_Array(array);
-                    SET_UNREADABLE_BLANK(val); // for Init_Block
+                    Init_Unreadable_Blank(val); // for Init_Block
                     Init_Block(item + 1, array);
                 }
                 break;
