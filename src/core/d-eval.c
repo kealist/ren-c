@@ -28,13 +28,8 @@
 //=////////////////////////////////////////////////////////////////////////=//
 //
 // Due to the length of Do_Core() and how many debug checks it already has,
-// three debug-only routines are separated out:
-//
-// * Do_Core_Entry_Checks_Debug() runs once at the beginning of a Do_Core()
-//   call.  It verifies that the fields of the frame the caller has to
-//   provide have been pre-filled correctly, and snapshots bits of the
-//   interpreter state that are supposed to "balance back to zero" by the
-//   end of a run (assuming it completes, and doesn't longjmp from fail()ing)
+// some debug-only routines are separated out here.  (Note that these are in
+// addition to the checks already done by Push_Frame() and Drop_Frame() time)
 //
 // * Do_Core_Expression_Checks_Debug() runs before each full "expression"
 //   is evaluated, e.g. before each DO/NEXT step.  It makes sure the state
@@ -56,151 +51,51 @@
 
 #if !defined(NDEBUG)
 
-
 //
 //  Dump_Frame_Location: C
 //
-void Dump_Frame_Location(REBFRM *f)
+void Dump_Frame_Location(const RELVAL *current, REBFRM *f)
 {
-    DECLARE_LOCAL (dump);
-    Derelativize(dump, f->value, f->specifier);
-
-    printf("Dump_Frame_Location() value\n");
-    PROBE(dump);
-
-    if (f->flags.bits & DO_FLAG_VA_LIST) {
+    if (FRM_IS_VALIST(f)) {
         //
-        // NOTE: This reifies the va_list in the frame, and hence has
-        // side effects.  It may need to be commented out if the
-        // problem you are trapping with DO_COUNT_BREAKPOINT was
-        // specifically with va_list frame processing.
+        // NOTE: This reifies the va_list in the frame, and hence has side
+        // effects.  It may need to be commented out if the problem you are
+        // trapping with TICK_BREAKPOINT or C-DEBUG-BREAK was specifically
+        // related to va_list frame processing.
         //
         const REBOOL truncated = TRUE;
         Reify_Va_To_Array_In_Frame(f, truncated);
     }
 
-    if (f->pending && NOT_END(f->pending)) {
-        assert(IS_SPECIFIC(f->pending));
-        printf("EVAL in progress, so next will be...\n");
-        PROBE(const_KNOWN(f->pending));
+    DECLARE_LOCAL (dump);
+
+    if (current != NULL) {
+        Derelativize(dump, current, f->specifier);
+        printf("Dump_Frame_Location() current\n");
+        PROBE(dump);
     }
 
-    if (IS_END(f->value)) {
-        printf("...then Dump_Frame_Location() at end of array\n");
+    if (f->value != NULL) {
+        Derelativize(dump, f->value, f->specifier);
+        printf("Dump_Frame_Location() next\n");
+        PROBE(dump);
+    }
+
+    if (FRM_AT_END(f)) {
+        printf("...then Dump_Frame_Location() is at end of array\n");
     }
     else {
+        printf("Dump_Frame_Location() rest\n");
+
         Init_Any_Series_At_Core(
             dump,
             REB_BLOCK,
             SER(f->source.array),
-            cast(REBCNT, f->index),
+            cast(REBCNT, f->source.index),
             f->specifier
         );
-
-        printf("Dump_Frame_Location() next input\n");
         PROBE(dump);
     }
-}
-
-
-//
-//  Do_Core_Entry_Checks_Debug: C
-//
-void Do_Core_Entry_Checks_Debug(REBFRM *f)
-{
-    // Though we can protect the value written into the target pointer 'out'
-    // from GC during the course of evaluation, we can't protect the
-    // underlying value from relocation.  Technically this would be a problem
-    // for any series which might be modified while this call is running, but
-    // most notably it applies to the data stack--where output used to always
-    // be returned.
-    //
-    // !!! A non-contiguous data stack which is not a series is a possibility.
-    //
-#ifdef STRESS_CHECK_DO_OUT_POINTER
-    REBSER *containing = Try_Find_Containing_Series_Debug(f->out);
-
-    if (containing) {
-        if (GET_SER_FLAG(containing, SERIES_FLAG_FIXED_SIZE)) {
-            //
-            // Currently it's considered OK to be writing into a fixed size
-            // series, for instance the durable portion of a function's
-            // arg storage.  It's assumed that the memory will not move
-            // during the course of the argument evaluation.
-            //
-        }
-        else {
-            printf("Request for ->out location in movable series memory\n");
-            panic (containing);
-        }
-    }
-#else
-    assert(!IN_DATA_STACK_DEBUG(f->out));
-#endif
-
-    Assert_Cell_Writable(f->out, __FILE__, __LINE__);
-
-    // Caller should have pushed the frame, such that it is the topmost.
-    // This way, repeated calls to Do_Core(), e.g. by routines like ANY []
-    // don't keep pushing and popping on each call.
-    //
-    assert(f == FS_TOP);
-
-    // The arguments to functions in their frame are exposed via FRAME!s
-    // and through WORD!s.  This means that if you try to do an evaluation
-    // directly into one of those argument slots, and run arbitrary code
-    // which also *reads* those argument slots...there could be trouble with
-    // reading and writing overlapping locations.  So unless a function is
-    // in the argument fulfillment stage (before the variables or frame are
-    // accessible by user code), it's not legal to write directly into an
-    // argument slot.  :-/  Note the availability of D_CELL for any functions
-    // that have more than one argument, during their run.
-    //
-    REBFRM *ftemp = FS_TOP->prior;
-    for (; ftemp != NULL; ftemp = ftemp->prior) {
-        if (!Is_Any_Function_Frame(ftemp))
-            continue;
-        if (Is_Function_Frame_Fulfilling(ftemp))
-            continue;
-        assert(
-            f->out < ftemp->args_head ||
-            f->out >= ftemp->args_head + FRM_NUM_ARGS(ftemp)
-        );
-    }
-
-    // The caller must preload ->value with the first value to process.  It
-    // may be resident in the array passed that will be used to fetch further
-    // values, or it may not.
-    //
-    assert(f->value);
-
-    assert(f->flags.bits & NODE_FLAG_END);
-    assert(NOT(f->flags.bits & NODE_FLAG_CELL));
-
-    // f->label is set to NULL by Do_Core()
-
-#if !defined(NDEBUG)
-    f->label_debug = NULL;
-
-    if (
-        NOT(FRM_IS_VALIST(f))
-        && GET_SER_FLAG(f->source.array, SERIES_FLAG_FILE_LINE)
-    ){
-        f->file_debug = cast(
-            const char*, STR_HEAD(SER(f->source.array)->link.filename)
-        );
-        f->line_debug = SER(f->source.array)->misc.line;
-    }
-    else {
-        f->file_debug = "(no file info)";
-        f->line_debug = 0;
-    }
-#endif
-
-    // All callers should ensure that the type isn't an END marker before
-    // bothering to invoke Do_Core().
-    //
-    assert(NOT_END(f->value));
 }
 
 
@@ -218,22 +113,24 @@ static void Do_Core_Shared_Checks_Debug(REBFRM *f) {
     // imbalanced state discovered on an exit.
     //
 #ifdef BALANCE_CHECK_EVERY_EVALUATION_STEP
-    ASSERT_STATE_BALANCED(&f->state_debug);
+    ASSERT_STATE_BALANCED(&f->state);
 #endif
 
     assert(f == FS_TOP);
-    assert(f->state_debug.top_chunk == TG_Top_Chunk);
-    /* assert(DSP == f->dsp_orig); */ // !!! not true now with push SET-WORD!
+    assert(f->state.top_chunk == TG_Top_Chunk);
+    assert(DSP == f->dsp_orig);
 
-    if (f->flags.bits & DO_FLAG_VA_LIST)
-        assert(f->index == TRASHED_INDEX);
-    else {
+    if (f->source.array != NULL) {
+        assert(NOT(IS_POINTER_TRASH_DEBUG(f->source.array)));
         assert(
-            f->index != TRASHED_INDEX
-            && f->index != END_FLAG
-            && f->index != THROWN_FLAG
-            && f->index != VA_LIST_FLAG
+            f->source.index != TRASHED_INDEX
+            && f->source.index != END_FLAG
+            && f->source.index != THROWN_FLAG
+            && f->source.index != VA_LIST_FLAG
         ); // END, THROWN, VA_LIST only used by wrappers
+    }
+    else {
+        assert(f->source.index == TRASHED_INDEX);
     }
 
     // If this fires, it means that Flip_Series_To_White was not called an
@@ -247,15 +144,23 @@ static void Do_Core_Shared_Checks_Debug(REBFRM *f) {
         assert(Get_Opt_Var_May_Fail(f->value, f->specifier) == f->gotten);
     }
 
+    // We only have a label if we are in the middle of running a function,
+    // and if we're not running a function then f->phase should be NULL.
+    //
+    assert(f->phase == NULL);
+    assert(IS_POINTER_TRASH_DEBUG(f->opt_label));
+
+    assert(NOT(IS_TRASH_DEBUG(&f->cell)));
+
     //=//// ^-- ABOVE CHECKS *ALWAYS* APPLY ///////////////////////////////=//
 
-    if (IS_END(f->value))
+    if (FRM_AT_END(f))
         return;
 
     if (NOT_END(f->out) && THROWN(f->out))
         return;
 
-    assert(f->kind_debug == VAL_TYPE(f->value));
+    assert(f->kind == VAL_TYPE(f->value));
 
     //=//// v-- BELOW CHECKS ONLY APPLY IN EXITS CASE WITH MORE CODE //////=//
 
@@ -272,7 +177,7 @@ static void Do_Core_Shared_Checks_Debug(REBFRM *f) {
     );
 
     assert(f->value);
-    assert(NOT_END(f->value));
+    assert(FRM_HAS_MORE(f));
     assert(NOT(THROWN(f->value)));
     ASSERT_VALUE_MANAGED(f->value);
     assert(f->value != f->out);
@@ -290,31 +195,34 @@ static void Do_Core_Shared_Checks_Debug(REBFRM *f) {
 // making the code shareable allows code paths that jump to later spots
 // in the switch (vs. starting at the top) to reuse the work.
 //
-REBUPT Do_Core_Expression_Checks_Debug(REBFRM *f) {
+void Do_Core_Expression_Checks_Debug(REBFRM *f) {
 
     assert(f == FS_TOP); // should be topmost frame, still
 
     Do_Core_Shared_Checks_Debug(f);
+
+    // The only thing the evaluator can take for granted between evaluations
+    // about the output cell is that it's not trash.  In the debug build,
+    // give this more teeth by explicitly setting it to an unreadable blank,
+    // but only if it wasn't an END marker (that's how we can tell no
+    // evaluations have been done yet, consider `(comment [...] + 2)`)
+    //
+    assert(NOT(IS_TRASH_DEBUG(f->out)));
+    if (NOT(IS_UNREADABLE_IF_DEBUG(f->out)) && NOT_END(f->out))
+        Init_Unreadable_Blank(f->out);
 
     // Once a throw is started, no new expressions may be evaluated until
     // that throw gets handled.
     //
     assert(IS_UNREADABLE_IF_DEBUG(&TG_Thrown_Arg));
 
-    assert(f->label == NULL); // release build initializes this
-
-#if !defined(NDEBUG)
-    assert(f->label_debug == NULL); // marked debug to point out debug only
-#endif
-
-    // Make sure `cell` is trash in debug build if not doing a `reevaluate`.
-    // It does not have to be GC safe (for reasons explained below).  We
-    // also need to reset evaluation to normal vs. a kind of "inline quoting"
-    // in case EVAL/ONLY had enabled that.
+    // Make sure `cell` is reset in debug build if not doing a `reevaluate`
+    // (once this was used by EVAL the native, but now it's used by rebEval()
+    // at the API level, which currently sets `f->value = &f->cell;`)
     //
 #if !defined(NDEBUG)
     if (f->value != &f->cell)
-        TRASH_CELL_IF_DEBUG(&f->cell);
+        Init_Unreadable_Blank(&f->cell);
 #endif
 
     // Trash call variables in debug build to make sure they're not reused.
@@ -331,26 +239,15 @@ REBUPT Do_Core_Expression_Checks_Debug(REBFRM *f) {
     TRASH_POINTER_IF_DEBUG(f->varlist);
 
     TRASH_POINTER_IF_DEBUG(f->original);
-    TRASH_POINTER_IF_DEBUG(f->phase);
     TRASH_POINTER_IF_DEBUG(f->binding);
 
     // Mutate va_list sources into arrays at fairly random moments in the
     // debug build.  It should be able to handle it at any time.
     //
-    if ((f->flags.bits & DO_FLAG_VA_LIST) && SPORADICALLY(50)) {
+    if (FRM_IS_VALIST(f) && SPORADICALLY(50)) {
         const REBOOL truncated = TRUE;
         Reify_Va_To_Array_In_Frame(f, truncated);
     }
-
-    // We bound the count at the max unsigned 32-bit, since otherwise it would
-    // roll over to zero and print a message that wasn't asked for, which
-    // is annoying even in a debug build.  (It's actually a REBUPT, so this
-    // wastes possible bits in the 64-bit build, but there's no MAX_REBUPT.)
-    //
-    if (TG_Do_Count < MAX_U32)
-        f->do_count_debug = ++TG_Do_Count;
-
-    return f->do_count_debug;
 }
 
 
@@ -358,40 +255,31 @@ REBUPT Do_Core_Expression_Checks_Debug(REBFRM *f) {
 //  Do_Core_Exit_Checks_Debug: C
 //
 void Do_Core_Exit_Checks_Debug(REBFRM *f) {
-    //
-    // To keep from slowing down the debug build too much, this is not put in
-    // the shared checks.  But if it fires and it's hard to figure out which
-    // exact cycle caused the problem, re-add it in the shared checks.
-    //
-    ASSERT_STATE_BALANCED(&f->state_debug);
-
     Do_Core_Shared_Checks_Debug(f);
 
-    if (NOT_END(f->value) && NOT(f->flags.bits & DO_FLAG_VA_LIST)) {
+    if (NOT(FRM_AT_END(f)) && NOT(FRM_IS_VALIST(f))) {
         assert(
-            (f->index <= ARR_LEN(f->source.array))
+            (f->source.index <= ARR_LEN(f->source.array))
             || (
                 (
-                    (f->pending && IS_END(f->pending))
+                    (f->source.pending && IS_END(f->source.pending))
                     || THROWN(f->out)
                 )
-                && f->index == ARR_LEN(f->source.array) + 1
+                && f->source.index == ARR_LEN(f->source.array) + 1
             )
         );
     }
 
     if (f->flags.bits & DO_FLAG_TO_END)
-        assert(THROWN(f->out) || IS_END(f->value));
+        assert(THROWN(f->out) || FRM_AT_END(f));
 
     // Function execution should have written *some* actual output value.
     // checking the VAL_TYPE() is enough to make sure it's not END or trash
     //
     assert(VAL_TYPE(f->out) <= REB_MAX_VOID);
 
-    if (NOT(THROWN(f->out))) {
-        assert(f->label == NULL);
+    if (NOT(THROWN(f->out)))
         ASSERT_VALUE_MANAGED(f->out);
-    }
 }
 
 #endif

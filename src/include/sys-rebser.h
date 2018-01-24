@@ -92,6 +92,10 @@
 // also prefer the header vs. info?  Such separation might help with caching.
 //
 
+#define SERIES_MASK_NONE \
+    0 // helps locate places that want to say "no flags"
+
+
 //=//// ARRAY_FLAG_VOIDS_LEGAL ////////////////////////////////////////////=//
 //
 // Identifies arrays in which it is legal to have void elements.  This is true
@@ -121,10 +125,13 @@
 //
 // !!! Strictly speaking, SERIES_FLAG_NO_RELOCATE could be different
 // from fixed size... if there would be a reason to reallocate besides
-// changing size (such as memory compaction).
+// changing size (such as memory compaction).  For now, just make the two
+// equivalent but let the callsite distinguish the intent.
 //
 #define SERIES_FLAG_FIXED_SIZE \
     FLAGIT_LEFT(GENERAL_SERIES_BIT + 0)
+
+#define SERIES_FLAG_DONT_RELOCATE SERIES_FLAG_FIXED_SIZE
 
 
 //=//// SERIES_FLAG_FILE_LINE /////////////////////////////////////////////=//
@@ -242,7 +249,7 @@
 // are flattened in kind of a wasteful way...some are mutually exclusive and
 // could use the same bit, if needed.
 //
-#if defined(__cplusplus) && (__cplusplus >= 201103L)
+#ifdef CPLUSPLUS_11
     static_assert(GENERAL_SERIES_BIT + 7 < 16, "SERIES_FLAG_XXX too high");
 #endif
 
@@ -310,7 +317,7 @@
 // size or values from modification.  It is the usermode analogue of
 // SERIES_INFO_FROZEN, but can be reversed.
 //
-// Note: There is a feature in PROTECT (VALUE_FLAG_PROTECTED) which protects
+// Note: There is a feature in PROTECT (CELL_FLAG_PROTECTED) which protects
 // a certain variable in a context from being changed.  It is similar, but
 // distinct.  SERIES_INFO_PROTECTED is a protection on a series itself--which
 // ends up affecting all values with that series in the payload.
@@ -321,16 +328,20 @@
     FLAGIT_LEFT(5)
 
 
-//=//// SERIES_INFO_RUNNING ///////////////////////////////////////////////=//
+//=//// SERIES_INFO_HOLD //////////////////////////////////////////////////=//
 //
-// Set in the header while a DO is happening on (or a PARSE, etc.) and gives
-// it a temporarily protected state.  It will be released when the execution
-// is finished, which distinguishes it from SERIES_INFO_FROZEN, from which it
-// will never come back, as long as it lives...
+// Set in the header whenever some stack-based operation wants a temporary
+// hold on a series, to give it a protected state.  This will happen with a
+// DO, or PARSE, or enumerations.  Even REMOVE-EACH will transition the series
+// it is operating on into a HOLD state while the removal signals are being
+// gathered, and apply all the removals at once before releasing the hold.
+//
+// It will be released when the execution is finished, which distinguishes it
+// from SERIES_INFO_FROZEN, which will never be reset, as long as it lives...
 //
 // Note: Same bit as NODE_FLAG_SPECIAL, should not be relevant.
 // 
-#define SERIES_INFO_RUNNING \
+#define SERIES_INFO_HOLD \
     FLAGIT_LEFT(6)
 
 
@@ -420,27 +431,13 @@
     FLAGIT_LEFT(12)
 
 
-#if !defined(NDEBUG)
-    //=//// SERIES_INFO_LEGACY_DEBUG //////////////////////////////////////=//
-    //
-    // This is a flag which is marked at the root set of the body of legacy
-    // functions.  It can be used in a dynamic examination of a call to see if
-    // it "originates from legacy code".  This is a vague concept given the
-    // ability to create blocks and run them--so functions like COPY would
-    // have to propagate the flag to make it "more accurate".  But it's good
-    // enough for casual compatibility in many cases.
-    //
-    #define SERIES_INFO_LEGACY_DEBUG \
-        FLAGIT_LEFT(13)
-#endif
-
 // ^-- STOP AT FLAGIT_LEFT(15) --^
 //
 // The rightmost 16 bits of the series info is used to store an 8 bit length
 // for non-dynamic series and an 8 bit width of the series.  So the info
 // flags need to stop at FLAGIT_LEFT(15).
 //
-#if defined(__cplusplus) && (__cplusplus >= 201103L)
+#ifdef CPLUSPLUS_11
     static_assert(13 < 16, "SERIES_INFO_XXX too high");
 #endif
 
@@ -537,14 +534,217 @@ union Reb_Series_Content {
     //
     // (See NODE_FLAG_END and NODE_FLAG_CELL for how this is done.)
     //
-    RELVAL values[1];
+    // We do not use a RELVAL here, because it would rule out making simple
+    // assignments of one series's content to another, as the assignment
+    // operator is disabled in the C++ build.  But the value may be relative
+    // or specific.
+    //
+    struct Reb_Cell values[1];
+};
+
+
+union Reb_Series_Link {
+    //
+    // If you assign one member in a union and read from another, then that's
+    // technically undefined behavior.  But this field is used as the one
+    // that is "trashed" in the debug build when the series is created, and
+    // hopefully it will lead to the other fields reading garbage (vs. zero)
+    //
+#if !defined(NDEBUG)
+    void *trash;
+#endif
+
+    // Ordinary source series use their ->link field to point to an
+    // interned file name string from which the code was loaded.  If a
+    // series was not created from a file, then the information from the
+    // source that was running at the time is propagated into the new
+    // second-generation series.
+    //
+    REBSTR *file;
+
+    // REBCTX types use this field of their varlist (which is the identity of
+    // an ANY-CONTEXT!) to find their "keylist".  It is stored in the REBSER
+    // node of the varlist REBARR vs. in the REBVAL of the ANY-CONTEXT! so
+    // that the keylist can be changed without needing to update all the
+    // REBVALs for that object.
+    //
+    // It may be a simple REBARR* -or- in the case of the varlist of a running
+    // FRAME! on the stack, it points to a REBFRM*.  If it's a FRAME! that
+    // is not running on the stack, it will be the function paramlist of the
+    // actual phase that function is for.  Since REBFRM* all start with a
+    // REBVAL cell, this means NODE_FLAG_CELL can be used on the node to
+    // discern the case where it can be cast to a REBFRM* vs. REBARR*.
+    //
+    // (Note: FRAME!s used to use a field `misc.f` to track the associated
+    // frame...but that prevented the ability to SET-META on a frame.  While
+    // that feature may not be essential, it seems awkward to not allow it
+    // since it's allowed for other ANY-CONTEXT!s.  Also, it turns out that
+    // FRAME! values have to get their keylist via the specifically applicable
+    // ->phase field anyway, and it's a faster test to check this for
+    // NODE_FLAG_CELL than to separately extract the CTX_TYPE() and treat
+    // frames differently.)
+    //
+    // It is done as a base-class REBNOD* as opposed to a union in order to
+    // not run afoul of C's rules, by which you cannot assign one member of
+    // a union and then read from another.
+    //
+    REBNOD *keysource;
+
+    // The facade is a REBARR which is a proxy for the paramlist of the
+    // underlying frame which is pushed when a function is called.  For
+    // instance, if a specialization of APPEND provides the value to
+    // append, that removes a parameter from the paramlist.  So the
+    // specialization will not have the value.  However, the frame that
+    // needs to be pushed for the call ultimately needs to have the
+    // value--so it must be pushed.
+    //
+    // Originally this was done just by caching the paramlist of the
+    // "underlying" function.  However, that can be limiting if one wants
+    // to constrain the types or change the parameter classes.  The facade
+    // *can* be the the paramlist of the underlying function, but it is
+    // not necessarily.
+    //
+    REBARR *facade;
+
+    // For REBSTR, circularly linked list of othEr-CaSed string forms
+    //
+    REBSTR *synonym;
+
+    // On Reb_Function body_holders, this is the specialization frame for
+    // a function--or NULL if none.
+    //
+    REBCTX *exemplar;
+
+    // The MAP! datatype uses this.
+    //
+    REBSER *hashlist;
+
+    // for STRUCT, this is a "REBFLD" array.  It parallels an object's
+    // keylist, giving not only names of the fields in the structure but
+    // also the types and sizes.
+    //
+    // !!! The Atronix FFI has been gradually moved away from having its
+    // hooks directly into the low-level implemetation and the garbage
+    // collector.  With the conversion of REBFLD to a REBARR instead of
+    // a custom C type, it is one step closer to making STRUCT! a very
+    // OBJECT!-like type extension.  When there is a full story told on
+    // user-defined types, this should be excisable from the core.
+    //
+    REBFLD *schema;
+
+    // For LIBRARY!, the file descriptor.  This is set to NULL when the
+    // library is not loaded.
+    //
+    // !!! As with some other types, this may not need the optimization of
+    // being in the Reb_Series node--but be handled via user defined types
+    //
+    void *fd;
+};
+
+
+// The `misc` field is an extra pointer-sized piece of data which is resident
+// in the series node, and hence visible to all REBVALs that might be
+// referring to the series.
+//
+union Reb_Series_Misc {
+    //
+    // Used to preload bad data in the debug build; see notes on link.trash
+    //
+#if !defined(NDEBUG)
+    void *trash;
+#endif
+
+    // Ordinary source series store the line number here.  It probably
+    // could have some bits taken out of it, vs. being a full 32-bit
+    // integer on 32-bit platforms.
+    //
+    REBUPT line;
+
+    // For REBSTR the canon cased form of this symbol, if it isn't canon
+    // itself.  If it *is* a canon, then the field is free and is used
+    // instead for `bind_index`
+    //
+    REBSTR *canon;
+
+    // When binding words into a context, it's necessary to keep a table
+    // mapping those words to indices in the context's keylist.  R3-Alpha
+    // had a global "binding table" for the spellings of words, where
+    // those spellings were not garbage collected.  Ren-C uses REBSERs
+    // to store word spellings, and then has a hash table indexing them.
+    //
+    // So the "binding table" is chosen to be indices reachable from the
+    // REBSER nodes of the words themselves.  If it were necessary for
+    // multiple clients to have bindings at the same time, this could be
+    // done through a pointer that would "pop out" into some kind of
+    // linked list.  For now, the binding API just demonstrates having
+    // up to 2 different indices in effect at once.
+    //
+    // Note that binding indices can be negative, so the sign can be used
+    // to encode a property of that particular binding.
+    //
+    struct {
+        int high:16;
+        int low:16;
+    } bind_index;
+
+    // FUNCTION! paramlists and ANY-CONTEXT! varlists can store a "meta"
+    // object.  It's where information for HELP is saved, and it's how modules
+    // store out-of-band information that doesn't appear in their body.
+    //
+    REBCTX *meta;
+
+    // When copying arrays, it's necessary to keep a map from source series
+    // to their corresponding new copied series.  This allows multiple
+    // appearances of the same identities in the source to give corresponding
+    // appearances of the same *copied* identity in the target, and also is
+    // integral to avoiding problems with cyclic structures.
+    //
+    // As with the `bind_index` above, the cheapest way to build such a map is
+    // to put the forward into the series node itself.  However, when copying
+    // a generic series the bits are all used up.  So the ->misc field is
+    // temporarily "co-opted"...its content taken out of the node and put into
+    // the forwarding entry.  Then the index of the forwarding entry is put
+    // here.  At the end of the copy, all the ->misc fields are restored.
+    //
+    REBDSP forwarding;
+
+    // native dispatcher code, see Reb_Function's body_holder
+    //
+    REBNAT dispatcher;
+
+    // some HANDLE!s use this for GC finalization
+    //
+    CLEANUP_FUNC cleaner;
+
+    // Because a bitset can get very large, the negation state is stored
+    // as a boolean in the series.  Since negating a bitset is intended
+    // to affect all values, it has to be stored somewhere that all
+    // REBVALs would see a change--hence the field is in the series.
+    //
+    REBOOL negated;
+
+    // used for vectors and bitsets
+    //
+    REBCNT size;
+
+    // used for IMAGE!
+    //
+    // !!! The optimization by which images live in a single REBSER vs.
+    // actually being a class of OBJECT! with something like an ordinary
+    // PAIR! for its size is superfluous, and would be excised when it
+    // is possible to make images a user-defined type.
+    //
+    struct {
+        int wide:16; // Note: bitfields can only be int
+        int high:16;
+    } area;
 };
 
 
 struct Reb_Series {
-
+    //
     // The low 2 bits in the header must be 00 if this is an "ordinary" REBSER
-    // node.  This allows such nodes to implicitly terminate a "doubular"
+    // node.  This allows such nodes to implicitly terminate a "pairing"
     // REBSER node, that is being used as storage for exactly 2 REBVALs.
     // As long as there aren't two of those REBSERs sequentially in the pool,
     // an unused node or a used ordinary one can terminate it.
@@ -560,7 +760,8 @@ struct Reb_Series {
 
     // The `link` field is generally used for pointers to something that
     // when updated, all references to this series would want to be able
-    // to see.
+    // to see.  This cannot be done (easily) for properties that are held
+    // in REBVAL cells directly.
     //
     // This field is in the second pointer-sized slot in the REBSER node to
     // push the `content` so it is 64-bit aligned on 32-bit platforms.  This
@@ -568,59 +769,16 @@ struct Reb_Series {
     // it is on a 64-bit boundary to start with...in order to position its
     // "payload" which might need to be 64-bit aligned as well.
     //
-    union {
-        // Ordinary source series use their ->link field to point to an
-        // interned file name string from which the code was loaded.  If a
-        // series was not created from a file, then the information from the
-        // source that was running at the time is propagated into the new
-        // second-generation series.
-        //
-        REBSTR *filename;
+    // Use the LINK() macro to acquire this field...don't access directly.
+    //
+    union Reb_Series_Link link_private;
 
-        // REBCTX types use this to point from the varlist (the object's
-        // values, which is the identity of the object) to the keylist.  One
-        // reason why this is stored in the REBSER node of the varlist REBARR
-        // as opposed to in the REBVAL of the ANY-CONTEXT! is so that the
-        // keylist can be changed without needing to update all the REBVALs
-        // for that object.
-        //
-        // (Note: The main reason a keylist pointer needs to change--at least
-        // at the moment--is when an object instance is expanded, and the
-        // keylist needs to be disconnected from sharing with other objects.)
-        //
-        REBARR *keylist;
-
-        // paramlists and keylists can store a "meta" object
-        //
-        REBCTX *meta;
-
-        // For REBSTR, circularly linked list of othEr-CaSed string forms
-        //
-        REBSTR *synonym;
-
-        // On Reb_Function body_holders, this is the specialization frame for
-        // a function--or NULL if none.
-        //
-        REBCTX *exemplar;
-
-        // The MAP! datatype uses this.
-        //
-        REBSER *hashlist;
-
-        // for STRUCT, this is a "REBFLD" array.  It parallels an object's
-        // keylist, giving not only names of the fields in the structure but
-        // also the types and sizes.
-        //
-        // !!! The Atronix FFI has been gradually moved away from having its
-        // hooks directly into the low-level implemetation and the garbage
-        // collector.  With the conversion of REBFLD to a REBARR instead of
-        // a custom C type, it is one step closer to making STRUCT! a very
-        // OBJECT!-like type extension.  When there is a full story told on
-        // user-defined types, this should be excisable from the core.
-        //
-        REBARR *schema;
-    } link;
-
+    // `content` is the sizeof(REBVAL) data for the series, which is thus
+    // 4 platform pointers in size.  If the series is small enough, the header
+    // contains the size in bytes and the content lives literally in these
+    // bits.  If it's too large, it will instead be a pointer and tracking
+    // information for another allocation.
+    //
     union Reb_Series_Content content;
 
     // `info` is the information about the series which needs to be known
@@ -638,106 +796,45 @@ struct Reb_Series {
     //
     struct Reb_Header info;
 
-    // The `misc` field is an extra pointer-sized piece of data which is
-    // resident in the series node, and hence visible to all REBVALs that
-    // might be referring to the series.
+    // This is the second pointer-sized piece of series data that is used
+    // for various purposes.  It is similar to ->link, however at some points
+    // it can be temporarily "corrupted", since copying extracts it into a
+    // forwarding entry and co-opts `misc.forwarding` to point to that entry.
+    // It can be recovered...but one must know one is copying and go through
+    // the forwarding.
     //
-    union {
-        // Ordinary source series store the line number here.  It probably
-        // could have some bits taken out of it, vs. being a full 32-bit
-        // integer on 32-bit platforms.
-        //
-        REBUPT line;
-
-        // native dispatcher code, see Reb_Function's body_holder
-        //
-        REBNAT dispatcher;
-
-        // The facade is a REBARR which is a proxy for the paramlist of the
-        // underlying frame which is pushed when a function is called.  For
-        // instance, if a specialization of APPEND provides the value to
-        // append, that removes a parameter from the paramlist.  So the
-        // specialization will not have the value.  However, the frame that
-        // needs to be pushed for the call ultimately needs to have the
-        // value--so it must be pushed.
-        //
-        // Originally this was done just by caching the paramlist of the
-        // "underlying" function.  However, that can be limiting if one wants
-        // to constrain the types or change the parameter classes.  The facade
-        // *can* be the the paramlist of the underlying function, but it is
-        // not necessarily.
-        //
-        REBARR *facade;
-
-        // If this is the varlist of the REBCTX of a FRAME! series, this is
-        // the Reb_Frame pointer containing the C runtime state of the frame.
-        // If the call corresponding to the frame is no longer on the stack,
-        // then this will be NULL.
-        //
-        REBFRM *f;
-
-        // For REBSTR the canon cased form of this symbol, if it isn't canon
-        // itself.  If it *is* a canon, then the field is free and is used
-        // instead for `bind_index`
-        //
-        REBSTR *canon;
-        
-        // When binding words into a context, it's necessary to keep a table
-        // mapping those words to indices in the context's keylist.  R3-Alpha
-        // had a global "binding table" for the spellings of words, where
-        // those spellings were not garbage collected.  Ren-C uses REBSERs
-        // to store word spellings, and then has a hash table indexing them.
-        //
-        // So the "binding table" is chosen to be indices reachable from the
-        // REBSER nodes of the words themselves.  If it were necessary for
-        // multiple clients to have bindings at the same time, this could be
-        // done through a pointer that would "pop out" into some kind of
-        // linked list.  For now, the binding API just demonstrates having
-        // up to 2 different indices in effect at once.
-        //
-        struct {
-            REBINT high:16;
-            REBINT low:16;
-        } bind_index;
-
-        // some HANDLE!s use this for GC finalization
-        //
-        CLEANUP_FUNC cleaner;
-
-        // Because a bitset can get very large, the negation state is stored
-        // as a boolean in the series.  Since negating a bitset is intended
-        // to affect all values, it has to be stored somewhere that all
-        // REBVALs would see a change--hence the field is in the series.
-        //
-        REBOOL negated;
-
-        // used for vectors and bitsets
-        //
-        REBCNT size;
-
-        // For LIBRARY!, the file descriptor.  This is set to NULL when the
-        // library is not loaded.
-        //
-        // !!! As with some other types, this may not need the optimization of
-        // being in the Reb_Series node--but be handled via user defined types
-        //
-        void *fd;
-
-        // used for IMAGE!
-        //
-        // !!! The optimization by which images live in a single REBSER vs.
-        // actually being a class of OBJECT! with something like an ordinary
-        // PAIR! for its size is superfluous, and would be excised when it
-        // is possible to make images a user-defined type.
-        //
-        struct {
-            REBCNT wide:16;
-            REBCNT high:16;
-        } area;
-    } misc;
+    // Currently it is assumed no one needs the ->misc while forwarding is in
+    // effect...but the MISC() macro checks that.  Don't access this directly.
+    //
+    union Reb_Series_Misc misc_private;
 
 #if !defined(NDEBUG)
     int *guard; // intentionally alloc'd and freed for use by Panic_Series
-    REBUPT do_count; // also maintains sizeof(REBSER) % sizeof(REBI64) == 0
+    REBUPT tick; // also maintains sizeof(REBSER) % sizeof(REBI64) == 0
 #endif
 };
+
+
+// No special assertion needed for link at this time, since it is never
+// co-opted for other purposes.
+//
+#define LINK(s) \
+    SER(s)->link_private
+
+
+// Currently only the C++ build does the check that ->misc is not being used
+// at a time when it is forwarded out for copying.  If the C build were to
+// do it, then it would be forced to go through a pointer access to do any
+// writing...which would likely be less efficient.
+//
+#ifdef CPLUSPLUS_11
+    inline static union Reb_Series_Misc& Get_Series_Misc(REBSER *s) {
+        return s->misc_private;
+    }
+
+    #define MISC(s) \
+        Get_Series_Misc(SER(s))
+#else
+    #define MISC(s) \
+        SER(s)->misc_private
+#endif

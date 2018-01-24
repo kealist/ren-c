@@ -48,7 +48,7 @@
 #include "sys-core.h"
 #include "sys-ext.h"
 
-#include "sha256/sha256.h" // depends on Reb-C for REBCNT, REBYTE
+#include "sha256/sha256.h" // depends on %reb-c.h for u8, u32, u64
 
 #include "tmp-mod-crypt-first.h"
 
@@ -106,7 +106,7 @@ static void cleanup_rc4_ctx(const REBVAL *v)
 //
 //  "Encrypt/decrypt data (modifies) using RC4 algorithm."
 //
-//      return: [handle!]
+//      return: [handle! logic!]
 //          "Returns stream cipher context handle."
 //      /key
 //          "Provided only for the first time to get stream HANDLE!"
@@ -148,10 +148,14 @@ static REBNATIVE(rc4)
         return R_TRUE;
     }
 
-    if (IS_BINARY(ARG(crypt_key))) { // Key defined - setup new context
+    if (REF(key)) { // Key defined - setup new context
         RC4_CTX *rc4_ctx = ALLOC_ZEROFILL(RC4_CTX);
 
-        RC4_setup(rc4_ctx, VAL_BIN_AT(ARG(key)), VAL_LEN_AT(ARG(key)));
+        RC4_setup(
+            rc4_ctx,
+            VAL_BIN_AT(ARG(crypt_key)),
+            VAL_LEN_AT(ARG(crypt_key))
+        );
 
         Init_Handle_Managed(D_OUT, rc4_ctx, 0, &cleanup_rc4_ctx);
         return R_OUT;
@@ -647,9 +651,8 @@ REBNATIVE(sha256)
     REBCNT index;
     REBCNT len;
     REBSER *series;
-    if (NOT(VAL_BYTE_SIZE(ARG(data)))) { // wide string
-        series = Temp_Bin_Str_Managed(ARG(data), &index, &len);
-    }
+    if (IS_STRING(ARG(data)))
+        series = Temp_UTF8_At_Managed(ARG(data), &index, &len);
     else {
         series = VAL_SERIES(ARG(data));
         index = VAL_INDEX(ARG(data));
@@ -707,7 +710,7 @@ static REBOOL Cloak(
 
     // Decode KEY as VALUE field (binary, string, or integer)
     if (klen == 0) {
-        REBVAL *val = (REBVAL*)kp;
+        REBVAL *val = cast(REBVAL*, kp);
         REBSER *ser;
 
         switch (VAL_TYPE(val)) {
@@ -717,7 +720,7 @@ static REBOOL Cloak(
             break;
 
         case REB_STRING:
-            ser = Temp_Bin_Str_Managed(val, &i, &klen);
+            ser = Temp_UTF8_At_Managed(val, &i, &klen);
             kp = BIN_AT(ser, i);
             break;
 

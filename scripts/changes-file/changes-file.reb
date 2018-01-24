@@ -84,7 +84,7 @@ make-changes-block: function [
         ]    
 
         ;; append change to changes
-        append block/(length? block)/changes/:category co
+        append block/(length of block)/changes/:category co
     ]
 
     for-each c commits [
@@ -134,7 +134,7 @@ load-cherry-pick-map: does [map lock load %cherry-pick-map.reb]
 notable?: function [
     {Is this a notable change?}
     c [block!] {Commit-log block}
-    <has>
+    <static>
         cherry-pick (load-cherry-pick-map)
         related (make block! 0)
 ][
@@ -310,15 +310,19 @@ make-changes-file: procedure [
     ;; summary text for each change
     for-each release changes-block [
         ;; ## [version]
-        write-line either/only release/date [
-            {## [} release/version {]}
-            { - } release/date
+        write-line either release/date [
+            [
+                {## [} release/version {]}
+                { - } release/date
+            ]
         ][
-            {## [} release/version {]}
+            [
+                {## [} release/version {]}
+            ]
         ]
 
         ;; ### Category (type)
-        for-each type words-of release/changes [
+        for-each type (words of release/changes) [
             unless empty? release/changes/:type [
                 write-line [{### } type]
 

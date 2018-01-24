@@ -184,24 +184,28 @@ const REBYTE *Scan_Time(REBVAL *out, const REBYTE *cp, REBCNT len)
 
 
 //
-//  Emit_Time: C
+//  MF_Time: C
 //
-void Emit_Time(REB_MOLD *mold, const REBVAL *value)
+void MF_Time(REB_MOLD *mo, const RELVAL *v, REBOOL form)
 {
+    UNUSED(form); // no difference between MOLD and FORM at this time
+
     REB_TIMEF tf;
+    Split_Time(VAL_NANO(v), &tf); // loses sign
+
     const char *fmt;
+    if (tf.s == 0 && tf.n == 0)
+        fmt = "I:2";
+    else
+        fmt = "I:2:2";
 
-    Split_Time(VAL_NANO(value), &tf); // loses sign
+    if (VAL_NANO(v) < cast(REBI64, 0))
+        Append_Codepoint(mo->series, '-');
 
-    if (tf.s == 0 && tf.n == 0) fmt = "I:2";
-    else fmt = "I:2:2";
+    Emit(mo, fmt, tf.h, tf.m, tf.s, 0);
 
-    if (VAL_NANO(value) < cast(REBI64, 0))
-        Append_Codepoint_Raw(mold->series, '-');
-
-    Emit(mold, fmt, tf.h, tf.m, tf.s, 0);
-
-    if (tf.n > 0) Emit(mold, ".i", tf.n);
+    if (tf.n > 0)
+        Emit(mo, ".i", tf.n);
 }
 
 
@@ -218,42 +222,49 @@ REBINT CT_Time(const RELVAL *a, const RELVAL *b, REBINT mode)
 
 
 //
-//  Make_Time: C
+//  MAKE_Time: C
 //
-// Returns NO_TIME if error.
-//
-REBI64 Make_Time(const REBVAL *val)
+void MAKE_Time(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
 {
-    if (IS_TIME(val)) {
-        return VAL_NANO(val);
-    }
-    else if (IS_STRING(val)) {
-        REBCNT len;
-        REBYTE *bp = Temp_Byte_Chars_May_Fail(val, MAX_SCAN_TIME, &len, FALSE);
+    assert(kind == REB_TIME);
+    UNUSED(kind);
 
-        DECLARE_LOCAL (temp);
-        if (Scan_Time(temp, bp, len) == NULL)
+    switch (VAL_TYPE(arg)) {
+    case REB_TIME: // just copy it (?)
+        Move_Value(out, arg);
+        return;
+
+    case REB_STRING: { // scan using same decoding as LOAD would
+        REBCNT len;
+        REBYTE *bp = Temp_Byte_Chars_May_Fail(arg, MAX_SCAN_TIME, &len, FALSE);
+
+        if (Scan_Time(out, bp, len) == NULL)
             goto no_time;
 
-        return VAL_NANO(temp);
-    }
-    else if (IS_INTEGER(val)) {
-        if (VAL_INT64(val) < -MAX_SECONDS || VAL_INT64(val) > MAX_SECONDS)
-            fail (Error_Out_Of_Range(val));
+        return; }
 
-        return VAL_INT64(val) * SEC_SEC;
-    }
-    else if (IS_DECIMAL(val)) {
+    case REB_INTEGER: // interpret as seconds
+        if (VAL_INT64(arg) < -MAX_SECONDS || VAL_INT64(arg) > MAX_SECONDS)
+            fail (Error_Out_Of_Range(arg));
+
+        Init_Time_Nanoseconds(out, VAL_INT64(arg) * SEC_SEC);
+        return;
+
+    case REB_DECIMAL:
         if (
-            VAL_DECIMAL(val) < cast(REBDEC, -MAX_SECONDS)
-            || VAL_DECIMAL(val) > cast(REBDEC, MAX_SECONDS)
+            VAL_DECIMAL(arg) < cast(REBDEC, -MAX_SECONDS)
+            || VAL_DECIMAL(arg) > cast(REBDEC, MAX_SECONDS)
         ){
-            fail (Error_Out_Of_Range(val));
+            fail (Error_Out_Of_Range(arg));
         }
-        return DEC_TO_SECS(VAL_DECIMAL(val));
-    }
-    else if (ANY_ARRAY(val) && VAL_ARRAY_LEN_AT(val) <= 3) {
-        RELVAL *item = VAL_ARRAY_AT(val);
+        Init_Time_Nanoseconds(out, DEC_TO_SECS(VAL_DECIMAL(arg)));
+        return;
+
+    case REB_BLOCK: { // [hh mm ss]
+        if (VAL_ARRAY_LEN_AT(arg) > 3)
+            goto no_time;
+
+        RELVAL *item = VAL_ARRAY_AT(arg);
         if (NOT(IS_INTEGER(item)))
             goto no_time;
 
@@ -287,11 +298,16 @@ REBI64 Make_Time(const REBVAL *val)
                         goto no_time;
 
                     secs += i;
-                    if (secs > MAX_SECONDS) goto no_time;
+                    if (secs > MAX_SECONDS)
+                        goto no_time;
                 }
                 else if (IS_DECIMAL(item)) {
-                    if (secs + cast(REBI64, VAL_DECIMAL(item)) + 1 > MAX_SECONDS)
+                    if (
+                        secs + cast(REBI64, VAL_DECIMAL(item)) + 1
+                        > MAX_SECONDS
+                    ){
                         goto no_time;
+                    }
 
                     // added in below
                 }
@@ -300,36 +316,22 @@ REBI64 Make_Time(const REBVAL *val)
             }
         }
 
-        secs *= SEC_SEC;
+        REBI64 nano = secs * SEC_SEC;
         if (IS_DECIMAL(item))
-            secs += DEC_TO_SECS(VAL_DECIMAL(item));
+            nano += DEC_TO_SECS(VAL_DECIMAL(item));
 
         if (neg)
-            secs = -secs;
+            nano = -nano;
 
-        return secs;
+        Init_Time_Nanoseconds(out, nano);
+        return; }
+
+    default:
+        goto no_time;
     }
 
 no_time:
-    return NO_TIME;
-}
-
-
-//
-//  MAKE_Time: C
-//
-void MAKE_Time(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
-{
-    assert(kind == REB_TIME);
-    UNUSED(kind);
-
-    REBI64 secs = Make_Time(arg);
-    if (secs == NO_TIME)
-        fail (Error_Bad_Make(REB_TIME, arg));
-
-    VAL_RESET_HEADER(out, REB_TIME);
-    VAL_NANO(out) = secs;
-    VAL_DATE(out).bits = 0;
+    fail (Error_Bad_Make(REB_TIME, arg));
 }
 
 
@@ -345,17 +347,13 @@ void TO_Time(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
 //
 //  Cmp_Time: C
 //
-// Given two times, compare them.
+// Given two TIME!s (or DATE!s with a time componet), compare them.
 //
 REBINT Cmp_Time(const RELVAL *v1, const RELVAL *v2)
 {
     REBI64 t1 = VAL_NANO(v1);
     REBI64 t2 = VAL_NANO(v2);
 
-    if (t1 == NO_TIME)
-        t1 = 0L;
-    if (t2 == NO_TIME)
-        t2 = 0L;
     if (t2 == t1)
         return 0;
     if (t1 > t2)
@@ -472,19 +470,21 @@ void Poke_Time_Immediate(
 //
 //  PD_Time: C
 //
-REBINT PD_Time(REBPVS *pvs)
+REB_R PD_Time(REBPVS *pvs, const REBVAL *picker, const REBVAL *opt_setval)
 {
-    if (pvs->opt_setval) {
+    if (opt_setval != NULL) {
         //
-        // !!! Since TIME! is an immediate value, allowing a SET-PATH! will
-        // modify the result of the expression but not the source.
+        // Returning R_IMMEDIATE means that we aren't actually changing a
+        // variable directly, and it will be up to the caller to decide if
+        // they can meaningfully determine what variable to copy the update
+        // we're making to.
         //
-        Poke_Time_Immediate(KNOWN(pvs->value), pvs->picker, pvs->opt_setval);
-        return PE_OK;
+        Poke_Time_Immediate(pvs->out, picker, opt_setval);
+        return R_IMMEDIATE;
     }
 
-    Pick_Time(pvs->store, KNOWN(pvs->value), pvs->picker);
-    return PE_USE_STORE;
+    Pick_Time(pvs->out, pvs->out, picker);
+    return R_OUT;
 }
 
 

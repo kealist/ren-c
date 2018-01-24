@@ -96,30 +96,28 @@
     FLAGIT_LEFT(2)
 
 
-//=//// DO_FLAG_VA_LIST ///////////////////////////////////////////////////=//
+//=//// DO_FLAG_POST_SWITCH ///////////////////////////////////////////////=//
 //
-// Usually VA_LIST_FLAG is enough to tell when there is a source array to
-// examine or not.  However, when the end is reached it is written over with
-// END_FLAG and it's no longer possible to tell if there's an array available
-// to inspect or not.  The few cases that "need to know" are things like
-// error delivery, which want to process the array after expression evaluation
-// is complete.  Review to see if they actually would rather know something
-// else, but this is a cheap flag for now.
+// This flag allows a deferred lookback to compensate for the lack of the
+// evaluator's ability to (easily) be psychic about when it is gathering the
+// last argument of a function.  It allows re-entery to argument gathering at
+// the point after the switch() statement, with a preloaded f->out.
 //
-#define DO_FLAG_VA_LIST \
+#define DO_FLAG_POST_SWITCH \
     FLAGIT_LEFT(3)
 
 
 #define DO_FLAG_4_IS_TRUE FLAGIT_LEFT(4) // NODE_FLAG_END
 
 
-//=//// DO_FLAG_TOOK_FRAME_LOCK ///////////////////////////////////////////=//
+//=//// DO_FLAG_TOOK_FRAME_HOLD ///////////////////////////////////////////=//
 //
 // While R3-Alpha permitted modifications of an array while it was being
-// executed, Ren-C does not.  It takes a lock if the source is not already
-// read only, and sets it back when Do_Core is finished (or on errors)
+// executed, Ren-C does not.  It takes a temporary read-only "hold" if the
+// source is not already read only, and sets it back when Do_Core is
+// finished (or on errors).  See SERIES_INFO_HOLD for more about this.
 //
-#define DO_FLAG_TOOK_FRAME_LOCK \
+#define DO_FLAG_TOOK_FRAME_HOLD \
     FLAGIT_LEFT(5)
 
 
@@ -146,47 +144,46 @@
     FLAGIT_LEFT(8)
 
 
-//=//// DO_FLAG_NO_ARGS_EVALUATE //////////////////////////////////////////=//
+//=//// DO_FLAG_FULFILLING_SET ////////////////////////////////////////////=//
+//
+// Similar to DO_FLAG_FULFILLING_ARG, this allows evaluator sensitivity to
+// noticing when a frame is being used to fulfill a SET-WORD! or a SET-PATH!
+//
+#define DO_FLAG_FULFILLING_SET \
+    FLAGIT_LEFT(9)
+
+
+//=//// DO_FLAG_EXPLICIT_EVALUATE /////////////////////////////////////////=//
 //
 // Sometimes a DO operation has already calculated values, and does not want
 // to interpret them again.  e.g. the call to the function wishes to use a
 // precalculated WORD! value, and not look up that word as a variable.  This
 // is common when calling Rebol functions from C code when the parameters are
-// known, or what R3-Alpha called "APPLY/ONLY"
+// known (also present in what R3-Alpha called "APPLY/ONLY")
 //
-// !!! It's questionable as to whether this flag needs to exist, or if C
-// code should use some kind of special out of band quoting operator to mean
-// "literally this value".  (The problem with using the QUOTE word or function
-// in this capacity is that then functions that quote their arguments will
-// receive the literal QUOTE word or function, but a variadic call from C
-// could subvert that with an invisible instruction.)  Currently the existence
-// of this mode is leaked to Rebol users through EVAL/ONLY, which may be
-// unnecessary complexity to expose.
+// Special escaping operations must be used in order to get evaluation
+// behavior.
 //
-#define DO_FLAG_NO_ARGS_EVALUATE \
-    FLAGIT_LEFT(9)
+// !!! This feature is in the process of being designed.
+//
+#define DO_FLAG_EXPLICIT_EVALUATE \
+    FLAGIT_LEFT(10)
 
 
 //=//// DO_FLAG_NO_LOOKAHEAD //////////////////////////////////////////////=//
 //
-// R3-Alpha had a property such that when it was in mid-dispatch of an infix
-// function, it would suppress further infix lookahead while getting the
-// arguments.  (e.g. with `1 + 2 * 3` it didn't want infix `+` to "look ahead"
-// past the 2 to see the infix `*`)
+// Infix functions may (depending on the #tight or non-tight parameter
+// acquisition modes) want to suppress further infix lookahead while getting
+// a function argument.  This precedent was started in R3-Alpha, where with
+// `1 + 2 * 3` it didn't want infix `+` to "look ahead" past the 2 to see the
+// infix `*` when gathering its argument, that was saved until the `1 + 2`
+// finished its processing.
 //
-// This amounted to what was basically another parameter acquisition mode for
-// the right hand sides of OP!, which became named <tight>.  Because tight
-// parameter fulfillment added variation into the evaluator, it is being
-// replaced by a strategy to use the quoted or non-quoted status of the left
-// hand argument of enfixed functions to guide evaluator behavior.  The worst
-// case scenario will be that `1 + 2 * 3` becomes 7 instead of 9.
-//
-// !!! The flag will be needed as long as legacy support is required, because
-// this fundamentally different mode of parameter acquisition is controlled at
-// the frame level and can't be achieved (reasonably) by other means.
+// See PARAM_CLASS_TIGHT for more explanation on the parameter class which
+// adds this flag to its argument gathering call.
 //
 #define DO_FLAG_NO_LOOKAHEAD \
-    FLAGIT_LEFT(10)
+    FLAGIT_LEFT(11)
 
 
 //=//// DO_FLAG_NATIVE_HOLD ///////////////////////////////////////////////=//
@@ -210,7 +207,36 @@
 // the reification happens.
 //
 #define DO_FLAG_NATIVE_HOLD \
-    FLAGIT_LEFT(11)
+    FLAGIT_LEFT(12)
+
+
+//=//// DO_FLAG_NEUTRAL ///////////////////////////////////////////////////=//
+//
+// !!! Experimental feature puts the evaluator into neutral and throws up
+// the stack in the case that it cannot skip without actually having side
+// effects.  It will be a trick to do efficiently, but for starters doing it
+// at all would be interesting.
+//
+// !!! This feature has proven to be questionable, and may not exist long
+// term.  However, the flag is currently used with paths to indicate that
+// GROUP!s should not be executed, and may wind up just serving that purpose.
+//
+#define DO_FLAG_NEUTRAL \
+    FLAGIT_LEFT(13)
+
+
+//=//// DO_FLAG_SET_PATH_ENFIXED //////////////////////////////////////////=//
+//
+// The way setting of paths is historically designed, it can't absolutely
+// give back a location of a variable to be set...since sometimes the result
+// is generated, or accessed as a modification of an immediate value.  This
+// complicates the interface to where the path dispatcher must be handed
+// the value to set and copy itself if necessary.  But CELL_MASK_COPIED does
+// not carry forward VALUE_FLAG_ENFIXED in the assignment.  This flag tells
+// a frame used with SET-PATH! semantics to make its final assignment enfix.
+//
+#define DO_FLAG_SET_PATH_ENFIXED \
+    FLAGIT_LEFT(14)
 
 
 // Currently the rightmost two bytes of the Reb_Frame->flags are not used,
@@ -218,8 +244,8 @@
 // like the ->eval_type, but performance is probably better to put such
 // information in a platform aligned position of the frame.
 //
-#if defined(__cplusplus) && (__cplusplus >= 201103L)
-    static_assert(11 < 32, "DO_FLAG_XXX too high");
+#ifdef CPLUSPLUS_11
+    static_assert(14 < 32, "DO_FLAG_XXX too high");
 #endif
 
 
@@ -266,10 +292,34 @@
     LOGICAL((k) >= REB_BLOCK)
 
 
-union Reb_Frame_Source {
-    REBARR *array;
+struct Reb_Frame_Source {
+    //
+    // A frame may be sourced from a va_list of pointers, or not.  If this is
+    // NULL it is assumed that the values are sourced from a simple array.
+    //
     va_list *vaptr;
+
+    // This contains an IS_END() marker if the next fetch should be an attempt
+    // to consult the va_list (if any).  That end marker may be resident in
+    // an array, or if it's a plain va_list source it may be the global END.
+    //
+    const RELVAL *pending;
+
+    // If values are being sourced from an array, this holds the pointer to
+    // that array.  By knowing the array it is possible for error and debug
+    // messages to reach backwards and present more context of where the
+    // error is located.
+    //
+    REBARR *array;
+
+    // `index`
+    //
+    // This holds the index of the *next* item in the array to fetch as
+    // f->value for processing.  It's invalid if the frame is for a C va_list.
+    //
+    REBUPT index;
 };
+
 
 // NOTE: The ordering of the fields in `Reb_Frame` are specifically done so
 // as to accomplish correct 64-bit alignment of pointers on 64-bit systems.
@@ -291,7 +341,7 @@ struct Reb_Frame {
     // * While a function is running, it is free to use it as a GC-safe spot,
     //   which is also implicitly terminated.  See D_CELL.
     //
-    REBVAL cell;
+    RELVAL cell; // can't be REBVAL in C++ build
 
     // `flags`
     //
@@ -338,7 +388,7 @@ struct Reb_Frame {
     // conditions require the va_list to be converted to an array, see notes
     // on Reify_Va_To_Array_In_Frame().)
     //
-    union Reb_Frame_Source source;
+    struct Reb_Frame_Source source;
 
     // `specifier`
     //
@@ -352,30 +402,26 @@ struct Reb_Frame {
 
     // `value`
     //
-    // This is the value currently being processed.  Callers pass in the
-    // first value pointer...which for any successive evaluations will be
-    // updated via picking from `array` based on `index`.  But having the
-    // caller pass in the initial value gives the *option* of that value
-    // not being resident in the series.
+    // This is the "prefetched" value being processed.  Entry points to the
+    // evaluator must load a first value pointer into it...which for any
+    // successive evaluations will be updated via Fetch_Next_In_Frame()--which
+    // retrieves values from arrays or va_lists.  But having the caller pass
+    // in the initial value gives the option of that value being out of band.
     //
     // (Hence if one has the series `[[a b c] [d e]]` it would be possible to
     // have an independent path value `append/only` and NOT insert it in the
     // series, yet get the effect of `append/only [a b c] [d e]`.  This only
     // works for one value, but is a convenient no-cost trick for apply-like
     // situations...as insertions usually have to "slide down" the values in
-    // the series and may also need to perform alloc/free/copy to expand.)
+    // the series and may also need to perform alloc/free/copy to expand.
+    // It also is helpful since in C, variadic functions must have at least
+    // one non-variadic parameter...and one might want that non-variadic
+    // parameter to be blended in with the variadics.)
     //
     // !!! Review impacts on debugging; e.g. a debug mode should hold onto
     // the initial value in order to display full error messages.
     //
-    const RELVAL *value;
-
-    // `index`
-    //
-    // This holds the index of the *next* item in the array to fetch as
-    // f->value for processing.  It's invalid if the frame is for a C va_list.
-    //
-    REBUPT index;
+    const_RELVAL_NO_END_PTR value;
 
     // `expr_index`
     //
@@ -397,7 +443,7 @@ struct Reb_Frame {
     // Additionally, the actual dispatch may not have started, so if a fail()
     // or other operation occurs it may not be able to assume that eval_type
     // of REB_FUNCTION implies that the arguments have been pushed yet.
-    // See Is_Any_Function_Frame() for notes on this detection.
+    // See Is_Function_Frame() for notes on this detection.
     //
     enum Reb_Kind eval_type;
 
@@ -416,19 +462,6 @@ struct Reb_Frame {
     // across this (and other modifications) need to use the INDEXOR-based API.
     //
     const REBVAL *gotten;
-
-    // `pending`
-    //
-    // Mechanically speaking, running an EVAL has to overwrite `value` from
-    // the natural pre-fetching course, so that the evaluated value can be
-    // simulated as living in the line of execution.  Because fetching moves
-    // forward only, we'd lose the next value if we didn't save it somewhere.
-    //
-    // This pointer saves the prefetched value that eval overwrites, and
-    // by virtue of not being NULL signals to just use the value on the
-    // next fetch instead of fetching again.
-    //
-    const RELVAL *pending;
 
     // `phase` and `original`
     //
@@ -453,15 +486,18 @@ struct Reb_Frame {
     // to exit.  The additional pointer of context is binding, and it is
     // extracted from the function REBVAL.
     //
-    REBARR *binding; // either a varlist of a FRAME! or function paramlist
+    REBNOD *binding; // either a varlist of a FRAME! or function paramlist
 
-    // `label`
+    // `opt_label`
     //
     // Functions don't have "names", though they can be assigned to words.
+    // However, not all function invocations are through words or paths, so
+    // the label may not be known.  It is NULL to indicate anonymity.
+    //
     // The evaluator only enforces that the symbol be set during function
     // calls--in the release build, it is allowed to be garbage otherwise.
     //
-    REBSTR *label;
+    REBSTR *opt_label;
 
     // `varlist`
     //
@@ -522,12 +558,22 @@ struct Reb_Frame {
     // `special`
     //
     // The specialized argument parallels arg if non-NULL, and contains the
-    // value to substitute in the case of a specialized call.  It is END
-    // if no specialization in effect, and parallels arg (so it may be
+    // value to substitute in the case of a specialized call.  It is NULL
+    // if no specialization in effect, else it parallels arg (so it may be
     // incremented on a common code path) if arguments are just being checked
     // vs. fulfilled.
     //
-    REBVAL *special;
+    // However, in PATH! frames, `special` is non-NULL if this is a SET-PATH!,
+    // and it is the value to ultimately set the path to.  The set should only
+    // occur at the end of the path, so most setters should check
+    // `IS_END(pvs->value + 1)` before setting.
+    //
+    // !!! See notes at top of %c-path.c about why the path dispatch is more
+    // complicated than simply being able to only pass the setval to the last
+    // item being dispatched (which would be cleaner, but some cases must
+    // look ahead with alternate handling).
+    //
+    const REBVAL *special;
 
     // `refine`
     //
@@ -561,24 +607,59 @@ struct Reb_Frame {
     //   left-hand argument of a lookback operation.  After that fulfillment,
     //   it will be transitioned to EMPTY_BLOCK.
     //
-    // Because of how this lays out, IS_CONDITIONAL_TRUE() can be used to
-    // determine if an argument should be type checked normally...while
-    // IS_CONDITIONAL_FALSE() means that the arg's bits must be set to void.
+    // Because of how this lays out, IS_TRUTHY() can be used to determine if
+    // an argument should be type checked normally...while IS_FALSEY() means
+    // that the arg's bits must be set to void.
+    //
+    // In path processing, ->refine points to the soft-quoted product of the
+    // current path item (the "picker").  So on the second step of processing
+    // foo/(1 + 2) it would be 3.
     //
     REBVAL *refine;
     REBOOL doing_pickups; // want to encode
 
+
+    // `deferred`
+    //
+    // The deferred pointer is used to mark an argument cell which *might*
+    // need to do more enfix processing in the frame--but only if it turns out
+    // to be the last argument being processed.  For instance, in both of
+    // these cases the AND finds itself gathering an argument to a function
+    // where there is an evaluated 10 on the left hand side:
+    //
+    //    x: 10
+    //
+    //    if block? x and ... [...]
+    //
+    //    if x and ... [...]
+    //
+    // In the former case, the evaluated 10 is fulfilling the one and only
+    // argument to BLOCK?.  The latter case has it fulfilling the *first* of
+    // two arguments to IF.  Since AND has PARAM_CLASS_NORMAL for its left
+    // argument (as opposed to PARAM_CLASS_TIGHT), it wishes to interpret the
+    // first case as `if (block? 10) and ... [...], but still let the second
+    // case work too.  Yet discerning these in advance is costly/complex.
+    //
+    // The trick used is to not run the AND, go ahead and let the cell fill
+    // the frame either way, and set `deferred` in the frame above to point
+    // at the cell.  If the function finishes gathering arguments and deferred
+    // wasn't cleared by some other operation (like in the `if x` case), then
+    // that cell is re-dispatched with DO_FLAG_POST_SWITCH to give the
+    // impression that the AND had "tightly" taken the argument all along.
+    //
+    REBVAL *deferred;
+
 #if !defined(NDEBUG)
     //
-    // `label_debug` [DEBUG]
+    // `label` [DEBUG]
     //
     // Knowing the label symbol is not as handy as knowing the actual string
     // of the function this call represents (if any).  It is in UTF8 format,
     // and cast to `char*` to help debuggers that have trouble with REBYTE.
     //
-    const char *label_debug;
+    const char *label_utf8;
 
-    // `file_debug` [DEBUG]
+    // `file` [DEBUG]
     //
     // An emerging feature in the system is the ability to connect user-seen
     // series to a file and line number associated with their creation,
@@ -586,30 +667,30 @@ struct Reb_Frame {
     // them.  As the feature gets better, it will certainly be useful to be
     // able to quickly see the information in the debugger for f->source.
     //
-    const char *file_debug;
-    int line_debug;
+    const char *file; // is REBYTE (UTF-8), but char* for debug watch
+    int line;
 
-    // `kind_debug` [DEBUG]
+    // `kind` [DEBUG]
     //
     // The fetching mechanics cache the type of f->value
     //
-    enum Reb_Kind kind_debug;
+    enum Reb_Kind kind;
 
-    // `do_count_debug` [DEBUG]
+    // `tick` [DEBUG]
     //
-    // The `do_count` represents the expression evaluation "tick" where the
-    // Reb_Frame is starting its processing.  This is helpful for setting
-    // breakpoints on certain ticks in reproducible situations.
+    // The expression evaluation "tick" where the Reb_Frame is starting its
+    // processing.  This is helpful for setting breakpoints on certain ticks
+    // in reproducible situations.
     //
-    REBUPT do_count_debug; // !!! Should this be available in release builds?
+    REBUPT tick; // !!! Should this be available in release builds?
 
-    // `state_debug` [DEBUG]
+    // `state` [DEBUG]
     //
     // Debug reuses PUSH_TRAP's snapshotting to check for leaks at each stack
     // level.  It can also be made to use a more aggresive leak check at every
     // evaluator step--see BALANCE_CHECK_EVERY_EVALUATION_STEP.
     //
-    struct Reb_State state_debug;
+    struct Reb_State state;
 #endif
 };
 
@@ -618,7 +699,22 @@ struct Reb_Frame {
 // so this macro sets that up for you, the same way DECLARE_LOCAL does.  The
 // optimizer should eliminate the extra pointer.
 //
+// Just to simplify matters, the frame cell is set to a bit pattern the GC
+// will accept.  It would need stack preparation anyway, and this simplifies
+// the invariant so that if a recycle happens before Do_Core() gets to its
+// body, it's always set to something.  Using an unreadable blank means we
+// signal to users of the frame that they can't be assured of any particular
+// value between evaluations; it's not cleared.
+//
 #define DECLARE_FRAME(name) \
     REBFRM name##struct; \
     REBFRM * const name = &name##struct; \
-    Prep_Global_Cell(&name->cell)
+    Prep_Stack_Cell(&name->cell); \
+    Init_Unreadable_Blank(&name->cell);
+
+
+// Hookable "Rebol DO Function" and "Rebol APPLY Function".  See PG_Do and
+// PG_Apply for usage.
+//
+typedef void (*REBDOF)(REBFRM * const);
+typedef REB_R (*REBAPF)(REBFRM * const);

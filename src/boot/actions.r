@@ -55,23 +55,66 @@ power: action [
     exponent [any-number!]
 ]
 
-and~: action [
-    {Returns the first value ANDed with the second.}
-    value1 [logic! integer! char! tuple! binary! bitset! typeset! datatype!]
-    value2 [logic! integer! char! tuple! binary! bitset! typeset! datatype!]
+
+intersect: action [
+    {Returns the intersection (AND) of two values.}
+    value1 [
+        logic! integer! char! tuple! ;-- math
+        any-array! any-string! bitset! typeset! ;-- sets
+        binary! ;-- ???
+    ]
+    value2 [
+        logic! integer! char! tuple! ;-- math
+        any-array! any-string! bitset! typeset! ;-- sets
+        binary! ;-- ???
+    ]
+    /case
+        "Uses case-sensitive comparison"
+    /skip
+        "Treat the series as records of fixed size"
+    size [integer!]
 ]
 
-or~: action [
-    {Returns the first value ORed with the second.}
-    value1 [logic! integer! char! tuple! binary! bitset! typeset! datatype!]
-    value2 [logic! integer! char! tuple! binary! bitset! typeset! datatype!]
+union: action [
+    {Returns the union (OR) of two values.}
+    value1 [
+        logic! integer! char! tuple! ;-- math
+        any-array! any-string! bitset! typeset! ;-- sets
+        binary! ;-- ???
+    ]
+    value2 [
+        logic! integer! char! tuple! ;-- math
+        any-array! any-string! bitset! typeset! ;-- sets
+        binary! ;-- ???
+    ]
+    /case
+        "Use case-sensitive comparison"
+    /skip
+        "Treat the series as records of fixed size"
+    size [integer!]
 ]
 
-xor~: action [
-    {Returns the first value exclusive ORed with the second.}
-    value1 [logic! integer! char! tuple! binary! bitset! typeset! datatype!]
-    value2 [logic! integer! char! tuple! binary! bitset! typeset! datatype!]
+difference: action [
+    {Returns the special difference (XOR) of two values.}
+    value1 [
+        logic! integer! char! tuple! ;-- math
+        any-array! any-string! bitset! typeset! ;-- sets
+        binary! ;-- ???
+        date! ;-- !!! Under review, this really doesn't fit
+    ]
+    value2 [
+        logic! integer! char! tuple! ;-- math
+        any-array! any-string! bitset! typeset! ;-- sets
+        binary! ;-- ???
+        date! ;-- !!! Under review, this really doesn't fit
+    ]
+    /case
+        "Uses case-sensitive comparison"
+    /skip
+        "Treat the series as records of fixed size"
+    size [integer!]
 ]
+
 
 ;-- Unary
 
@@ -124,31 +167,6 @@ even?: action [
 
 ;-- Series Navigation
 
-head-of: action [
-    {Returns the series at its beginning.}
-    series [any-series! gob! port!]
-]
-
-tail-of: action [
-    {Returns the series just past its end.}
-    series [any-series! gob! port!]
-]
-
-head?: action [
-    {Returns TRUE if a series is at its beginning.}
-    series [any-series! gob! port!]
-]
-
-tail?: action [
-    {Returns TRUE if series is at or past its end; or empty for other types.}
-    series [any-series! object! gob! port! bitset! map! blank! varargs!]
-]
-
-past?: action [
-    {Returns TRUE if series is past its end.}
-    series [any-series! gob! port!]
-]
-
 skip: action [
     {Returns the series forward or backward from the current position.}
     series [any-series! gob! port!]
@@ -159,17 +177,6 @@ at: action [
     {Returns the series at the specified index.}
     series [any-series! gob! port!]
     index [any-number! logic! pair!]
-]
-
-index-of: action [
-    {Returns the current position (index) of the series.}
-    series [any-series! gob! port! blank!]
-    /xy {Returns index as an XY pair offset}
-]
-
-length-of: action [
-    {Returns the length (from the current position for series.)}
-    series [any-series! port! map! tuple! bitset! object! gob! struct! any-word! blank!]
 ]
 
 ;-- Series Search
@@ -209,12 +216,14 @@ select*: action [
 
 ]
 
-;;;;!!! MATCH
 
 reflect: action [
     {Returns specific details about a datatype.}
-    value [any-value!]
-    field [word!] "Such as: spec, body, words, values, title"
+
+    return: [any-value!]
+    value [<opt> any-value!] ; accepts void for REFLECT () 'TYPE to be BLANK!
+    property [word!]
+        "Such as: type, length, spec, body, words, values, title"
 ]
 
 ;-- Making, copying, modifying
@@ -391,11 +400,6 @@ write: action [
 ;       encoding [blank! any-number!] {UTF number (0 8 16 -16)}
 ]
 
-open?: action [
-    {Returns TRUE if port is open.}
-    port [port!]
-]
-
 query: action [
     {Returns information about a port, file, or URL.}
     target [port! file! url! block!]
@@ -410,7 +414,14 @@ modify: action [
     value
 ]
 
-update: action [
+; This action seems to only be dispatched to *native* ports, and only as part
+; of the WAKE-UP function.  It used to have the name UPDATE, but for Ren-C it
+; was felt this term would be better applied as a complement to DEFAULT.
+; There were no apparent user-facing references in the repo, but it turns out
+; to be important it can be called something else.  For now, it's given a
+; name most relevant to what it does internally.
+;
+on-wake-up: action [
     {Updates external and internal states (normally after read/write).}
     port [port!]
 ]

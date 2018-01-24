@@ -12,6 +12,9 @@ REBOL [
 ]
 
 
+file-to-local*: specialize 'file-to-local [only: true]
+local-to-file*: specialize 'local-to-file [only: true]
+
 clean-path: function [
     "Returns new directory path with `//` `.` and `..` processed."
     file [file! url! string!]
@@ -44,19 +47,19 @@ clean-path: function [
 
     if all [dir | not dir? file] [append file #"/"]
 
-    out: make type-of file length-of file ; same datatype
-    cnt: 0 ; back dir counter
+    out: make type of file length of file ; same datatype
+    count: 0 ; back dir counter
 
     parse reverse file [
         some [
-            "../" (++ cnt)
+            "../" (count: ++ 1)
             | "./"
             | #"/" (
                 if any [not file? file | #"/" <> last out] [append out #"/"]
             )
             | copy f [to #"/" | to end] (
-                either cnt > 0 [
-                    -- cnt
+                either count > 0 [
+                    count: -- 1
                 ][
                     unless find ["" "." ".."] as string! f [append out f]
                 ]
@@ -64,14 +67,16 @@ clean-path: function [
         ]
     ]
 
-    if all [#"/" = last out | #"/" <> last file] [remove back tail out]
+    if all [#"/" = last out | #"/" <> last file] [remove back tail of out]
     reverse out
 ]
 
 
 input: function [
     {Inputs a string from the console. New-line character is removed.}
-    return: [string!]
+
+    return: [string! blank!]
+        {Blank if the input was aborted via ESC}
 ;   /hide
 ;       "Mask input with a * character"
 ][
@@ -82,7 +87,30 @@ input: function [
         system/ports/input: open [scheme: 'console]
     ]
 
-    line: to-string read system/ports/input
+    data: read system/ports/input
+    if 0 = length of data [
+        ;
+        ; !!! While zero-length data is the protocol being used to signal a
+        ; halt in the (deprecated) Host OS layer, even in more ideal
+        ; circumstances it is probably bad to try to get INPUT to be emitting
+        ; that HALT.
+        ;
+        fail "Signal for Ctrl-C got to INPUT function somehow."
+    ]
+
+    if all [
+        1 = length of data
+        escape = to-char data/1
+    ][
+        ; Input Aborted (e.g. Ctrl-D on Windows, ESC on POSIX)--this does not
+        ; try and HALT the program overall, but gives the caller the chance
+        ; to process the BLANK! and realize it as distinct from the user
+        ; just hitting enter on an empty line (empty string)
+        ;
+        return blank;
+    ]
+
+    line: to-string data
     trim/with line newline
     line
 ]
@@ -103,24 +131,24 @@ ask: function [
 
 confirm: function [
     "Confirms a user choice."
-    return: [logic!]
+    return: [logic! blank!]
     question [any-series!]
         "Prompt to user"
     /with
     choices [string! block!]
 ][
-    if all [block? choices | 2 < length-of choices] [
-        cause-error 'script 'invalid-arg mold choices
+    if all [block? :choices | 2 < length of choices] [
+        cause-error 'script 'invalid-arg join-of "maximum 2 arguments allowed for choices [true false] got: " mold choices
     ]
 
     response: ask question
 
     unless with [choices: [["y" "yes"] ["n" "no"]]]
 
-    case [
+    to-value case [
         empty? choices [true]
         string? choices [find?/match response choices]
-        2 > length-of choices [find?/match response first choices]
+        2 > length of choices [find?/match response first choices]
         find? first choices response [true]
         find? second choices response [false]
     ]
@@ -139,7 +167,7 @@ list-dir: procedure [
     /i "Indent"
         indent
 ][
-    indent: default ""
+    indent: default [""]
 
     save-dir: what-dir
 
@@ -147,22 +175,22 @@ list-dir: procedure [
         fail ["No directory listing protocol registered for" save-dir]
     ]
 
-    switch type-of :path [
+    switch type of :path [
         _ [] ; Stay here
-        :file! [change-dir path]
-        :string! [change-dir to-rebol-file path]
-        :word! :path! [change-dir to-file path]
+        (file!) [change-dir path]
+        (string!) [change-dir local-to-file path]
+        (word!) (path!) [change-dir to-file path]
     ]
 
     if r [l: true]
-    unless l [l: make string! 62] ; approx width    
-    
+    unless l [l: make string! 62] ; approx width
+ 
     if not (files: attempt [read %./]) [
         print ["Not found:" :path]
         change-dir save-dir
         leave
     ]
-    
+
     for-each file files [
         if any [
             all [f | dir? file]
@@ -171,8 +199,8 @@ list-dir: procedure [
 
         either string? l [
             append l file
-            append/dup l #" " 15 - remainder length-of l 15
-            if greater? length-of l 60 [print l clear l]
+            append/dup l #" " 15 - remainder length of l 15
+            if greater? length of l 60 [print l clear l]
         ][
             info: get query file
             change info second split-path info/1
@@ -182,9 +210,9 @@ list-dir: procedure [
             ]
         ]
     ]
-    
+
     if all [string? l | not empty? l] [print l]
-    
+
     change-dir save-dir
 ]
 
@@ -195,7 +223,7 @@ undirize: function [
     path [file! string! url!]
 ][
     path: copy path
-    if #"/" = last path [clear back tail path]
+    if #"/" = last path [clear back tail of path]
     path
 ]
 
@@ -213,7 +241,7 @@ in-dir: function [
 
     ; You don't want the block to be done if the change-dir fails, for safety.
 
-    also do block change-dir old-dir
+    do block also-do [change-dir old-dir]
 ]
 
 
@@ -230,17 +258,17 @@ to-relative-file: function [
         "Convert to local-style filename if not"
 ][
     either string? file [ ; Local file
-        ; Note: to-local-file drops trailing / in R2, not in R3
-        ; if tmp: find/match file to-local-file what-dir [file: next tmp]
-        file: any [find/match file to-local-file what-dir | file]
+        ; Note: file-to-local drops trailing / in R2, not in R3
+        ; if tmp: find/match file file-to-local what-dir [file: next tmp]
+        file: any [find/match file file-to-local what-dir | file]
         if as-rebol [
-            file: to-rebol-file file
+            file: local-to-file file
             no-copy: true
         ]
     ][
         file: any [find/match file what-dir | file]
         if as-local [
-            file: to-local-file file
+            file: file-to-local file
             no-copy: true
         ]
     ]
@@ -269,6 +297,6 @@ set-net: procedure [
     {sets the system/user/identity email smtp pop3 esmtp-usr esmtp-pass fqdn}
     bl [block!]
 ][
-    if 6 <> length-of bl [fail "Needs all 6 parameters for set-net"]
-    set words-of system/user/identity bl
+    if 6 <> length of bl [fail "Needs all 6 parameters for set-net"]
+    set (words of system/user/identity) bl
 ]

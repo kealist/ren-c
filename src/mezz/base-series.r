@@ -28,7 +28,7 @@ first+: func [
     'word [word!] "Word must refer to a series"
     <local> prior
 ][
-    also (pick prior: get word 1) (set word next prior)
+    (first prior: get word) also-do [set word next prior]
 ]
 
 second: redescribe [
@@ -93,8 +93,8 @@ last: func [
 ][
     case* [ ;-- returns <opt>, can't use "blankifying" convention
 
-        any-series? value [pick back tail value 1]
-        tuple? value [pick value length-of value]
+        any-series? value [pick back tail of value 1]
+        tuple? value [pick value length of value]
         gob? value [
             ; The C code effectively used 'pick value t' with:
             ;
@@ -103,7 +103,7 @@ last: func [
             ;
             ; Try getting same result with what series does.  :-/
 
-            pick back tail value 1
+            pick back tail of value 1
         ]
         'else [
             ; C code said "let the action throw the error", but by virtue

@@ -10,8 +10,9 @@ REBOL [
         See: http://www.apache.org/licenses/LICENSE-2.0
     }
     Purpose: {
-        These words are used internally by REBOL and must have specific canon
-        word values in order to be correctly identified.
+        These words are used internally by Rebol, and are canonized with small
+        integer SYM_XXX constants.  These constants can then be quickly used
+        in switch() statements.
     }
 ]
 
@@ -74,14 +75,31 @@ rebol
 
 system
 
-;reflectors:
+; REFLECTORS
+;
+; These words are used for things like REFLECT SOME-FUNCTION 'BODY, which then
+; has a convenience wrapper which is infix and doesn't need a quote, as OF.
+; (e.g. BODY OF SOME-FUNCTION)
+;
+index
+xy ;-- !!! There was an INDEX?/XY, which is an XY reflector for the time being 
+length
+head
+tail
+head?
+tail?
+past?
+open?
 spec
 body
 words
 values
 types
 title
-;addr already defined
+context
+file
+line
+function
 
 value ; used by TYPECHECKER to name the argument of the generated function
 
@@ -113,7 +131,7 @@ memory
 debug
 browse
 extension
-file
+;file -- already provided for FILE OF
 dir
 
 ; Time:
@@ -158,6 +176,7 @@ any
 opt
 not
 and
+ahead
 then
 remove
 insert
@@ -224,7 +243,6 @@ int64
 float
 ;double ;reuse earlier definition
 pointer
-addr
 raw-memory
 raw-size
 extern
@@ -319,9 +337,6 @@ sigxcpu
 sigxfsz
 
 bits
-crash
-crash-dump
-watch-recycle
 
 uid
 euid
@@ -341,6 +356,9 @@ exit-code
 ; a debug build has been elided
 ;
 --optimized-out--
+
+; used to indicate the execution point where an error or debug frame is
+~~
 
 ; used to signal a void in a reified va_list call, since voids can't actually
 ; appear in user-visible arrays

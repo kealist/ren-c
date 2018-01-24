@@ -1,7 +1,7 @@
 ; datatypes/object.r
 [object? make object! [x: 1]]
 [not object? 1]
-[object! = type-of make object! [x: 1]]
+[object! = type of make object! [x: 1]]
 ; minimum
 [object? make object! []]
 ; literal form
@@ -72,24 +72,17 @@
     o3: make o1 o2
     2 == o3/f
 ]
-; object cloning
-; bug#2049
-[
-    o: make object! [n: 'o f: closure [] [n]]
-    p: make o [n: 'p]
-    'p = p/f
-]
 ; appending to objects
 ; bug#1979
 [
     o: make object! []
     append o [b: 1 b: 2]
-    1 == length? words-of o
+    1 == length of words of o
 ]
 [
     o: make object! [b: 0]
     append o [b: 1 b: 2]
-    1 == length? words-of o
+    1 == length of words of o
 ]
 [
     o: make object! []

@@ -27,54 +27,43 @@
 //=////////////////////////////////////////////////////////////////////////=//
 //
 
+#include <stddef.h> // size_t, wchar_t and other definitions API use
+
 #include "reb-config.h"
 
+// %reb-host.h is often used in third party code that was not written to
+// use REBOOL.  Hence the definitions of TRUE and FALSE used in the "fake"
+// build will trip it up.  We substitute in normal definitions for this
+// file.  See explanations of this test in %reb-c.h for more information.
+//
+#undef STRICT_BOOL_COMPILER_TEST
+
 #include "reb-c.h"
+#include "reb-ext.h"        // includes reb-defs.h
 
-#ifdef STRICT_BOOL_COMPILER_TEST
-    //
-    // %reb-host.h is often used in third party code that was not written to
-    // use REBOOL.  Hence the definitions of TRUE and FALSE used in the "fake"
-    // build will trip it up.  We substitute in normal definitions for this
-    // file.  See explanations of this test in %reb-c.h for more information.
-    //
-    #undef REBOOL
-    #define REBOOL int
-    #undef TRUE
-    #undef FALSE
-    #define TRUE 1
-    #define FALSE 0
-#endif
-
-// Must be defined at the end of reb-c.h, but not *in* reb-c.h so that
-// files including sys-core.h and reb-host.h can have differing
-// definitions of REBCHR.  (We want it opaque to the core, but the
-// host to have it compatible with the native character type w/o casting)
+// Must be defined at the end of reb-defs.h, but not *in* reb-defs.h so that
+// files including sys-core.h and reb-host.h can have differing definitions of
+// REBCHR.  (We want it opaque to the core, but the host to have it compatible
+// with the native character type w/o casting)
+//
+// !!! This should become obsolete when all string exchanges with non-core
+// code are done via STRING! values.
+//
 #ifdef OS_WIDE_CHAR
     typedef wchar_t REBCHR;
 #else
     typedef char REBCHR;
 #endif
 
-#include "reb-ext.h"        // includes reb-defs.h
 #include "reb-device.h"
 #include "reb-file.h"
 #include "reb-event.h"
 #include "reb-evtypes.h"
-#include "reb-filereq.h"
 
 #include "sys-rebnod.h" // !!! Legacy dependency, REBGOB should not be REBNOD
 #include "reb-gob.h"
 
 #include "reb-lib.h"
-
-// !!! None of the above currently include anything that *necessarily* defines
-// size_t.  However the host-lib API currently uses it in defining its
-// allocator.  In order to match the signature of Alloc_Mem() and malloc(),
-// we include it for the moment, but a more formal policy decision on "what
-// parameter types are legal in the host API" would be ideal.
-//
-#include <stdlib.h>
 
 #include "host-lib.h"
 

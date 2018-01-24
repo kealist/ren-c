@@ -55,7 +55,7 @@ enum {
     VTSF64
 };
 
-#define VECT_TYPE(s) ((s)->misc.size & 0xff)
+#define VECT_TYPE(s) (MISC(s).size & 0xff)
 
 static REBCNT bit_sizes[4] = {8, 16, 32, 64};
 
@@ -229,24 +229,27 @@ REBARR *Vector_To_Array(const REBVAL *vect)
 //
 REBINT Compare_Vector(const RELVAL *v1, const RELVAL *v2)
 {
-    REBCNT l1 = VAL_LEN_AT(v1);
-    REBCNT l2 = VAL_LEN_AT(v2);
-    REBCNT len = MIN(l1, l2);
-    REBCNT n;
-    REBU64 i1;
-    REBU64 i2;
-    REBYTE *d1 = SER_DATA_RAW(VAL_SERIES(v1));
-    REBYTE *d2 = SER_DATA_RAW(VAL_SERIES(v2));
     REBCNT b1 = VECT_TYPE(VAL_SERIES(v1));
     REBCNT b2 = VECT_TYPE(VAL_SERIES(v2));
 
     if ((b1 >= VTSF08 && b2 < VTSF08) || (b2 >= VTSF08 && b1 < VTSF08))
         fail (Error_Not_Same_Type_Raw());
 
+    REBCNT l1 = VAL_LEN_AT(v1);
+    REBCNT l2 = VAL_LEN_AT(v2);
+    REBCNT len = MIN(l1, l2);
+
+    REBYTE *d1 = SER_DATA_RAW(VAL_SERIES(v1));
+    REBYTE *d2 = SER_DATA_RAW(VAL_SERIES(v2));
+
+    REBU64 i1 = 0; // avoid uninitialized warning
+    REBU64 i2 = 0; // ...
+    REBCNT n;
     for (n = 0; n < len; n++) {
         i1 = get_vect(b1, d1, n + VAL_INDEX(v1));
         i2 = get_vect(b2, d2, n + VAL_INDEX(v2));
-        if (i1 != i2) break;
+        if (i1 != i2)
+            break;
     }
 
     if (n != len) {
@@ -313,15 +316,20 @@ void Set_Vector_Value(REBVAL *var, REBSER *series, REBCNT index)
 // bits: number of bits per unit (8, 16, 32, 64)
 // size: size of array ?
 //
-REBSER *Make_Vector(REBINT type, REBINT sign, REBINT dims, REBINT bits, REBINT size)
-{
+REBSER *Make_Vector(
+    REBINT type,
+    REBINT sign,
+    REBINT dims,
+    REBINT bits,
+    REBINT size
+){
     REBCNT len = size * dims;
     if (len > 0x7fffffff)
         fail ("vector size too big");
 
-    REBSER *ser = Make_Series_Core(len + 1, bits/8, SERIES_FLAG_POWER_OF_2);
-    CLEAR(SER_DATA_RAW(ser), (len * bits) / 8);
-    SET_SERIES_LEN(ser, len);
+    REBSER *s = Make_Series_Core(len + 1, bits / 8, SERIES_FLAG_POWER_OF_2);
+    CLEAR(SER_DATA_RAW(s), (len * bits) / 8);
+    SET_SERIES_LEN(s, len);
 
     // Store info about the vector (could be moved to flags if necessary):
     switch (bits) {
@@ -330,9 +338,10 @@ REBSER *Make_Vector(REBINT type, REBINT sign, REBINT dims, REBINT bits, REBINT s
     case 32: bits = 2; break;
     case 64: bits = 3; break;
     }
-    ser->misc.size = (dims << 8) | (type << 3) | (sign << 2) | bits;
 
-    return ser;
+    MISC(s).size = (dims << 8) | (type << 3) | (sign << 2) | bits;
+
+    return s;
 }
 
 
@@ -596,17 +605,15 @@ void Poke_Vector_Fail_If_Read_Only(
 //
 // Path dispatch acts like PICK for GET-PATH! and POKE for SET-PATH!
 //
-REBINT PD_Vector(REBPVS *pvs)
+REB_R PD_Vector(REBPVS *pvs, const REBVAL *picker, const REBVAL *opt_setval)
 {
-    if (pvs->opt_setval) {
-        Poke_Vector_Fail_If_Read_Only(
-            KNOWN(pvs->value), pvs->picker, pvs->opt_setval
-        );
-        return PE_OK;
+    if (opt_setval != NULL) {
+        Poke_Vector_Fail_If_Read_Only(pvs->out, picker, opt_setval);
+        return R_INVISIBLE;
     }
 
-    Pick_Vector(pvs->store, KNOWN(pvs->value), pvs->picker);
-    return PE_USE_STORE;
+    Pick_Vector(pvs->out, pvs->out, picker);
+    return R_OUT;
 }
 
 
@@ -629,10 +636,24 @@ REBTYPE(Vector)
 
     switch (action) {
 
-    case SYM_LENGTH_OF:
-        //bits = 1 << (vect->size & 3);
-        Init_Integer(D_OUT, SER_LEN(vect));
-        return R_OUT;
+    case SYM_REFLECT: {
+        INCLUDE_PARAMS_OF_REFLECT;
+
+        UNUSED(ARG(value));
+        REBSYM property = VAL_WORD_SYM(ARG(property));
+        assert(property != SYM_0);
+
+        switch (property) {
+        case SYM_LENGTH:
+            //bits = 1 << (vect->size & 3);
+            Init_Integer(D_OUT, SER_LEN(vect));
+            return R_OUT;
+
+        default:
+            break;
+        }
+
+        break; }
 
     case SYM_COPY: {
         INCLUDE_PARAMS_OF_COPY;
@@ -650,9 +671,9 @@ REBTYPE(Vector)
         }
 
         ser = Copy_Sequence(vect);
-        ser->misc.size = vect->misc.size; // attributes
+        MISC(ser).size = MISC(vect).size; // attributes
         Init_Vector(value, ser);
-        break; }
+        goto return_vector; }
 
     case SYM_RANDOM: {
         INCLUDE_PARAMS_OF_RANDOM;
@@ -668,89 +689,93 @@ REBTYPE(Vector)
         return R_OUT; }
 
     default:
-        fail (Error_Illegal_Action(VAL_TYPE(value), action));
+        break;
     }
 
+    fail (Error_Illegal_Action(VAL_TYPE(value), action));
+
+return_vector:
     Move_Value(D_OUT, value);
     return R_OUT;
 }
 
 
 //
-//  Mold_Vector: C
+//  MF_Vector: C
 //
-void Mold_Vector(const REBVAL *value, REB_MOLD *mold, REBOOL molded)
+void MF_Vector(REB_MOLD *mo, const RELVAL *v, REBOOL form)
 {
-    REBSER *vect = VAL_SERIES(value);
+    REBSER *vect = VAL_SERIES(v);
     REBYTE *data = SER_DATA_RAW(vect);
-    REBCNT bits  = VECT_TYPE(vect);
-//  REBCNT dims  = vect->size >> 8;
+    REBCNT bits = VECT_TYPE(vect);
+
     REBCNT len;
     REBCNT n;
-    REBCNT c;
-    union {REBU64 i; REBDEC d;} v;
-    REBYTE buf[32];
-    REBYTE l;
-
-    if (GET_MOPT(mold, MOPT_MOLD_ALL)) {
-        len = VAL_LEN_HEAD(value);
+    if (GET_MOLD_FLAG(mo, MOLD_FLAG_ALL)) {
+        len = VAL_LEN_HEAD(v);
         n = 0;
     } else {
-        len = VAL_LEN_AT(value);
-        n = VAL_INDEX(value);
+        len = VAL_LEN_AT(v);
+        n = VAL_INDEX(v);
     }
 
-    if (molded) {
+    if (NOT(form)) {
         enum Reb_Kind kind = (bits >= VTSF08) ? REB_DECIMAL : REB_INTEGER;
-        Pre_Mold(value, mold);
-        if (!GET_MOPT(mold, MOPT_MOLD_ALL))
-            Append_Codepoint_Raw(mold->series, '[');
+        Pre_Mold(mo, v);
+        if (NOT_MOLD_FLAG(mo, MOLD_FLAG_ALL))
+            Append_Codepoint(mo->series, '[');
         if (bits >= VTUI08 && bits <= VTUI64)
-            Append_Unencoded(mold->series, "unsigned ");
+            Append_Unencoded(mo->series, "unsigned ");
         Emit(
-            mold,
+            mo,
             "N I I [",
             Canon(SYM_FROM_KIND(kind)),
             bit_sizes[bits & 3],
             len
         );
         if (len)
-            New_Indented_Line(mold);
+            New_Indented_Line(mo);
     }
 
-    c = 0;
+    REBCNT c = 0;
     for (; n < SER_LEN(vect); n++) {
-        v.i = get_vect(bits, data, n);
+        union {REBU64 i; REBDEC d;} u;
+
+        u.i = get_vect(bits, data, n);
+
+        REBYTE buf[32];
+        REBYTE l;
         if (bits < VTSF08) {
-            l = Emit_Integer(buf, v.i);
+            l = Emit_Integer(buf, u.i);
         } else {
-            l = Emit_Decimal(buf, v.d, 0, '.', mold->digits);
+            l = Emit_Decimal(buf, u.d, 0, '.', mo->digits);
         }
-        Append_Unencoded_Len(mold->series, s_cast(buf), l);
+        Append_Unencoded_Len(mo->series, s_cast(buf), l);
 
         if ((++c > 7) && (n + 1 < SER_LEN(vect))) {
-            New_Indented_Line(mold);
+            New_Indented_Line(mo);
             c = 0;
         }
         else
-            Append_Codepoint_Raw(mold->series, ' ');
+            Append_Codepoint(mo->series, ' ');
     }
 
     if (len) {
         //
         // remove final space (overwritten with terminator)
         //
-        TERM_UNI_LEN(mold->series, UNI_LEN(mold->series) - 1);
+        TERM_UNI_LEN(mo->series, UNI_LEN(mo->series) - 1);
     }
 
-    if (molded) {
-        if (len) New_Indented_Line(mold);
-        Append_Codepoint_Raw(mold->series, ']');
-        if (!GET_MOPT(mold, MOPT_MOLD_ALL)) {
-            Append_Codepoint_Raw(mold->series, ']');
+    if (NOT(form)) {
+        if (len)
+            New_Indented_Line(mo);
+        Append_Codepoint(mo->series, ']');
+        if (NOT_MOLD_FLAG(mo, MOLD_FLAG_ALL)) {
+            Append_Codepoint(mo->series, ']');
         }
         else {
-            Post_Mold(value, mold);
+            Post_Mold(mo, v);
         }
     }
 }

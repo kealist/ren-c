@@ -44,6 +44,9 @@ fix-randutils.c: func [
             ;randutils.c:137:12: error: invalid conversion from ‘void*’ to ‘unsigned char*’ 
             | change {cp = buf} {cp = (unsigned char*)buf}
 
+            ; Fix "error: invalid suffix on literal; C++11 requires a space between literal and identifier"
+            | change {"PRIu64"} {" PRIu64 "}
+
             | skip
         ]
     ]
@@ -64,6 +67,8 @@ fix-gen_uuid.c: function [
         {"all-io.h"}
         | {"c.h"}
         | {"strutils.h"}
+        | {"md5.h"}
+        | {"sha1.h"}
     ]
 
     parse cnt [
@@ -75,6 +80,32 @@ fix-gen_uuid.c: function [
 
             ; avoid "unused node_id" warning
             | {get_node_id} thru #"^{" thru "^/" insert {^/^-(void)node_id;^/}
+
+            ; comment out uuid_generate_md5, we don't need this
+            | change [
+                copy definition: [
+                    {void uuid_generate_md5(} thru "^}"
+                  ]
+                  (target: unspaced [{#if 0^/} to string! definition {^/#endif^/}])
+                ]
+                target
+
+            ; comment out uuid_generate_sha1, we don't need this
+            | change [
+                copy definition: [
+                    {void uuid_generate_sha1(} thru "^}"
+                  ]
+                  (target: unspaced [{#if 0^/} to string! definition {^/#endif^/}])
+                ]
+                target
+
+            ; comment out unused variable variant_bits
+            | change [
+                copy unused: [
+                    {static unsigned char variant_bits[]}
+                  ]
+                  (target: unspaced [{// } to string! unused])
+                ] target
 
             | skip
         ]

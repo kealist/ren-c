@@ -49,22 +49,13 @@
         (FLAGIT_LEFT(TYPE_SPECIFIC_BIT + (n)) | HEADERIZE_KIND(REB_WORD))
 #endif
 
-// `WORD_FLAG_BOUND` answers whether a word is bound, but it may be
-// relatively bound if `VALUE_FLAG_RELATIVE` is set.  In that case, it
-// does not have a context pointer but rather a function pointer, that
-// must be combined with more information to get the FRAME! where the
-// word should actually be looked up.
-//
-// If VALUE_FLAG_RELATIVE is set, then WORD_FLAG_BOUND must also be set.
-//
-#define WORD_FLAG_BOUND WORD_FLAG(0)
-
+inline static REBOOL IS_WORD_UNBOUND(const RELVAL *v) {
+    assert(ANY_WORD(v));
+    return LOGICAL(v->extra.binding == UNBOUND);
+}
 
 #define IS_WORD_BOUND(v) \
-    GET_VAL_FLAG((v), WORD_FLAG_BOUND)
-
-#define IS_WORD_UNBOUND(v) \
-    NOT(IS_WORD_BOUND(v))
+    NOT(IS_WORD_UNBOUND(v))
 
 inline static REBSTR *VAL_WORD_SPELLING(const RELVAL *v) {
     assert(ANY_WORD(v));
@@ -85,30 +76,41 @@ inline static const REBYTE *VAL_WORD_HEAD(const RELVAL *v) {
 }
 
 inline static void INIT_WORD_CONTEXT(RELVAL *v, REBCTX *context) {
-    assert(GET_VAL_FLAG(v, WORD_FLAG_BOUND) && context != SPECIFIED);
+    //
+    // !!! Is it a good idea to be willing to do the ENSURE here?
+    // See weirdness in Copy_Body_Deep_Bound_To_New_Context()
+    //
     ENSURE_ARRAY_MANAGED(CTX_VARLIST(context));
+
     ASSERT_ARRAY_MANAGED(CTX_KEYLIST(context));
-    v->extra.binding = CTX_VARLIST(context);
+    INIT_BINDING(v, context);
 }
 
 inline static REBCTX *VAL_WORD_CONTEXT(const REBVAL *v) {
-    assert(GET_VAL_FLAG((v), WORD_FLAG_BOUND));
-    return VAL_SPECIFIC(v);
-}
+    assert(IS_WORD_BOUND(v));
+    REBNOD *binding = VAL_BINDING(v);
+    if (binding->header.bits & NODE_FLAG_CELL) {
+        //
+        // Bound specifically to a REBFRM* that isn't reified.  Force
+        // a reification, for now.
+        //
+        REBFRM *f = cast(REBFRM*, binding);
+        return Context_For_Frame_May_Reify_Managed(f);
+    }
 
-inline static void INIT_WORD_FUNC(RELVAL *v, REBFUN *func) {
-    assert(GET_VAL_FLAG(v, WORD_FLAG_BOUND));
-    v->extra.binding = FUNC_PARAMLIST(func);
+    // Bound specifically to a REBCTX*.
+    //
+    assert(binding->header.bits & ARRAY_FLAG_VARLIST);
+    return CTX(binding);
 }
 
 inline static REBFUN *VAL_WORD_FUNC(const RELVAL *v) {
-    assert(GET_VAL_FLAG(v, WORD_FLAG_BOUND));
+    assert(IS_WORD_BOUND(v));
     return VAL_RELATIVE(v);
 }
 
 inline static void INIT_WORD_INDEX(RELVAL *v, REBCNT i) {
-    assert(ANY_WORD(v));
-    assert(GET_VAL_FLAG((v), WORD_FLAG_BOUND));
+    assert(IS_WORD_BOUND(v));
     assert(SAME_STR(
         VAL_WORD_SPELLING(v),
         IS_RELATIVE(v)
@@ -119,14 +121,14 @@ inline static void INIT_WORD_INDEX(RELVAL *v, REBCNT i) {
 }
 
 inline static REBCNT VAL_WORD_INDEX(const RELVAL *v) {
-    assert(ANY_WORD(v));
+    assert(IS_WORD_BOUND(v));
     REBINT i = v->payload.any_word.index;
     assert(i > 0);
     return cast(REBCNT, i);
 }
 
 inline static void Unbind_Any_Word(RELVAL *v) {
-    CLEAR_VAL_FLAGS(v, WORD_FLAG_BOUND | VALUE_FLAG_RELATIVE);
+    INIT_BINDING(v, UNBOUND);
 #if !defined(NDEBUG)
     v->payload.any_word.index = 0;
 #endif
@@ -141,6 +143,7 @@ inline static void Init_Any_Word(
 
     assert(spelling != NULL);
     out->payload.any_word.spelling = spelling;
+    INIT_BINDING(out, UNBOUND);
 
 #if !defined(NDEBUG)
     out->payload.any_word.index = 0;
@@ -177,9 +180,7 @@ inline static void Init_Any_Word_Bound(
     REBCTX *context,
     REBCNT index
 ) {
-    assert(CTX_KEY_CANON(context, index) == STR_CANON(spelling));
-
-    VAL_RESET_HEADER_EXTRA(out, type, WORD_FLAG_BOUND);
+    VAL_RESET_HEADER(out, type);
 
     assert(spelling != NULL);
     out->payload.any_word.spelling = spelling;
@@ -193,4 +194,65 @@ inline static void Init_Any_Word_Bound(
 
 inline static void Canonize_Any_Word(REBVAL *any_word) {
     any_word->payload.any_word.spelling = VAL_WORD_CANON(any_word);
+}
+
+// To make interfaces easier for some functions that take REBSTR* strings,
+// it can be useful to allow passing UTF-8 text, a REBVAL* with an ANY-WORD!
+// or ANY-STRING!, or just plain UTF-8 text.
+//
+// !!! Should VOID_CELL or other arguments make anonymous symbols?
+//
+#ifdef CPLUSPLUS_11
+template<typename T>
+inline static REBSTR* STR(const T *p)
+{
+    static_assert(
+        std::is_same<T, REBVAL>::value
+        || std::is_same<T, char>::value
+        || std::is_same<T, REBSTR>::value,
+        "STR works on: char*, REBVAL*, REBSTR*"
+    );
+#else
+inline static REBSTR* STR(const void *p)
+{
+#endif
+    switch (Detect_Rebol_Pointer(p)) {
+    case DETECTED_AS_UTF8: {
+        const char *utf8 = cast(const char*, p);
+        return Intern_UTF8_Managed(cb_cast(utf8), strlen(utf8)); }
+
+    case DETECTED_AS_SERIES: {
+        REBSER *s = m_cast(REBSER*, cast(const REBSER*, p));
+        assert(GET_SER_FLAG(s, SERIES_FLAG_UTF8_STRING));
+        return s; }
+
+    case DETECTED_AS_VALUE: {
+        const REBVAL *v = cast(const REBVAL*, p);
+        if (ANY_WORD(v))
+            return VAL_WORD_SPELLING(v);
+
+        assert(ANY_STRING(v));
+
+        // The string may be mutable, so we wouldn't want to store it
+        // persistently as-is.  Consider:
+        //
+        //     file: copy %test
+        //     x: transcode/file data1 file
+        //     append file "-2"
+        //     y: transcode/file data2 file
+        //
+        // You would not want the change of `file` to affect the filename
+        // references in x's loaded source.  So the series shouldn't be used
+        // directly, and as long as another reference is needed, use an
+        // interned one (the same mechanic words use).  Since the source
+        // filename may be a wide string it is converted to UTF-8 first.
+        //
+        REBCNT index = VAL_INDEX(v);
+        REBCNT len = VAL_LEN_AT(v);
+        REBSER *temp = Temp_UTF8_At_Managed(v, &index, &len);
+        return Intern_UTF8_Managed(BIN_AT(temp, index), len); }
+
+    default:
+        panic ("Bad pointer type passed to STR()");
+    }
 }

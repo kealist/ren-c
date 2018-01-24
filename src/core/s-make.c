@@ -117,29 +117,33 @@ REBSER *Copy_Bytes_To_Unicode(REBYTE *src, REBINT len)
 // Create a REBOL string series from a wide char string.
 // Minimize to bytes if possible
 //
-REBSER *Copy_Wide_Str(void *src, REBINT len)
+REBSER *Copy_Wide_Str(const wchar_t *ws, REBINT len)
 {
+    assert(sizeof(REBUNI) == sizeof(wchar_t));
+
     REBSER *dst;
-    REBUNI *str = (REBUNI*)src;
-    if (Is_Wide(str, len)) {
-        REBUNI *up;
+    if (All_Codepoints_Latin1(cast(const REBUNI*, ws), len)) {
         dst = Make_Unicode(len);
         SET_SERIES_LEN(dst, len);
-        up = UNI_HEAD(dst);
-        while (len-- > 0) *up++ = *str++;
+
+        REBUNI *up = UNI_HEAD(dst);
+        while (len-- > 0)
+            *up++ = *ws++;
         *up = 0;
     }
     else {
-        REBYTE *bp;
         dst = Make_Binary(len);
         SET_SERIES_LEN(dst, len);
-        bp = BIN_HEAD(dst);
-        while (len-- > 0) *bp++ = (REBYTE)*str++;
+
+        REBYTE *bp = BIN_HEAD(dst);
+        while (len-- > 0)
+            *bp++ = cast(REBYTE, *ws++);
         *bp = 0;
     }
     ASSERT_SERIES_TERM(dst);
     return dst;
 }
+
 
 //
 //  Copy_OS_Str: C
@@ -152,12 +156,12 @@ REBSER *Copy_Wide_Str(void *src, REBINT len)
 // For Linux the char string could be UTF-8, so that must be
 // converted to REBOL Unicode or Latin byte strings.
 //
-REBSER *Copy_OS_Str(void *src, REBINT len)
+REBSER *Copy_OS_Str(const void *src, REBINT len)
 {
 #ifdef OS_WIDE_CHAR
-    return Copy_Wide_Str(src, len);
+    return Copy_Wide_Str(cast(const wchar_t*, src), len);
 #else
-    return Decode_UTF_String((REBYTE*)src, len, 8);
+    return Decode_UTF_String(cast(const REBYTE*, src), len, 8);
 #endif
 }
 
@@ -332,7 +336,7 @@ REBCHR *Val_Str_To_OS_Managed(REBSER **out, REBVAL *val)
     }
     else {
         // !!! "Leaks" in the sense that the GC has to take care of this
-        REBSER *ser = Temp_Bin_Str_Managed(val, 0, NULL);
+        REBSER *ser = Temp_UTF8_At_Managed(val, 0, NULL);
 
         if (out) *out = ser;
 
@@ -394,12 +398,12 @@ REBSER *Append_Unencoded(REBSER *dst, const char *src)
 
 
 //
-//  Append_Codepoint_Raw: C
+//  Append_Codepoint: C
 //
 // Optimized function to append a non-encoded character.
 // Destination can be 1 or 2 bytes wide, but DOES NOT WIDEN.
 //
-REBSER *Append_Codepoint_Raw(REBSER *dst, REBCNT codepoint)
+REBSER *Append_Codepoint(REBSER *dst, REBCNT codepoint)
 {
     REBCNT tail = SER_LEN(dst);
 
@@ -439,7 +443,7 @@ REBSER *Make_Series_Codepoint(REBCNT codepoint)
     out = (codepoint > 255) ? Make_Unicode(1) : Make_Binary(1);
     TERM_SEQUENCE(out);
 
-    Append_Codepoint_Raw(out, codepoint);
+    Append_Codepoint(out, codepoint);
 
     return out;
 }

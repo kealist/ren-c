@@ -59,6 +59,32 @@ void TO_Unit(REBVAL *out, enum Reb_Kind kind, const REBVAL *data) {
 
 
 //
+//  MF_Unit: C
+//
+void MF_Unit(REB_MOLD *mo, const RELVAL *v, REBOOL form)
+{
+    UNUSED(form); // no distinction between MOLD and FORM
+
+    switch (VAL_TYPE(v)) {
+    case REB_BAR:
+        Append_Unencoded(mo->series, "|");
+        break;
+
+    case REB_LIT_BAR:
+        Append_Unencoded(mo->series, "'|");
+        break;
+
+    case REB_BLANK:
+        Append_Unencoded(mo->series, "_");
+        break;
+
+    default:
+        panic (v);
+    }
+}
+
+
+//
 //  REBTYPE: C
 //
 REBTYPE(Unit)
@@ -67,11 +93,28 @@ REBTYPE(Unit)
     assert(!IS_VOID(val));
 
     switch (action) {
-    case SYM_TAIL_Q:
-        return R_TRUE;
 
-    case SYM_INDEX_OF:
-    case SYM_LENGTH_OF:
+    case SYM_REFLECT: {
+        INCLUDE_PARAMS_OF_REFLECT;
+
+        UNUSED(ARG(value)); // covered by `val` above
+        REBSYM property = VAL_WORD_SYM(ARG(property));
+        assert(property != SYM_0);
+
+        switch (property) {
+        case SYM_TAIL_Q:
+            return R_TRUE;
+
+        case SYM_INDEX:
+        case SYM_LENGTH:
+            return R_BLANK;
+
+        default:
+            break;
+        }
+
+        break; }
+
     case SYM_SELECT_P:
     case SYM_FIND:
     case SYM_REMOVE:
@@ -106,6 +149,19 @@ REBINT CT_Handle(const RELVAL *a, const RELVAL *b, REBINT mode)
     fail ("Currently comparing HANDLE! types is not allowed.");
 }
 
+
+//
+//  MF_Handle: C
+//
+void MF_Handle(REB_MOLD *mo, const RELVAL *v, REBOOL form)
+{
+    // Value has no printable form, so just print its name.
+
+    if (form)
+        Emit(mo, "?T?", v);
+    else
+        Emit(mo, "+T", v);
+}
 
 
 //

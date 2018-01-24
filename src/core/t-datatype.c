@@ -67,6 +67,25 @@ void TO_Datatype(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg) {
 
 
 //
+//  MF_Datatype: C
+//
+void MF_Datatype(REB_MOLD *mo, const RELVAL *v, REBOOL form)
+{
+    REBSTR *name = Canon(VAL_TYPE_SYM(v));
+#if !defined(NDEBUG)
+    if (LEGACY(OPTIONS_PAREN_INSTEAD_OF_GROUP)) {
+        if (VAL_TYPE_KIND(v) == REB_GROUP)
+            name = Canon(SYM_PAREN_X); // e_Xclamation point (PAREN!)
+    }
+#endif
+    if (form)
+        Emit(mo, "N", name);
+    else
+        Emit(mo, "+DN", SYM_DATATYPE_X, name);
+}
+
+
+//
 //  REBTYPE: C
 //
 REBTYPE(Datatype)
@@ -101,18 +120,18 @@ REBTYPE(Datatype)
             assert(VAL_KEY_SYM(key) == SYM_SELF);
             ++key; ++var;
 
-            RELVAL *value = ARR_HEAD(
+            RELVAL *item = ARR_HEAD(
                 VAL_TYPE_SPEC(CTX_VAR(Lib_Context, SYM_FROM_KIND(kind)))
             );
 
             for (; NOT_END(var); ++var, ++key) {
-                if (IS_END(value))
+                if (IS_END(item))
                     Init_Blank(var);
                 else {
                     // typespec array does not contain relative values
                     //
-                    Derelativize(var, value, SPECIFIED);
-                    ++value;
+                    Derelativize(var, item, SPECIFIED);
+                    ++item;
                 }
             }
 

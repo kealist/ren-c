@@ -48,14 +48,16 @@
 inline static REB_R Vararg_Op_If_No_Advance(
     REBVAL *out,
     enum Reb_Vararg_Op op,
-    const RELVAL *look,
+    const RELVAL *opt_look, // the first value in the varargs input
     REBSPC *specifier,
     enum Reb_Param_Class pclass
 ){
-    if (IS_END(look))
+    if (opt_look == NULL)
         return R_For_Vararg_End(op); // exhausted
 
-    if (IS_BAR(look)) {
+    assert(NOT_END(opt_look));
+
+    if (IS_BAR(opt_look)) {
         //
         // Only hard quotes are allowed to see BAR! (and if they do, they
         // are *encouraged* to test the evaluated bit and error on literals,
@@ -72,12 +74,12 @@ inline static REB_R Vararg_Op_If_No_Advance(
             return R_UNHANDLED; // advance frame/array to consume BAR!
         }
 
-        return R_For_Vararg_End(op);
+        return R_For_Vararg_End(op); // simulate exhaustion for non hard quote
     }
 
     if (
         (pclass == PARAM_CLASS_NORMAL || pclass == PARAM_CLASS_TIGHT)
-        && IS_WORD(look)
+        && IS_WORD(opt_look)
     ){
         // When a variadic argument is being TAKE-n, deferred left hand side
         // argument needs to be seen as end of variadic input.  Otherwise,
@@ -91,7 +93,7 @@ inline static REB_R Vararg_Op_If_No_Advance(
         // and the rules apply.  Note the raw check is faster, no need to
         // separately test for IS_END()
 
-        const REBVAL *child_gotten = Get_Opt_Var_Else_End(look, specifier);
+        const REBVAL *child_gotten = Get_Opt_Var_Else_End(opt_look, specifier);
 
         if (VAL_TYPE_OR_0(child_gotten) == REB_FUNCTION) {
             if (GET_VAL_FLAG(child_gotten, VALUE_FLAG_ENFIXED)) {
@@ -115,7 +117,7 @@ inline static REB_R Vararg_Op_If_No_Advance(
         if (pclass != PARAM_CLASS_HARD_QUOTE)
             fail (Error_Varargs_No_Look_Raw()); // hard quote only
 
-        Derelativize(out, look, specifier);
+        Derelativize(out, opt_look, specifier);
         SET_VAL_FLAG(out, VALUE_FLAG_UNEVALUATED);
 
         return R_OUT; // only a lookahead, no need to advance
@@ -138,84 +140,69 @@ inline static REB_R Vararg_Op_If_No_Advance(
 // check the result, and if an error is delivered it will use the name of
 // the parameter symbol in the fail() message.
 //
-// * returns THROWN_FLAG if it takes from an evaluating vararg that throws
+// If op is VARARG_OP_TAIL_Q, then it will return R_TRUE or R_FALSE, and
+// this case cannot return R_OUT_IS_THROWN.
 //
-// * returns END_FLAG if it reaches the end of an entire input chain
+// For other ops, it will return R_VOID if at the end of variadic input,
+// or R_OUT if there is a value.  Note that since this can perform evaluations
+// that R_OUT with out as void means an evaluation to void was performed,
+// while R_VOID means it really physically hit the end of the frame/block.
 //
-// * returns VA_LIST_FLAG if the input is not exhausted
-//
-// Note: Returning VA_LIST_FLAG is probably a lie, since the odds of the
-// underlying varargs being from a FRAME! running on a C `va_list` aren't
-// necessarily that high.  For now it is a good enough signal simply because
-// it is not an index number, so it is an opaque way of saying "there is
-// still more data"--and it's the same type as END_FLAG and THROWN_FLAG.
+// If an evaluation is involved, then R_OUT_IS_THROWN is possibly returned.
 //
 REB_R Do_Vararg_Op_May_Throw(
     REBVAL *out,
     RELVAL *vararg,
     enum Reb_Vararg_Op op
-) {
-    assert(IS_END(out));
+){
+#if !defined(NDEBUG)
+    if (op != VARARG_OP_TAIL_Q)
+        TRASH_CELL_IF_DEBUG(out);
+#endif
 
     const RELVAL *param; // for type checking
     enum Reb_Param_Class pclass;
 
     REBVAL *arg; // for updating VALUE_FLAG_UNEVALUATED
-    REBSTR *label;
 
-    if (vararg->extra.binding == NULL) {
+    REBARR *facade = vararg->payload.varargs.facade;
+    if (facade == NULL) {
         //
         // A vararg created from a block AND never passed as an argument
         // so no typeset or quoting settings available.  Treat as "normal"
         // parameter.
         //
         assert(
-            NOT_SER_FLAG(
-                vararg->payload.varargs.feed, ARRAY_FLAG_VARLIST
-            )
+            NOT(vararg->extra.binding->header.bits & NODE_FLAG_CELL)
+            && NOT(vararg->extra.binding->header.bits & ARRAY_FLAG_VARLIST)
         );
         pclass = PARAM_CLASS_NORMAL;
         param = NULL; // doesn't correspond to a real varargs parameter
-        arg = NULL; // no corresponding varargs argument either
-        label = Canon(SYM___ANONYMOUS__);
     }
     else {
-        REBCTX *context = CTX(vararg->extra.binding);
-        REBFRM *param_frame = CTX_FRAME_IF_ON_STACK(context);
-
-        // If the VARARGS! has a call frame, then ensure that the call frame
-        // where the VARARGS! originated is still on the stack.
-        //
-        if (param_frame == NULL)
-            fail (Error_Varargs_No_Stack_Raw());
-
-        param = FUNC_FACADE_HEAD(param_frame->phase)
-            + vararg->payload.varargs.param_offset;
+        param = ARR_AT(facade, vararg->payload.varargs.param_offset + 1);
         pclass = VAL_PARAM_CLASS(param);
-
-        arg = param_frame->args_head + vararg->payload.varargs.param_offset;
-
-        label = FRM_LABEL(param_frame);
     }
 
     REB_R r;
+    REBFRM *opt_vararg_frame;
 
-    if (NOT_SER_FLAG(vararg->payload.varargs.feed, ARRAY_FLAG_VARLIST)) {
+    REBFRM *f;
+    REBVAL *shared;
+    if (Is_Block_Style_Varargs(&shared, vararg)) {
         //
         // We are processing an ANY-ARRAY!-based varargs, which came from
         // either a MAKE VARARGS! on an ANY-ARRAY! value -or- from a
         // MAKE ANY-ARRAY! on a varargs (which reified the varargs into an
         // array during that creation, flattening its entire output).
 
-        REBARR *array1 = vararg->payload.varargs.feed;
-        REBVAL *shared = KNOWN(ARR_HEAD(array1));
-
-        assert(IS_END(shared) || (IS_BLOCK(shared) && ARR_LEN(array1) == 1));
+        opt_vararg_frame = NULL;
+        arg = NULL; // no corresponding varargs argument either
 
         r = Vararg_Op_If_No_Advance(
             out,
             op,
-            IS_END(shared) ? END : VAL_ARRAY_AT(shared),
+            IS_END(shared) ? NULL : VAL_ARRAY_AT(shared), // NULL is protocol
             IS_END(shared) ? SPECIFIED : VAL_SPECIFIER(shared),
             pclass
         );
@@ -226,9 +213,9 @@ REB_R Do_Vararg_Op_May_Throw(
         switch (pclass) {
         case PARAM_CLASS_NORMAL:
         case PARAM_CLASS_TIGHT: {
-            DECLARE_FRAME (f);
+            DECLARE_FRAME (f_temp);
             Push_Frame_At(
-                f,
+                f_temp,
                 VAL_ARRAY(shared),
                 VAL_INDEX(shared),
                 VAL_SPECIFIER(shared),
@@ -240,23 +227,23 @@ REB_R Do_Vararg_Op_May_Throw(
             // Note: Do_Next_In_Subframe_Throws() is not needed here because
             // this is a single use frame, whose state can be overwritten.
             //
-            if (Do_Next_In_Frame_Throws(out, f)) {
-                Drop_Frame(f);
+            if (Do_Next_In_Frame_Throws(out, f_temp)) {
+                Drop_Frame(f_temp);
                 return R_OUT_IS_THROWN;
             }
 
-            if (IS_END(f->value))
+            if (FRM_AT_END(f_temp))
                 SET_END(shared); // signal end to all varargs sharing value
             else {
                 // The indexor is "prefetched", so though the temp_frame would
                 // be ready to use again we're throwing it away, and need to
                 // effectively "undo the prefetch" by taking it down by 1.
                 //
-                assert(f->index > 0);
-                VAL_INDEX(shared) = f->index - 1; // seen by all sharings
+                assert(f_temp->source.index > 0);
+                VAL_INDEX(shared) = f_temp->source.index - 1; // all sharings
             }
 
-            Drop_Frame(f);
+            Drop_Frame(f_temp);
             break; }
 
         case PARAM_CLASS_HARD_QUOTE:
@@ -284,19 +271,18 @@ REB_R Do_Vararg_Op_May_Throw(
             fail ("Invalid variadic parameter class");
         }
     }
-    else {
+    else if (Is_Frame_Style_Varargs_May_Fail(&f, vararg)) {
+        //
         // "Ordinary" case... use the original frame implied by the VARARGS!
         // (so long as it is still live on the stack)
 
-        REBCTX *context = CTX(vararg->payload.varargs.feed);
-        REBFRM *f = CTX_FRAME_IF_ON_STACK(context);
-        if (f == NULL)
-            fail (Error_Varargs_No_Stack_Raw());
+        opt_vararg_frame = f;
+        arg = FRM_ARG(f, vararg->payload.varargs.param_offset + 1);
 
         r = Vararg_Op_If_No_Advance(
             out,
             op,
-            f->value,
+            f->value, // NULL if FRM_AT_END()
             f->specifier,
             pclass
         );
@@ -335,15 +321,16 @@ REB_R Do_Vararg_Op_May_Throw(
 
                 Fetch_Next_In_Frame(f);
             }
-            else { // not a soft-"exception" case, quote ordinarily
+            else // not a soft-"exception" case, quote ordinarily
                 Quote_Next_In_Frame(out, f);
-            }
             break;
 
         default:
             fail ("Invalid variadic parameter class");
         }
     }
+    else
+        panic ("Malformed VARARG cell");
 
     r = R_OUT;
 
@@ -357,8 +344,10 @@ type_check_and_return:
 
     assert(NOT(THROWN(out))); // should have returned above
 
-    if (param && NOT(TYPE_CHECK(param, VAL_TYPE(out))))
-        fail (Error_Arg_Type(label, param, VAL_TYPE(out)));
+    if (param && NOT(TYPE_CHECK(param, VAL_TYPE(out)))) {
+        assert(opt_vararg_frame != NULL); // !!! is this true?
+        fail (Error_Arg_Type(opt_vararg_frame, param, VAL_TYPE(out)));
+    }
 
     if (arg) {
         if (GET_VAL_FLAG(out, VALUE_FLAG_UNEVALUATED))
@@ -388,17 +377,20 @@ void MAKE_Varargs(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
         // Make a single-element array to hold a reference+index to the
         // incoming ANY-ARRAY!.  This level of indirection means all
         // VARARGS! copied from this will update their indices together.
+        // By protocol, if the array is exhausted then the shared element
+        // should be an END marker (not an array at its end)
         //
         REBARR *array1 = Alloc_Singular_Array();
-        Move_Value(ARR_HEAD(array1), arg);
+        if (IS_END(VAL_ARRAY_AT(arg)))
+            SET_END(ARR_HEAD(array1));
+        else
+            Move_Value(ARR_HEAD(array1), arg);
         MANAGE_ARRAY(array1);
 
         VAL_RESET_HEADER(out, REB_VARARGS);
-        out->extra.binding = NULL;
-    #if !defined(NDEBUG)
-        out->payload.varargs.param_offset = -1020;
-    #endif
-        out->payload.varargs.feed = array1;
+        out->payload.varargs.facade = NULL;
+        UNUSED(out->payload.varargs.param_offset); // trashes in C++11 build
+        INIT_BINDING(out, array1);
 
         return;
     }
@@ -428,26 +420,28 @@ void TO_Varargs(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
 //
 // Implements the PICK* operation.
 //
-REBINT PD_Varargs(REBPVS *pvs)
+REB_R PD_Varargs(REBPVS *pvs, const REBVAL *picker, const REBVAL *opt_setval)
 {
-    if (NOT(IS_INTEGER(pvs->picker)))
-        fail (pvs->picker);
+    UNUSED(opt_setval);
 
-    if (VAL_INT32(pvs->picker) != 1)
+    if (NOT(IS_INTEGER(picker)))
+        fail (picker);
+
+    if (VAL_INT32(picker) != 1)
         fail (Error_Varargs_No_Look_Raw());
 
-    DECLARE_LOCAL (specific);
-    Derelativize(specific, pvs->value, pvs->value_specifier);
+    DECLARE_LOCAL (location);
+    Move_Value(location, pvs->out);
 
-    REB_R r = Do_Vararg_Op_May_Throw(pvs->store, specific, VARARG_OP_FIRST);
+    REB_R r = Do_Vararg_Op_May_Throw(pvs->out, location, VARARG_OP_FIRST);
     if (r == R_OUT_IS_THROWN)
         assert(FALSE); // VARARG_OP_FIRST can't throw
     else if (r == R_VOID)
-        Init_Void(pvs->store);
+        Init_Void(pvs->out);
     else
         assert(r == R_OUT);
 
-    return PE_USE_STORE;
+    return R_OUT;
 }
 
 
@@ -464,12 +458,25 @@ REBTYPE(Varargs)
     switch (action) {
     // !!! SYM_PICK_P moved into PD_Varargs functionality, which PICK* uses
 
-    case SYM_TAIL_Q: {
-        REB_R r = Do_Vararg_Op_May_Throw(
-            m_cast(REBVAL*, END), value, VARARG_OP_TAIL_Q // won't write `out`
-        );
-        assert(r == R_TRUE || r == R_FALSE); // cannot throw
-        return r; }
+    case SYM_REFLECT: {
+        INCLUDE_PARAMS_OF_REFLECT;
+
+        UNUSED(ARG(value)); // already have `value`
+        REBSYM property = VAL_WORD_SYM(ARG(property));
+        assert(property != SYM_0);
+
+        switch (property) {
+        case SYM_TAIL_Q: {
+            REBVAL *out = NULL; // won't write to `out`
+            REB_R r = Do_Vararg_Op_May_Throw(out, value, VARARG_OP_TAIL_Q);
+            assert(r == R_TRUE || r == R_FALSE); // cannot throw
+            return r; }
+
+        default:
+            break;
+        }
+
+        break; }
 
     case SYM_TAKE_P: {
         INCLUDE_PARAMS_OF_TAKE_P;
@@ -512,8 +519,7 @@ REBTYPE(Varargs)
         // !!! What if caller wanted a REB_GROUP, REB_PATH, or an /INTO?
         //
         Init_Block(D_OUT, Pop_Stack_Values(dsp_orig));
-        return R_OUT;
-    }
+        return R_OUT; }
 
     default:
         break;
@@ -531,21 +537,21 @@ REBTYPE(Varargs)
 //
 REBINT CT_Varargs(const RELVAL *a, const RELVAL *b, REBINT mode)
 {
-    cast(void, mode);
+    UNUSED(mode);
 
     // !!! For the moment, say varargs are the same if they have the same
     // source feed from which the data comes.  (This check will pass even
     // expired varargs, because the expired stub should be kept alive as
     // long as its identity is needed).
     //
-    if (a->payload.varargs.feed == b->payload.varargs.feed)
+    if (Same_Binding(VAL_BINDING(a), VAL_BINDING(b)))
         return 1;
     return 0;
 }
 
 
 //
-//  Mold_Varargs: C
+//  MF_Varargs: C
 //
 // !!! The molding behavior was implemented to help with debugging the type,
 // but is not ready for prime-time.  Rather than risk crashing or presenting
@@ -553,22 +559,24 @@ REBINT CT_Varargs(const RELVAL *a, const RELVAL *b, REBINT mode)
 // VARARGS! have stabilized somewhat just how much information can (or should)
 // be given when printing these out (they should not "lookahead")
 //
-void Mold_Varargs(const REBVAL *v, REB_MOLD *mold) {
+void MF_Varargs(REB_MOLD *mo, const RELVAL *v, REBOOL form) {
+    UNUSED(form);
+
     assert(IS_VARARGS(v));
 
-    Pre_Mold(v, mold);  // #[varargs! or make varargs!
+    Pre_Mold(mo, v);  // #[varargs! or make varargs!
 
-    Append_Codepoint_Raw(mold->series, '[');
+    Append_Codepoint(mo->series, '[');
 
-    if (v->extra.binding == NULL) {
-        Append_Unencoded(mold->series, "???");
+    if (v->payload.varargs.facade == NULL) {
+        Append_Unencoded(mo->series, "???");
     }
     else {
         REBCTX *context = CTX(v->extra.binding);
         REBFRM *param_frame = CTX_FRAME_IF_ON_STACK(context);
 
         if (param_frame == NULL) {
-            Append_Unencoded(mold->series, "???");
+            Append_Unencoded(mo->series, "???");
         }
         else {
             const RELVAL *param
@@ -604,65 +612,64 @@ void Mold_Varargs(const REBVAL *v, REB_MOLD *mold) {
                 param_word, kind, VAL_PARAM_SPELLING(param)
             );
 
-            Mold_Value(mold, param_word, TRUE);
+            Mold_Value(mo, param_word);
         }
     }
 
-    Append_Unencoded(mold->series, " <= ");
+    Append_Unencoded(mo->series, " <= ");
 
-    REBARR *feed = v->payload.varargs.feed;
+    REBFRM *f;
 
-    if (NOT_SER_FLAG(feed, ARRAY_FLAG_VARLIST)) {
-        REBARR *array1 = feed;
+    if (VAL_BINDING(v)->header.bits & NODE_FLAG_CELL) {
+        f = cast(REBFRM*, VAL_BINDING(v));
+        goto have_f;
+    }
+    else if (NOT(VAL_BINDING(v)->header.bits & ARRAY_FLAG_VARLIST)) {
 
         { // Just [...] for now
-            Append_Unencoded(mold->series, "[...]");
+            Append_Unencoded(mo->series, "[...]");
             goto skip_complex_mold_for_now;
         }
-
+        /*
+        REBARR *array1 = ARR(VAL_BINDING(v));
         if (IS_END(ARR_HEAD(array1)))
-            Append_Unencoded(mold->series, "*exhausted*");
+            Append_Unencoded(mo->series, "*exhausted*");
         else
-            Mold_Value(mold, ARR_HEAD(array1), TRUE);
-    }
-    else if (NOT(IS_ARRAY_MANAGED(feed))) {
-        //
-        // This can happen if you internally try and PROBE() a varargs
-        // item that is residing in the argument slots for a function,
-        // while that function is still fulfilling its arguments.
-        //
-        Append_Unencoded(mold->series, "** varargs frame not fulfilled");
+            Mold_Value(mo, ARR_HEAD(array1));
+        */
     }
     else {
-        REBCTX *context = CTX(feed);
-        REBFRM *f = CTX_FRAME_IF_ON_STACK(context);
+        f = CTX_FRAME_IF_ON_STACK(CTX(VAL_BINDING(v)));
 
         if (f == NULL) {
-            Append_Unencoded(mold->series, "**unavailable: call ended **");
+            Append_Unencoded(mo->series, "**unavailable: call ended **");
         }
         else {
+        have_f:
             {// Just [...] for now
-                Append_Unencoded(mold->series, "[...]");
+                Append_Unencoded(mo->series, "[...]");
                 goto skip_complex_mold_for_now;
             }
 
-            if (IS_END(f->value))
-                Append_Unencoded(mold->series, "*exhausted*");
+            /*
+            if (FRM_AT_END(f))
+                Append_Unencoded(mo->series, "*exhausted*");
             else {
-                Mold_Value(mold, f->value, TRUE);
+                Mold_Value(mo, f->value);
 
-                if (f->flags.bits & DO_FLAG_VA_LIST)
-                    Append_Unencoded(mold->series, "*C varargs, pending*");
+                if (FRM_IS_VALIST(f))
+                    Append_Unencoded(mo->series, "*C varargs, pending*");
                 else
                     Mold_Array_At(
-                        mold, f->source.array, cast(REBCNT, f->index), NULL
+                        mo, f->source.array, cast(REBCNT, f->source.index), NULL
                     );
             }
+            */
         }
     }
 
 skip_complex_mold_for_now:
-    Append_Codepoint_Raw(mold->series, ']');
+    Append_Codepoint(mo->series, ']');
 
-    End_Mold(mold);
+    End_Mold(mo);
 }

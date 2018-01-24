@@ -38,30 +38,40 @@
 //
 static REB_R Serial_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
 {
-    REBVAL *spec;   // port spec
+    FAIL_IF_BAD_PORT(port);
+
     REBVAL *arg;    // action argument value
     REBINT result;  // IO result
     REBCNT len;     // generic length
     REBSER *ser;    // simplifier
-    REBVAL *path;
 
-    Move_Value(D_OUT, D_ARG(1));
-
-    // Validate PORT fields:
-    spec = CTX_VAR(port, STD_PORT_SPEC);
-    if (!IS_OBJECT(spec)) fail (Error_Invalid_Port_Raw());
-    path = Obj_Value(spec, STD_PORT_SPEC_HEAD_REF);
-    if (!path) fail (Error_Invalid_Spec_Raw(spec));
-
-    //if (!IS_FILE(path)) fail (Error_Invalid_Spec_Raw(path));
+    REBVAL *spec = CTX_VAR(port, STD_PORT_SPEC);
+    REBVAL *path = Obj_Value(spec, STD_PORT_SPEC_HEAD_REF);
+    if (path == NULL)
+        fail (Error_Invalid_Spec_Raw(spec));
 
     REBREQ *req = Ensure_Port_State(port, RDI_SERIAL);
     struct devreq_serial *serial = DEVREQ_SERIAL(req);
 
     // Actions for an unopened serial port:
-    if (!IS_OPEN(req)) {
-
+    if (NOT(req->flags & RRF_OPEN)) {
         switch (action) {
+
+        case SYM_REFLECT: {
+            INCLUDE_PARAMS_OF_REFLECT;
+
+            UNUSED(ARG(value));
+            REBSYM property = VAL_WORD_SYM(ARG(property));
+            assert(property != SYM_0);
+
+            switch (property) {
+            case SYM_OPEN_Q:
+                return R_FALSE;
+
+            default:
+                break; }
+
+            fail (Error_On_Port(RE_NOT_OPEN, port, -12)); }
 
         case SYM_OPEN:
             arg = Obj_Value(spec, STD_PORT_SPEC_SERIAL_PATH);
@@ -142,14 +152,11 @@ static REB_R Serial_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
 
             if (OS_DO_DEVICE(req, RDC_OPEN))
                 fail (Error_On_Port(RE_CANNOT_OPEN, port, -12));
-            SET_OPEN(req);
-            return R_OUT;
+            req->flags |= RRF_OPEN;
+            goto return_port;
 
         case SYM_CLOSE:
-            return R_OUT;
-
-        case SYM_OPEN_Q:
-            return R_FALSE;
+            goto return_port;
 
         default:
             fail (Error_On_Port(RE_NOT_OPEN, port, -12));
@@ -158,6 +165,23 @@ static REB_R Serial_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
 
     // Actions for an open socket:
     switch (action) {
+
+    case SYM_REFLECT: {
+        INCLUDE_PARAMS_OF_REFLECT;
+
+        UNUSED(ARG(value));
+        REBSYM property = VAL_WORD_SYM(ARG(property));
+        assert(property != SYM_0);
+
+        switch (property) {
+        case SYM_OPEN_Q:
+            return R_TRUE;
+
+        default:
+            break;
+        }
+
+        break; }
 
     case SYM_READ: {
         INCLUDE_PARAMS_OF_READ;
@@ -203,8 +227,7 @@ static REB_R Serial_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         }
         printf("\n");
 #endif
-        Move_Value(D_OUT, arg);
-        return R_OUT; }
+        goto return_port; }
 
     case SYM_WRITE: {
         INCLUDE_PARAMS_OF_WRITE;
@@ -242,9 +265,9 @@ static REB_R Serial_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         result = OS_DO_DEVICE(req, RDC_WRITE); // send can happen immediately
         if (result < 0)
             fail (Error_On_Port(RE_WRITE_ERROR, port, req->error));
-        break; }
+        goto return_port; }
 
-    case SYM_UPDATE:
+    case SYM_ON_WAKE_UP:
         // Update the port object after a READ or WRITE operation.
         // This is normally called by the WAKE-UP function.
         arg = CTX_VAR(port, STD_PORT_DATA);
@@ -261,20 +284,21 @@ static REB_R Serial_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         }
         return R_BLANK;
 
-    case SYM_OPEN_Q:
-        return R_TRUE;
-
     case SYM_CLOSE:
-        if (IS_OPEN(req)) {
+        if (req->flags & RRF_OPEN) {
             OS_DO_DEVICE(req, RDC_CLOSE);
-            SET_CLOSED(req);
+            req->flags &= ~RRF_OPEN;
         }
-        break;
+        goto return_port;
 
     default:
-        fail (Error_Illegal_Action(REB_PORT, action));
+        break;
     }
 
+    fail (Error_Illegal_Action(REB_PORT, action));
+
+return_port:
+    Move_Value(D_OUT, D_ARG(1));
     return R_OUT;
 }
 

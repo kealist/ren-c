@@ -165,7 +165,7 @@ inline static void DS_PUSH(const REBVAL *v) {
     #define DS_DROP_TO(dsp) \
         (DS_Index = dsp)
 #else
-    inline static void DS_DROP_Core() {
+    inline static void DS_DROP_Core(void) {
         // Note: DS_TOP checks to make sure it's not an END.
         Init_Unreadable_Blank(DS_TOP); // TRASH would mean ASSERT_ARRAY failing
         --DS_Index;
@@ -192,6 +192,9 @@ inline static void DS_PUSH(const REBVAL *v) {
 //
 #define Pop_Stack_Values(dsp) \
     Pop_Stack_Values_Core((dsp), SERIES_FLAG_FILE_LINE)
+
+#define Pop_Stack_Values_Keep_Eval_Flip(dsp) \
+    Pop_Stack_Values_Core((dsp), SERIES_FLAG_FILE_LINE | ARRAY_FLAG_VOIDS_LEGAL)
 
 
 //=////////////////////////////////////////////////////////////////////////=//
@@ -415,18 +418,17 @@ inline static REBVAL* Push_Value_Chunk_Of_Length(REBCNT num_values) {
 
     TG_Top_Chunk = chunk;
 
-
-    // Set all chunk cells writable.
+    // Make the chunk cells completely unformatted space in debug build.
+    // The parameter fulfillment walk has to do its own Prep_Stack_Cell
     //
-    // !!! Should be using VALUE_FLAG_STACK
-    {
+#if !defined(NDEBUG)
     REBCNT index;
     for (index = 0; index < num_values; index++)
-        INIT_CELL(&chunk->values[index]);
-    }
+        chunk->values[index].header.bits = 0;
+#endif
 
     assert(CHUNK_FROM_VALUES(&chunk->values[0]) == chunk);
-    return KNOWN(&chunk->values[0]);
+    return cast(REBVAL*, &chunk->values[0]);
 }
 
 

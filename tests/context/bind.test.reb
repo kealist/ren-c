@@ -1,6 +1,6 @@
 ; functions/context/bind.r
 ; bug#50
-[blank? context-of to word! "zzz"]
+[blank? context of to word! "zzz"]
 ; BIND works 'as expected' in object spec
 ; bug#1549
 [
@@ -16,16 +16,6 @@
 [
     b1: [self]
     f: func [/local b2] [
-        b2: [self]
-        same? first b2 first bind/copy b1 'b2
-    ]
-    f
-]
-; bug#1549
-; BIND works 'as expected' in closure body
-[
-    b1: [self]
-    f: closure [/local b2] [
         b2: [self]
         same? first b2 first bind/copy b1 'b2
     ]

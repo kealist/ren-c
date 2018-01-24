@@ -106,7 +106,7 @@
 
 //=////////////////////////////////////////////////////////////////////////=//
 //
-//  VALUE_FLAG_CONDITIONAL_FALSE
+//  VALUE_FLAG_FALSEY
 //
 //=////////////////////////////////////////////////////////////////////////=//
 //
@@ -125,7 +125,7 @@
 // the modern codebase, this optimization may need to be sacrificed to
 // reclaim the bit for a "higher purpose".
 //
-#define VALUE_FLAG_CONDITIONAL_FALSE \
+#define VALUE_FLAG_FALSEY \
     FLAGIT_LEFT(GENERAL_VALUE_BIT + 0)
 
 
@@ -151,26 +151,6 @@
 
 //=////////////////////////////////////////////////////////////////////////=//
 //
-//  VALUE_FLAG_RELATIVE
-//
-//=////////////////////////////////////////////////////////////////////////=//
-//
-// This flag is used to indicate a value that needs to have a specific context
-// added into it before it can have its bits copied--or used for some other
-// purposes.
-//
-// An ANY-WORD! is relative if it refers to a local or argument of a function,
-// and has its bits resident in the deep copy of that function's body.
-//
-// An ANY-ARRAY! in the deep copy of a function body must be relative also to
-// the same function if it contains any instances of such relative words.
-//
-#define VALUE_FLAG_RELATIVE \
-    FLAGIT_LEFT(GENERAL_VALUE_BIT + 2)
-
-
-//=////////////////////////////////////////////////////////////////////////=//
-//
 //  VALUE_FLAG_UNEVALUATED
 //
 //=////////////////////////////////////////////////////////////////////////=//
@@ -192,7 +172,7 @@
 // That has a lot of impact for the new user experience.
 //
 #define VALUE_FLAG_UNEVALUATED \
-    FLAGIT_LEFT(GENERAL_VALUE_BIT + 3)
+    FLAGIT_LEFT(GENERAL_VALUE_BIT + 2)
 
 
 //=////////////////////////////////////////////////////////////////////////=//
@@ -218,7 +198,7 @@
 // !!! This feature is a work in progress.
 //
 #define VALUE_FLAG_STACK \
-    FLAGIT_LEFT(GENERAL_VALUE_BIT + 4)
+    FLAGIT_LEFT(GENERAL_VALUE_BIT + 3)
 
 
 //=////////////////////////////////////////////////////////////////////////=//
@@ -247,12 +227,12 @@
 //
 
 #define VALUE_FLAG_ENFIXED \
-    FLAGIT_LEFT(GENERAL_VALUE_BIT + 5)
+    FLAGIT_LEFT(GENERAL_VALUE_BIT + 4)
 
 
 //=////////////////////////////////////////////////////////////////////////=//
 //
-//  VALUE_FLAG_PROTECTED
+//  CELL_FLAG_PROTECTED
 //
 //=////////////////////////////////////////////////////////////////////////=//
 //
@@ -261,9 +241,34 @@
 // another location will not propagate the protectedness from the original
 // value to the copy.
 //
+// This is called a CELL_FLAG and not a VALUE_FLAG because any formatted cell
+// can be tested for it, even if it is "trash".  This means writing routines
+// that are putting data into a cell for the first time can check the bit.
+// (Series, having more than one kind of protection, put those bits in the
+// "info" so they can all be checked at once...otherwise there might be a
+// shared NODE_FLAG_PROTECTED in common.)
 
-#define VALUE_FLAG_PROTECTED \
+#define CELL_FLAG_PROTECTED \
+    FLAGIT_LEFT(GENERAL_VALUE_BIT + 5)
+
+
+//=////////////////////////////////////////////////////////////////////////=//
+//
+//  VALUE_FLAG_EVAL_FLIP
+//
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// !!! Highly experimental feature that may not want to be implemented as
+// a value flag.  If a DO is happening with DO_FLAG_EXPLICIT_EVALUATE, only
+// values which carry this bit will override it.  It may be the case that the
+// flag on a value would signal a kind of quoting to suppress evaluation in
+// ordinary evaluation (without DO_FLAG_EXPLICIT_EVALUATE), hence it is being
+// tested as a "flip" bit.
+//
+
+#define VALUE_FLAG_EVAL_FLIP \
     FLAGIT_LEFT(GENERAL_VALUE_BIT + 6)
+
 
 
 // v-- BEGIN TYPE SPECIFIC BITS HERE
@@ -273,15 +278,44 @@
     (GENERAL_VALUE_BIT + 7)
 
 
-// Technically speaking, this only needs to use 6 bits of the rightmost byte
-// to store the type.  So using a full byte wastes 2 bits.  However, the
-// performance advantage of not needing to mask to do VAL_TYPE() is worth
-// it...also there may be a use for 256 types (even though the type bitsets
-// are only 64-bits at the moment)
+//=////////////////////////////////////////////////////////////////////////=//
 //
-#define HEADERIZE_KIND(kind) \
-    FLAGBYTE_RIGHT(kind)
+//  Cell Reset and Copy Masks
+//
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// It's important for operations that write to cells not to overwrite *all*
+// the bits in the header, because some of those bits give information about
+// the nature of the cell's storage and lifetime.  Similarly, if bits are
+// being copied from one cell to another, those header bits must be masked
+// out to avoid corrupting the information in the target cell.
+//
+// !!! Future optimizations may put the integer stack level of the cell in
+// the header in the unused 32 bits for the 64-bit build.  That would also
+// be kept in this mask.
+//
+// Additionally, operations that copy need to not copy any of those bits that
+// are owned by the cell, plus additional bits that would be reset in the
+// cell if overwritten but not copied.  For now, this is why `foo: :+` does
+// not make foo an enfixed operation.
+//
+// Note that this will clear NODE_FLAG_FREE, so it should be checked by the
+// debug build before resetting.
+//
+// Note also that NODE_FLAG_MARKED usage is a relatively new concept, e.g.
+// to allow REMOVE-EACH to mark values in a locked series as to which should
+// be removed when the enumeration is finished.  This *should* not be able
+// to interfere with the GC, since userspace arrays don't use that flag with
+// that meaning, but time will tell if it's a good idea to reuse the bit.
+//
 
+#define CELL_MASK_RESET \
+    (NODE_FLAG_NODE | NODE_FLAG_CELL \
+        | NODE_FLAG_MANAGED | VALUE_FLAG_STACK)
+
+#define CELL_MASK_COPY \
+    ~(CELL_MASK_RESET | NODE_FLAG_MARKED | CELL_FLAG_PROTECTED \
+        | VALUE_FLAG_ENFIXED | VALUE_FLAG_UNEVALUATED | VALUE_FLAG_EVAL_FLIP)
 
 
 //=////////////////////////////////////////////////////////////////////////=//
@@ -305,7 +339,7 @@
 
 #if !defined(NDEBUG)
     struct Reb_Track {
-        const char *filename;
+        const char *file; // is REBYTE (UTF-8), but char* for debug watch
         int line;
     };
 #endif
@@ -328,25 +362,35 @@ struct Reb_Money {
     int e:8;        /* exponent */
 };
 
+// !!! This structure varies the layout based on endianness, so that when it
+// is seen throuh the .bits field of the REBDAT union, a later date will
+// have a value that will be greater (>) than an earlier date.  This should
+// be reviewed for standards compliance; masking and shifting is generally
+// safer than bit field union tricks.
+//
 typedef struct reb_ymdz {
 #ifdef ENDIAN_LITTLE
-    REBINT zone:7; // +/-15:00 res: 0:15
-    REBCNT day:5;
-    REBCNT month:4;
-    REBCNT year:16;
+    int zone:7; // +/-15:00 res: 0:15
+    unsigned day:5;
+    unsigned month:4;
+    unsigned year:16;
 #else
-    REBCNT year:16;
-    REBCNT month:4;
-    REBCNT day:5;
-    REBINT zone:7; // +/-15:00 res: 0:15
+    unsigned year:16;
+    unsigned month:4;
+    unsigned day:5;
+    int zone:7; // +/-15:00 res: 0:15
 #endif
 } REBYMD;
 
 typedef union reb_date {
     REBYMD date;
-    REBCNT bits;
+    REBCNT bits; // !!! alias used for hashing date, is this standards-legal? 
 } REBDAT;
 
+// The same payload is used for TIME! and DATE!.  The extra bits needed by
+// DATE! (as REBYMD) fit into 32 bits, so can live in the ->extra field,
+// which is the size of a platform pointer.
+//
 struct Reb_Time {
     REBI64 nanoseconds;
 };
@@ -422,7 +466,7 @@ struct Reb_Function {
     // for the function can be found (although this value is archetypal, and
     // loses the `binding` property--which must be preserved other ways)
     //
-    // The `link.meta` field of the paramlist holds a meta object (if any)
+    // The `misc.meta` field of the paramlist holds a meta object (if any)
     // that describes the function.  This is read by help.
     //
     REBARR *paramlist;
@@ -461,11 +505,11 @@ struct Reb_Any_Context {
     // element specially.  It stores a copy of the ANY-CONTEXT! value that
     // refers to itself.
     //
-    // The `keylist` is held in the varlist's Reb_Series.misc field, and it
+    // The `keylist` is held in the varlist's Reb_Series.link field, and it
     // may be shared with an arbitrary number of other contexts.  Changing
     // the keylist involves making a copy if it is shared.
     //
-    // REB_MODULE depends on a property stored in the "meta" miscellaneous
+    // REB_MODULE depends on a property stored in the "meta" Reb_Series.link
     // field of the keylist, which is another object's-worth of data *about*
     // the module's contents (e.g. the processed header)
     //
@@ -482,7 +526,7 @@ struct Reb_Any_Context {
     // function whose "view" it represents.  This field is only applicable
     // to frames, and so it could be used for something else on other types
     //
-    // !!! Note that the binding on a FRAME! can't be used for this purpose,
+    // Note that the binding on a FRAME! can't be used for this purpose,
     // because it's already used to hold the binding of the function it
     // represents.  e.g. if you have a definitional return value with a
     // binding, and try to MAKE FRAME! on it, the paramlist alone is not
@@ -501,7 +545,7 @@ struct Reb_Any_Context {
 //
 struct Reb_Varargs {
     //
-    // If the extra->binding of the varargs is not NULL, it represents the
+    // If the extra->binding of the varargs is not UNBOUND, it represents the
     // frame in which this VARARGS! was tied to a parameter.  This 0-based
     // offset can be used to find the param the varargs is tied to, in order
     // to know whether it is quoted or not (and its name for error delivery).
@@ -514,11 +558,13 @@ struct Reb_Varargs {
     //
     REBCNT param_offset;
 
-    // Data source for the VARARGS!.  This can come from a frame (and is often
-    // the same as extra->binding), or from an array if MAKE ARRAY! is the
-    // source of the variadic data.
-    // 
-    REBARR *feed;
+    // The "facade" (see FUNC_FACADE) is a paramlist-shaped entity that may
+    // or may not be the actual paramlist of a function.  It allows for the
+    // ability of phases of functions to have modified typesets or parameter
+    // classes from those of the underlying frame.  This is where to look
+    // up the parameter by its offset.
+    //
+    REBARR *facade;
 };
 
 
@@ -530,6 +576,19 @@ struct Reb_Varargs {
 struct Reb_Pickup {
     const REBVAL *param;
     REBVAL *arg;
+};
+
+
+// Rebol doesn't have a REFERENCE! datatype, but this is used to let path
+// dispatch return information pointing at a cell that can be used to either
+// read it or write to it, depending on the need.  Because it contains an
+// actual cell pointer in it, it's not a durable value...as that cell lives
+// in some array and could be relocated.  So it must be written to immediately
+// or converted into an extraction of the cell's value.
+//
+struct Reb_Reference {
+    RELVAL *cell;
+    // specifier is kept in the extra->binding portion of the value
 };
 
 
@@ -552,8 +611,8 @@ struct Reb_Handle {
 };
 
 
-// Meta information in singular->link.meta
-// File descriptor in singular->misc.fd
+// File descriptor in singular->link.fd
+// Meta information in singular->misc.meta
 //
 struct Reb_Library {
     REBARR *singular; // singular array holding this library value
@@ -567,26 +626,28 @@ typedef REBARR REBLIB;
 // should be).  On that path, a struct's internals are simplified to being
 // just an array:
 //
-// [0] is a specification OBJECT! which contains all the information about
+// [0] is a specification array which contains all the information about
 // the structure's layout, regardless of what offset it would find itself at
 // inside of a data blob.  This includes the total size, and arrays of
 // field definitions...essentially, the validated spec.  It also contains
 // a HANDLE! which contains the FFI-type.
 //
 // [1] is the content BINARY!.  The VAL_INDEX of the binary indicates the
-// offset within the struct.
-//
-// As an interim step, the [0] is the ordinary struct fields series as an
-// ordinary BINARY!
+// offset within the struct.  See notes in ADDR-OF from the FFI about how
+// the potential for memory instability of content pointers may not be a
+// match for the needs of an FFI interface.
 //
 struct Reb_Struct {
     REBARR *stu; // [0] is canon self value, ->misc.schema is schema
     REBSER *data; // binary data series (may be shared with other structs)
 };
 
-struct Struct_Field; // forward decl avoids conflict in Prepare_Field_For_FFI
-
+// To help document places in the core that are complicit in the "extension
+// hack", alias arrays being used for the FFI to another name.
+//
 typedef REBARR REBSTU;
+typedef REBARR REBFLD;
+
 
 #include "reb-gob.h"
 
@@ -610,14 +671,14 @@ struct Reb_All {
 
 //=////////////////////////////////////////////////////////////////////////=//
 //
-//  VALUE CELL DEFINITION (`struct Reb_Value`)
+//  VALUE CELL DEFINITION (`struct Reb_Cell`)
 //
 //=////////////////////////////////////////////////////////////////////////=//
 //
-// The value is defined to have the header, "extra", and payload.  Having
-// the header come first is taken advantage of by the trick for allowing
-// a single REBUPT-sized value (32-bit on 32 bit builds, 64-bit on 64-bit
-// builds) be examined to determine if a value is an END marker or not.
+// Each value cell has a header, "extra", and payload.  Having the header come
+// first is taken advantage of by the trick for allowing a single REBUPT-sized
+// value (32-bit on 32 bit builds, 64-bit on 64-bit builds) be examined to
+// determine if a value is an END marker or not.
 //
 // Conceptually speaking, one might think of the "extra" as being part of
 // the payload.  But it is broken out into a separate union.  This is because
@@ -644,8 +705,9 @@ struct Reb_All {
 union Reb_Value_Extra {
     //
     // The binding will be either a REBFUN (relative to a function) or a
-    // REBCTX (specific to a context).  ARRAY_FLAG_VARLIST can be
-    // used to tell which it is.
+    // REBCTX (specific to a context), or simply a plain REBARR such as
+    // EMPTY_ARRAY which indicates UNBOUND.  ARRAY_FLAG_VARLIST and
+    // ARRAY_FLAG_PARAMLIST can be used to tell which it is.
     //
     // ANY-WORD!: binding is the word's binding
     //
@@ -662,11 +724,11 @@ union Reb_Value_Extra {
     // of RETURN, the keylist only indicates the archetype RETURN.  Putting
     // the binding back together can indicate the instance.
     //
-    // VARARGS!: the binding is the frame context where the variadic parameter
-    // lives (or NULL if it was made with MAKE VARARGS! and hasn't been
-    // passed through a parameter yet).
+    // VARARGS!: the binding identifies the feed from which the values are
+    // coming.  It can be an ordinary singular array which was created with
+    // MAKE VARARGS! and has its index updated for all shared instances.
     //
-    REBARR *binding;
+    REBNOD *binding;
 
     // The remaining properties are the "leftovers" of what won't fit in the
     // payload for other types.  If those types have a quanitity that requires
@@ -698,7 +760,7 @@ union Reb_Value_Extra {
     REBARR *singular;
 
 #if !defined(NDEBUG)
-    REBUPT do_count; // used by track payloads
+    REBUPT tick; // value initialization tick if the payload is Reb_Track
 #endif
 };
 
@@ -740,9 +802,13 @@ union Reb_Value_Payload {
     // REB_0 (REB_0_PICKUP) as the type.
     //
     struct Reb_Pickup pickup;
+
+    // Also an internal type, references are used by path dispatch
+    //
+    struct Reb_Reference reference;
 };
 
-struct Reb_Value
+struct Reb_Cell
 {
     struct Reb_Header header;
     union Reb_Value_Extra extra;
@@ -752,45 +818,11 @@ struct Reb_Value
 
 //=////////////////////////////////////////////////////////////////////////=//
 //
-//  Cell Reset and Copy Masks
+//  RELATIVE AND SPECIFIC VALUES (difference enforced in C++ build only)
 //
 //=////////////////////////////////////////////////////////////////////////=//
 //
-// It's important for operations that write to cells not to overwrite *all*
-// the bits in the header, because some of those bits give information about
-// the nature of the cell's storage and lifetime.  Similarly, if bits are
-// being copied from one cell to another, those header bits must be masked
-// out to avoid corrupting the information in the target cell.
-//
-// !!! Future optimizations may put the integer stack level of the cell in
-// the header in the unused 32 bits for the 64-bit build.  That would also
-// be kept in this mask.
-//
-// Additionally, operations that copy need to not copy any of those bits that
-// are owned by the cell, plus additional bits that would be reset in the
-// cell if overwritten but not copied.  For now, this is why `foo: :+` does
-// not make foo an enfixed operation.
-//
-// Note that this will clear NODE_FLAG_FREE, so it should be checked by the
-// debug build before resetting.
-//
-
-#define CELL_MASK_RESET \
-    (NODE_FLAG_NODE | NODE_FLAG_CELL \
-        | NODE_FLAG_MANAGED | VALUE_FLAG_STACK)
-
-#define CELL_MASK_COPY \
-    ~(CELL_MASK_RESET \
-        | VALUE_FLAG_ENFIXED | VALUE_FLAG_PROTECTED | VALUE_FLAG_UNEVALUATED)
-
-
-//=////////////////////////////////////////////////////////////////////////=//
-//
-//  REBVAL ("fully specified" value) and RELVAL ("possibly relative" value)
-//
-//=////////////////////////////////////////////////////////////////////////=//
-//
-// A relative value is the identical struct to Reb_Value, but is allowed to
+// A RELVAL is an equivalent struct layout to to REBVAL, but is allowed to
 // have the relative bit set.  Hence a relative value pointer can point to a
 // specific value, but a relative word or array cannot be pointed to by a
 // plain REBVAL*.  The RELVAL-vs-REBVAL distinction is purely commentary
@@ -809,10 +841,39 @@ struct Reb_Value
 // to be combined with any relative words that are seen later.
 //
 
-#define REB_MAX_VOID REB_MAX // there is no VOID! datatype, use REB_MAX
+#ifdef CPLUSPLUS_11
+    //
+    // Since a RELVAL may be either specific or relative, there's not a whole
+    // lot to check in the C++ build.  However, it does disable bitwise
+    // copying or assignment...one must use Derelativize() or Blit_Cell().
+    //
+    struct Reb_Relative_Value : public Reb_Cell
+    {
+        // This cannot have any custom constructors or destructors; relative
+        // values are found in unions and structures in places that
+        // non-trivial construction is disallowed.  We must use the C++11
+        // `= default` feature to request "trivial" construction.
+        //
+        Reb_Relative_Value () = default;
 
-#ifdef __cplusplus
-    struct Reb_Specific_Value : public Reb_Value {
+        // Overwriting one RELVAL* with another RELVAL* cannot be done with
+        // a direct assignment, such as `*dest = *src;`
+        //
+        // Note that "= delete" only works in C++11.  We'd run into trouble
+        // if we tried to just make the copy constructor private, because
+        // there'd have to be a public constructor candidate...and we can't
+        // have any constructors in this class.
+    private:
+        Reb_Relative_Value (Reb_Relative_Value const & other) = delete;
+        void operator= (Reb_Relative_Value const &rhs) = delete;
+    };
+
+
+    // Reb_Specific_Value inherits from Reb_Relative_Value in C++, and hence
+    // you can pass a REBVAL to any function that takes a RELVAL, but not
+    // vice-versa.
+    //
+    struct Reb_Specific_Value : public Reb_Relative_Value {
     #if !defined(NDEBUG)
         //
         // In C++11, it is now formally legal to add constructors to types
@@ -822,25 +883,18 @@ struct Reb_Value
         //     http://stackoverflow.com/a/7189821/211160
         //
         // No required functionality should be implemented via the constructor
-        // but optional debug features can be added.
+        // as the C build must have the same feature set as the C++ one.
+        // But optional debug features can be added.  (Since most REBVAL* are
+        // produced by casts using KNOWN(), it's not clear exactly what use
+        // those would be.)
         //
-        Reb_Specific_Value () {
-        }
+        Reb_Specific_Value () {}
 
         // The destructor checks that all REBVALs wound up with NODE_FLAG_CELL
         // set on them.  This would be done by DECLARE_LOCAL () if a stack
         // value, and by the Make_Series() construction for SERIES_FLAG_ARRAY.
         //
-        ~Reb_Specific_Value() {
-            assert(header.bits & NODE_FLAG_CELL);
-
-            enum Reb_Kind kind = cast(enum Reb_Kind, RIGHT_8_BITS(header.bits));
-            assert(
-                header.bits & NODE_FLAG_FREE
-                    ? kind == REB_MAX_VOID + 1
-                    : kind <= REB_MAX_VOID
-            );
-        }
+        ~Reb_Specific_Value(); // defined in %c-value.c
 
         // Overwriting one REBVAL* with another REBVAL* cannot be done with
         // a direct assignment, such as `*dest = *src;`  Instead one is
@@ -850,85 +904,42 @@ struct Reb_Value
         // array) then special handling is necessary to make sure any stack
         // constrained pointers are "reified" 
         //
-        // !!! Note that "= delete" only works in C++11, and can be achieved
-        // less clearly but still work just by making assignment and copying
-        // constructors private.
     private:
-        Reb_Specific_Value (Reb_Specific_Value const & other);
-        void operator= (Reb_Specific_Value const &rhs);
+        Reb_Specific_Value (Reb_Specific_Value const & other) = delete;
+        void operator= (Reb_Specific_Value const &rhs) = delete;
     #endif
     };
-#endif
 
-inline static REBOOL IS_RELATIVE(const RELVAL *v) {
-    return LOGICAL(v->header.bits & VALUE_FLAG_RELATIVE);
-}
-
-#if defined(__cplusplus)
+    // Some operations that run on sequences of arrays and values do not
+    // let ordinary END markers stop them from moving on to the next slice
+    // in the sequence.  Since they've already done an IS_END() test before
+    // fetching their value, it makes sense for them to choose NULL as their
+    // value for when the final END is seen...to help avoid accidents with
+    // leaking intermediate ends.  If a value slot is being assigned through
+    // such a process, it helps to have an added layer of static analysis
+    // to assure it's never tested for end.
     //
-    // Take special advantage of the fact that C++ can help catch when we are
-    // trying to see if a REBVAL is specific or relative (it will always
-    // be specific, so the call is likely in error).  In the C build, they
-    // are the same type so there will be no error.
-    //
-    REBOOL IS_RELATIVE(const REBVAL *v);
-#endif
+    struct const_Reb_Relative_Value_No_End_Ptr {
+        const Reb_Relative_Value *p;
 
-#define IS_SPECIFIC(v) \
-    NOT(IS_RELATIVE(v))
+        const_Reb_Relative_Value_No_End_Ptr () {}
+        const_Reb_Relative_Value_No_End_Ptr (const Reb_Relative_Value *p)
+            : p (p) {}
 
-inline static REBFUN *VAL_RELATIVE(const RELVAL *v) {
-    assert(IS_RELATIVE(v));
-    //assert(NOT(GET_SER_FLAG(v->extra.binding, ARRAY_FLAG_VARLIST)));
-    return cast(REBFUN*, v->extra.binding);
-}
+        operator const Reb_Relative_Value* () { return p; }
+        
+        const Reb_Relative_Value* operator-> () { return p; } 
 
-inline static REBCTX *VAL_SPECIFIC_COMMON(const RELVAL *v) {
-    assert(IS_SPECIFIC(v));
-    //assert(
-    //    v->extra.binding == SPECIFIED
-    //    || GET_SER_FLAG(v->extra.binding, ARRAY_FLAG_VARLIST)
-    //);
-    return cast(REBCTX*, v->extra.binding);
-}
+        const_Reb_Relative_Value_No_End_Ptr operator= (
+            const Reb_Relative_Value *rhs
+        ){
+            // The static checking only affects IS_END(), there's no
+            // compile-time check that can determine if an END is assigned.
+            //
+            assert(rhs == NULL || NOT(rhs->header.bits & NODE_FLAG_END));
 
-#ifdef NDEBUG
-    #define VAL_SPECIFIC(v) \
-        VAL_SPECIFIC_COMMON(v)
-#else
-    #define VAL_SPECIFIC(v) \
-        VAL_SPECIFIC_Debug(v)
-#endif
-
-// When you have a RELVAL* (e.g. from a REBARR) that you "know" to be specific,
-// the KNOWN macro can be used for that.  Checks to make sure in debug build.
-//
-// Use for: "invalid conversion from 'Reb_Value*' to 'Reb_Specific_Value*'"
-
-inline static const REBVAL *const_KNOWN(const RELVAL *value) {
-    assert(IS_SPECIFIC(value));
-    return cast(const REBVAL*, value); // we asserted it's actually specific
-}
-
-inline static REBVAL *KNOWN(RELVAL *value) {
-    assert(IS_SPECIFIC(value));
-    return cast(REBVAL*, value); // we asserted it's actually specific
-}
-
-inline static const RELVAL *const_REL(const REBVAL *v) {
-    return cast(const RELVAL*, v); // cast w/input restricted to REBVAL
-}
-
-inline static RELVAL *REL(REBVAL *v) {
-    return cast(RELVAL*, v); // cast w/input restricted to REBVAL
-}
-
-#define SPECIFIED NULL
-
-
-#ifdef NDEBUG
-    #define ASSERT_NO_RELATIVE(array,deep) NOOP
-#else
-    #define ASSERT_NO_RELATIVE(array,deep) \
-        Assert_No_Relative((array),(deep))
+            p = rhs;
+            return rhs;
+        }
+    };
 #endif

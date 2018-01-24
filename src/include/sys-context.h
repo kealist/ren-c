@@ -77,27 +77,56 @@ inline static REBCTX *CTX(void *p) {
     return cast(REBCTX*, a);
 }
 
-inline static REBARR *CTX_VARLIST(REBCTX *c) {
-    return &c->varlist;
-}
+#define CTX_VARLIST(c) \
+    (&(c)->varlist)
 
 
+// There may not be any dynamic or stack allocation available for a stack
+// allocated context, and in that case it will have to come out of the
+// REBSER node data itself.  This is called very often, so use a raw C cast
+// and not cast() or KNOWN(), which slow down the debug build.
 //
-// Special property: keylist pointer is stored in the misc field of REBSER
-//
+#define CTX_VALUE(c) \
+    cast(REBVAL*, ARR_HEAD(CTX_VARLIST(c)))
 
+// CTX_KEYLIST is called often, and it's worth it to make it as fast as
+// possible--even in an unoptimized build.  Use VAL_TYPE_RAW, plain C cast.
+//
 inline static REBARR *CTX_KEYLIST(REBCTX *c) {
-    return SER(CTX_VARLIST(c))->link.keylist;
+    if (NOT(LINK(CTX_VARLIST(c)).keysource->header.bits & NODE_FLAG_CELL)) {
+        //
+        // Ordinarily, we want to use the keylist pointer that is stored in
+        // the link field of the varlist.
+        //
+        return ARR(LINK(CTX_VARLIST(c)).keysource);
+    }
+
+    // If the context in question is a FRAME! value, then the ->phase
+    // of the frame presents the "view" of which keys should be visible at
+    // this phase.  So if the phase is a specialization, then it should
+    // not show all the underlying function's keys...just the ones that
+    // are not hidden in the facade that specialization uses.  Since the
+    // phase changes, a fixed value can't be put into the keylist...that is
+    // just the keylist of the underlying function.
+    //
+    // Note: FUNC_FACADE and VAL_FUNC_PARAMLIST macros not defined yet.  Also
+    // uses low level access since this is called so much...less "safe" than
+    // SER() or MISC() but worth it for this case.
+    //
+    assert(VAL_TYPE_RAW(CTX_VALUE(c)) == REB_FRAME);
+    return (
+        (REBSER*)CTX_VALUE(c)->payload.any_context.phase
+    )->link_private.facade;
 }
 
 static inline void INIT_CTX_KEYLIST_SHARED(REBCTX *c, REBARR *keylist) {
     SET_SER_INFO(keylist, SERIES_INFO_SHARED_KEYLIST);
-    SER(CTX_VARLIST(c))->link.keylist = keylist;
+    LINK(CTX_VARLIST(c)).keysource = NOD(keylist);
 }
 
 static inline void INIT_CTX_KEYLIST_UNIQUE(REBCTX *c, REBARR *keylist) {
     assert(NOT_SER_INFO(keylist, SERIES_INFO_SHARED_KEYLIST));
-    SER(CTX_VARLIST(c))->link.keylist = keylist;
+    LINK(CTX_VARLIST(c)).keysource = NOD(keylist);
 }
 
 // Navigate from context to context components.  Note that the context's
@@ -131,31 +160,24 @@ inline static REBVAL *CTX_KEYS_HEAD(REBCTX *c) {
     return SER_AT(REBVAL, SER(CTX_KEYLIST(c)), 1);
 }
 
-// There may not be any dynamic or stack allocation available for a stack
-// allocated context, and in that case it will have to come out of the
-// REBSER node data itself.
-//
-inline static REBVAL *CTX_VALUE(REBCTX *c) {
-    return GET_SER_INFO(CTX_VARLIST(c), CONTEXT_INFO_STACK)
-        ? KNOWN(&SER(CTX_VARLIST(c))->content.values[0])
-        : KNOWN(ARR_HEAD(CTX_VARLIST(c))); // not a RELVAL
-}
-
 inline static REBFRM *CTX_FRAME_IF_ON_STACK(REBCTX *c) {
     assert(IS_FRAME(CTX_VALUE(c)));
-    REBFRM *f = SER(CTX_VARLIST(c))->misc.f;
-    assert(
-        f == NULL
-        || (
-            f->eval_type <= REB_FUNCTION
-            && f->label != NULL
-        ) // Note: inlining of Is_Any_Function_Frame() to break dependency
-    );
+
+    REBNOD *keysource = LINK(CTX_VARLIST(c)).keysource;
+    if (NOT(keysource->header.bits & NODE_FLAG_CELL))
+        return NULL; // not on stack...has been downgraded to paramlist/facade
+
+    REBFRM *f = cast(REBFRM*, keysource);
+
+    // Note: inlining of Is_Function_Frame() to break dependency
+    //
+    assert(f->eval_type == REB_FUNCTION && f->phase != NULL);
+
     return f;
 }
 
 inline static REBVAL *CTX_VARS_HEAD(REBCTX *c) {
-    if (NOT(GET_SER_INFO(CTX_VARLIST(c), CONTEXT_INFO_STACK)))
+    if (NOT_SER_INFO(CTX_VARLIST(c), CONTEXT_INFO_STACK))
         return KNOWN(ARR_AT(CTX_VARLIST(c), 1));
 
     REBFRM *f = CTX_FRAME_IF_ON_STACK(c);
@@ -171,14 +193,10 @@ inline static REBVAL *CTX_KEY(REBCTX *c, REBCNT n) {
 }
 
 inline static REBVAL *CTX_VAR(REBCTX *c, REBCNT n) {
-    REBVAL *var;
     assert(n != 0 && n <= CTX_LEN(c));
     assert(GET_SER_FLAG(CTX_VARLIST(c), ARRAY_FLAG_VARLIST));
-
-    var = CTX_VARS_HEAD(c) + (n) - 1;
-
-    assert(NOT(var->header.bits & VALUE_FLAG_RELATIVE));
-
+    REBVAL *var = CTX_VARS_HEAD(c) + (n) - 1;
+    assert(NOT(IS_RELATIVE(cast(RELVAL*, var))));
     return var;
 }
 
@@ -192,10 +210,6 @@ inline static REBSTR *CTX_KEY_CANON(REBCTX *c, REBCNT n) {
 
 inline static REBSYM CTX_KEY_SYM(REBCTX *c, REBCNT n) {
     return STR_SYMBOL(CTX_KEY_SPELLING(c, n)); // should be same as canon
-}
-
-inline static REBCTX *CTX_META(REBCTX *c) {
-    return SER(CTX_KEYLIST(c))->link.meta;
 }
 
 #define FAIL_IF_READ_ONLY_CONTEXT(c) \
@@ -272,18 +286,8 @@ inline static void INIT_VAL_CONTEXT(REBVAL *v, REBCTX *c) {
 #define VAL_CONTEXT_KEY(v,n) \
     CTX_KEY(VAL_CONTEXT(v), (n))
 
-inline static REBCTX *VAL_CONTEXT_META(const RELVAL *v) {
-    return SER(
-        CTX_KEYLIST(CTX(v->payload.any_context.varlist))
-    )->link.meta;
-}
-
 #define VAL_CONTEXT_KEY_SYM(v,n) \
     CTX_KEY_SYM(VAL_CONTEXT(v), (n))
-
-inline static void INIT_CONTEXT_META(REBCTX *c, REBCTX *m) {
-    SER(CTX_KEYLIST(c))->link.meta = m;
-}
 
 inline static REBVAL *CTX_FRAME_FUNC_VALUE(REBCTX *c) {
     assert(IS_FUNCTION(CTX_ROOTKEY(c)));
@@ -350,24 +354,6 @@ inline static REBVAL *CTX_FRAME_FUNC_VALUE(REBCTX *c) {
 // a convenience.
 //
 
-inline static REBVAL *Get_Typed_Field(
-    REBCTX *c,
-    REBSTR *spelling, // will be canonized
-    enum Reb_Kind kind // REB_0 to not check the kind
-) {
-    REBCNT n = Find_Canon_In_Context(c, STR_CANON(spelling), FALSE);
-    if (n == 0)
-        fail ("Field not found"); // improve error
-
-    REBVAL *var = CTX_VAR(c, n);
-    if (kind == REB_0)
-        return var;
-
-    if (kind != VAL_TYPE(var))
-        fail ("Invalid type of field"); // improve error
-    return var;
-}
-
 #define Get_Field(c, spelling) \
     Get_Typed_Field((c), (spelling), REB_0) // will canonize
 
@@ -384,7 +370,7 @@ inline static REBVAL *Get_Typed_Field(
 inline static void Deep_Freeze_Context(REBCTX *c) {
     Protect_Context(
         c,
-        FLAGIT(PROT_SET) | FLAGIT(PROT_DEEP) | FLAGIT(PROT_FREEZE)
+        PROT_SET | PROT_DEEP | PROT_FREEZE
     );
     Uncolor_Array(CTX_VARLIST(c));
 }

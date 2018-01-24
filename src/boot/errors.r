@@ -97,8 +97,6 @@ Script: [
     multiple-do-errors: [{DO-ALL encountered multiple failures} :arg1 :arg2]
 
     apply-too-many:     {Too many values in processed argument block of APPLY.}
-    apply-has-changed:  {APPLY takes frame def block (or see r3-alpha-apply)}
-    apply-non-function: [:arg1 {needs to be a function for APPLY/SPECIALIZE}]
 
     invalid-tighten:    {TIGHTEN does not support SPECIALIZE/ADAPT/CHAIN}
     print-needs-eval:   {PRINT needs /EVAL to process non-literal blocks}
@@ -108,12 +106,9 @@ Script: [
     expression-barrier: {Expression barrier hit while processing arguments}
     bar-hit-mid-case:   {Expression barrier hit in middle of CASE pairing}
     enfix-quote-late:   [:arg1 {can't left quote a forward quoted value}]
-    partial-lookback:   [:arg1 {can't complete} :arg2 {expression on left}]
     evaluate-void:      {voids cannot be evaluated}
 
     enfix-path-group:   [:arg1 {GROUP! can't be in a lookback quoted PATH!}]
-
-    hard-quote-void:    [:arg1 {is hard quoted and can't be optionally void}]
 
     reduce-made-void:   {Expression in REDUCE evaluated to void}
     break-not-continue: {Use BREAK/WITH when body is the breaking condition}
@@ -147,10 +142,9 @@ Script: [
     non-logic-refine:   [:arg1 {refinement must be LOGIC!, not} :arg2]
     refinement-arg-opt: [{refinement arguments cannot be <opt>}]
 
-    invalid-path:       [{cannot access} :arg2 {in path} :arg1]
-    bad-path-type:      [{path} :arg1 {is not valid for} :arg2 {type}]
-    bad-path-set:       [{cannot set} :arg2 {in path} :arg1]
     bad-field-set:      [{cannot set} :arg1 {field to} :arg2 {datatype}]
+    bad-path-pick:      [{cannot pick} :arg1 {in path}]
+    bad-path-poke:      [{cannot poke} :arg1 {in path}]
     dup-vars:           [{duplicate variable specified:} :arg1]
 
     past-end:           {out of range or past end}
@@ -190,7 +184,6 @@ Script: [
     parse-command:      [{PARSE - command cannot be used as variable:} :arg1]
     parse-series:       [{PARSE - input must be a series:} :arg1]
 
-    not-ffi-build:      {This Rebol build wasn't linked with libffi features}
     not-tcc-build:      {This Rebol build wasn't linked with libtcc features}
     bad-library:        {bad library (already closed?)}
     only-callback-ptr:  {Only callback functions may be passed by FFI pointer}
@@ -205,7 +198,6 @@ Script: [
     frame-already-used: [{Frame currently in use by a function call} :arg1]
     frame-not-on-stack: {Frame is no longer running on the stack}
 
-    recursive-varargs:  {VARARGS! chained into itself (maybe try <durable>?)}
     varargs-no-stack:   {Call originating VARARGS! has finished running}
     varargs-make-only:  {MAKE *shared* BLOCK! supported on VARARGS! (not TO)}
     varargs-no-look:    {VARARGS! may only lookahead by 1 if "hard quoted"}
@@ -238,6 +230,7 @@ Script: [
     tcc-error-warn:      [{TCC reported error/warnings. Fix error/warnings, or use '-w' to disable all of the warnings:} :arg1]
 
     block-conditional:  [{Literal block used as conditional} :arg1]
+    non-block-branch:   [{Evaluated non-block/function used as branch} :arg1]
     block-switch:       [{Literal block used as switch value} :arg1]
 
     non-unloadable-native:    [{Not an unloadable native:} :arg1]
@@ -266,7 +259,7 @@ Access: [
     
     series-protected:   {series read-only due to PROTECT (see UNPROTECT)}
     series-frozen:      {series is source or permanently locked, can't modify}
-    series-running:     {series temporarily read-only for running (DO, PARSE)}
+    series-held:        {series has temporary read-only hold for iteration}
 
     hidden:             {not allowed - would expose or modify hidden values}
 
@@ -314,8 +307,6 @@ Access: [
     no-extension:       [{cannot open extension:} :arg1]
     bad-extension:      [{invalid extension format:} :arg1]
     extension-init:     [{extension cannot be initialized (check version):} :arg1]
-
-    call-fail:          [{external process failed:} :arg1]
 
     symbol-not-found:   [{symbol not found:} :arg1]
     bad-memory:         [{non-accessible memory at} :arg1 {in} :arg2]

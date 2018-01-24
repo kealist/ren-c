@@ -13,12 +13,6 @@
 ; No structural equivalence for function!
 ; Uses FUNC instead of make function! so the test is compatible.
 [not equal? func [] [] func [] []]
-; reflexivity test for closure!
-; Uses CLOSURE to make the test compatible.
-[equal? a-value: closure [] [] :a-value]
-; No structural equivalence for closure!
-; Uses CLOSURE to make the test compatible.
-[not equal? closure [] [] closure [] []]
 [equal? a-value: #{00} a-value]
 ; binary!
 ; Same contents
@@ -155,8 +149,8 @@
 ; Reflexivity for past-tail blocks
 ; Error in R2.
 [
-    a-value: tail [1]
-    clear head a-value
+    a-value: tail of [1]
+    clear head of a-value
     equal? a-value a-value
 ]
 ; Reflexivity for cyclic blocks
@@ -399,8 +393,13 @@
 ; date! doesn't ignore time portion
 [not equal? 2-Jul-2009 2-Jul-2009/22:20]
 [equal? equal? 2-Jul-2009 2-Jul-2009/22:20 equal? 2-Jul-2009/22:20 2-Jul-2009]
-; date! missing time and zone = 00:00:00+00:00
-[equal? 2-Jul-2009 2-Jul-2009/00:00:00+00:00]
+
+; R3-Alpha considered date! missing time and zone = 00:00:00+00:00.  But
+; in Ren-C, dates without a time are semantically distinct from a date with
+; a time at midnight.
+;
+[not equal? 2-Jul-2009 2-Jul-2009/00:00:00+00:00]
+
 [equal? equal? 2-Jul-2009 2-Jul-2009/00:00 equal? 2-Jul-2009/00:00 2-Jul-2009]
 ; Timezone math in date!
 [equal? 2-Jul-2009/22:20 2-Jul-2009/20:20-2:00]
@@ -585,18 +584,18 @@
 ; Code in R3 mezzanines depends on this.
 [() <> blank]
 ; basic comparison with unset second argument fails with = op
-[not blank = ()]
+[not (blank = ())]
 ; basic comparison with unset second argument fails with != op
 [blank != ()]
 [() = ()]
-[not () != ()]
+[not (() != ())]
 ; unset! symmetry with =
-[equal? blank = () () = blank]
+[equal? (blank = ()) (() = blank)]
 ; error! reflexivity
 ; Evaluates (try [1 / 0]) to get error! value.
 [
     a-value: blank
-    set/opt 'a-value (try [1 / 0])
+    set/only 'a-value (try [1 / 0])
     equal? a-value a-value
 ]
 ; error! structural equivalence

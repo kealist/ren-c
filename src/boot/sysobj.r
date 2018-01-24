@@ -145,14 +145,10 @@ options: construct [] [  ; Options supplied to REBOL during startup
 
     ; Legacy Behaviors Options (paid attention to only by debug builds)
 
-    lit-word-decay: false
     exit-functions-only: false
-    broken-case-semantics: false
-    refinements-blank: false
     forever-64-bit-ints: false
     print-forms-everything: false
     break-with-overrides: false
-    none-instead-of-voids: false
     dont-exit-natives: false
     paren-instead-of-group: false
     get-will-get-anything: false
@@ -190,29 +186,26 @@ standard: construct [] [
     func-body: [
         return: make function! [
             [{Returns a value from a function.} value [<opt> any-value!]]
-            [exit/from/with (context-of 'return) :value]
+            [exit/from/with (context of 'return) :value]
         ]
         leave: make function! [
             [{Leaves a function, giving no result to the caller.}]
-            [exit/from (context-of 'leave)]
-        ]
-        #BODY
+            [exit/from (context of 'leave)]
+        ] #BODY
     ]
 
     func-no-leave-body: [
         return: make function! [
             [{Returns a value from a function.} value [<opt> any-value!]]
-            [exit/from/with (context-of 'return) :value]
-        ]
-        #BODY
+            [exit/from/with (context of 'return) :value]
+        ] #BODY
     ]
 
     proc-body: [
         leave: make function! [
             [{Leaves a procedure, giving no result to the caller.}]
-            [exit/from (context-of 'leave)]
-        ]
-        #BODY
+            [exit/from (context of 'leave)]
+        ] #BODY
         comment {No return value.}
     ]
 
@@ -262,6 +255,15 @@ standard: construct [] [
         description:
         adaptee:
         adaptee-name:
+            _
+    ]
+
+    enclosed-meta: construct [] [
+        description:
+        inner:
+        inner-name:
+        outer:
+        outer-name:
             _
     ]
 

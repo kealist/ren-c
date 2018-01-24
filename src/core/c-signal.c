@@ -78,7 +78,7 @@
 //
 REBOOL Do_Signals_Throws(REBVAL *out)
 {
-    assert(IS_END(out)); // incoming must be END, will be END if no throw
+    assert(NOT(IS_TRASH_DEBUG(out)));
 
     // !!! When it was the case that the only way Do_Signals_Throws would run
     // due to the Eval_Count reaching the end of an Eval_Dose, this way of
@@ -106,19 +106,19 @@ REBOOL Do_Signals_Throws(REBVAL *out)
 
     // "Be careful of signal loops! EG: do not PRINT from here."
 
-    if (GET_FLAG(filtered_sigs, SIG_RECYCLE)) {
+    if (filtered_sigs & SIG_RECYCLE) {
         CLR_SIGNAL(SIG_RECYCLE);
         Recycle();
     }
 
 #ifdef NOT_USED_INVESTIGATE
-    if (GET_FLAG(filtered_sigs, SIG_EVENT_PORT)) {  // !!! Why not used?
+    if (filtered_sigs & SIG_EVENT_PORT) {  // !!! Why not used?
         CLR_SIGNAL(SIG_EVENT_PORT);
         Awake_Event_Port();
     }
 #endif
 
-    if (GET_FLAG(filtered_sigs, SIG_HALT)) {
+    if (filtered_sigs & SIG_HALT) {
         //
         // Early in the booting process, it's not possible to handle Ctrl-C
         // because the error machinery has not been initialized.  There must
@@ -133,7 +133,7 @@ REBOOL Do_Signals_Throws(REBVAL *out)
         fail (VAL_CONTEXT(TASK_HALT_ERROR));
     }
 
-    if (GET_FLAG(filtered_sigs, SIG_INTERRUPT)) {
+    if (filtered_sigs & SIG_INTERRUPT) {
         //
         // Similar to the Ctrl-C halting, the "breakpoint" interrupt request
         // can't be processed early on.  The throw mechanics should panic
@@ -141,13 +141,24 @@ REBOOL Do_Signals_Throws(REBVAL *out)
         //
         CLR_SIGNAL(SIG_INTERRUPT);
 
+        if (PG_Breakpoint_Hook == NULL)
+            fail (Error_Host_No_Breakpoint_Raw());
+
         // !!! This can recurse, which may or may not be a bad thing.  But
         // if the garbage collector and such are going to run during this
         // execution, the signal mask has to be turned back on.  Review.
         //
         Eval_Sigmask = saved_mask;
-        if (Do_Breakpoint_Throws(out, TRUE, VOID_CELL, FALSE))
-            return TRUE;
+
+        const REBOOL interrupted = TRUE;
+        const REBVAL *default_value = VOID_CELL;
+        const REBOOL do_default = FALSE;
+
+        if ((*PG_Breakpoint_Hook)(
+            out, interrupted, default_value, do_default
+        )){
+            return TRUE; // threw
+        }
 
         // !!! What to do with something like a Ctrl-C-based breakpoint
         // session that does something like `resume/with 10`?  This gets

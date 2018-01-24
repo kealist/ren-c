@@ -27,19 +27,20 @@
 //
 //=////////////////////////////////////////////////////////////////////////=//
 //
-// NOTE: The R3-Alpha extension mechanism and API are deprecated in Ren-C.
+// !!! Extensions in Ren-C are a redesign from extensions in R3-Alpha.  They
+// are a work in progress (and need documentation and cleanup), but have
+// been a proof-of-concept for the core idea to be able to write code that
+// looks similar to Rebol natives, but can be loaded from a DLL making calls
+// back into the executable...or alternately, built directly into the Rebol
+// interpreter itself based on a configuration switch.
 //
-// See %reb-ext.h for a general overview of R3-Alpha extensions.  Also:
-//
-// http://www.rebol.com/r3/docs/concepts/extensions-embedded.html
+// See the %extensions/ directory for some current (evolving) examples.
 //
 
 #include "sys-core.h"
 
-#include "reb-ext.h"
 #include "reb-evtypes.h"
 
-#include "reb-lib.h"
 #include "sys-ext.h"
 
 //(*call)(int cmd, RXIFRM *args);
@@ -85,7 +86,8 @@ static void cleanup_extension_quit_handler(const REBVAL *val)
 //
 //  "Low level extension module loader (for DLLs)."
 //
-//      path-or-handle [file! handle!] "Path to the extension file or handle to a builtin extension"
+//      path-or-handle [file! handle!]
+//          "Path to the extension file or handle to a builtin extension"
 //  ]
 //
 REBNATIVE(load_extension_helper)
@@ -101,7 +103,7 @@ REBNATIVE(load_extension_helper)
 // Each extension is defined as DLL with:
 //
 // RX_Init() - init anything needed
-// optinoal RX_Quit() - cleanup anything needed
+// optional RX_Quit() - cleanup anything needed
 {
     INCLUDE_PARAMS_OF_LOAD_EXTENSION_HELPER;
 
@@ -121,29 +123,41 @@ REBNATIVE(load_extension_helper)
         if (IS_BLOCK(loaded_exts)) {
             RELVAL *item = VAL_ARRAY_HEAD(loaded_exts);
             for (; NOT_END(item); ++item) {
-                // do some sanity checking, just to avoid crashing if system/extensions was messed up
-                if (!IS_OBJECT(item))
-                    fail(Error_Bad_Extension_Raw(item));
+                //
+                // do some sanity checking, just to avoid crashing if
+                // system/extensions was messed up
+
+                if (!IS_OBJECT(item)) {
+                    DECLARE_LOCAL (bad);
+                    Derelativize(bad, item, VAL_SPECIFIER(loaded_exts));
+                    fail(Error_Bad_Extension_Raw(bad));
+                }
 
                 REBCTX *item_ctx = VAL_CONTEXT(item);
-                if ((CTX_LEN(item_ctx) <= STD_EXTENSION_LIB_BASE)
+                if (
+                    CTX_LEN(item_ctx) <= STD_EXTENSION_LIB_BASE
                     || CTX_KEY_SPELLING(item_ctx, STD_EXTENSION_LIB_BASE)
                     != CTX_KEY_SPELLING(std_ext_ctx, STD_EXTENSION_LIB_BASE)
-                    ) {
-                    fail(Error_Bad_Extension_Raw(item));
+                ){
+                    DECLARE_LOCAL (bad);
+                    Derelativize(bad, item, VAL_SPECIFIER(loaded_exts));
+                    fail(Error_Bad_Extension_Raw(bad));
                 }
                 else {
-                    if (IS_BLANK(CTX_VAR(item_ctx, STD_EXTENSION_LIB_BASE))) {//builtin extension
-                        continue;
-                    }
+                    if (IS_BLANK(CTX_VAR(item_ctx, STD_EXTENSION_LIB_BASE)))
+                        continue; //builtin extension
                 }
 
                 assert(IS_LIBRARY(CTX_VAR(item_ctx, STD_EXTENSION_LIB_BASE)));
 
-                if (VAL_LIBRARY_FD(lib)
-                    == VAL_LIBRARY_FD(CTX_VAR(item_ctx, STD_EXTENSION_LIB_BASE))) {
-                    // found the existing extension
-                    OS_CLOSE_LIBRARY(VAL_LIBRARY_FD(lib)); //decrease the reference added by MAKE_library
+                if (
+                    VAL_LIBRARY_FD(CTX_VAR(item_ctx, STD_EXTENSION_LIB_BASE))
+                    == VAL_LIBRARY_FD(lib)
+                ){
+                    // found the existing extension, decrease the reference
+                    // added by MAKE_library
+
+                    OS_CLOSE_LIBRARY(VAL_LIBRARY_FD(lib));
                     Move_Value(D_OUT, KNOWN(item));
                     return R_OUT;
                 }
@@ -329,6 +343,7 @@ void Prepare_Boot_Extensions(REBVAL *exts, CFUNC **funcs, REBCNT n)
     Init_Block(exts, arr);
 }
 
+
 //
 //  Shutdown_Boot_Extensions: C
 //
@@ -388,15 +403,15 @@ REBNATIVE(load_native)
             MKF_KEYWORDS | MKF_FAKE_RETURN
         ),
         dispatcher, // unique
-        NULL, // no underlying function, this is fundamental
-        NULL // not providing a specialization
+        NULL, // no facade (use paramlist)
+        NULL // no specialization exemplar (or inherited exemplar)
     );
 
     if (REF(unloadable))
         SET_VAL_FLAG(FUNC_VALUE(fun), FUNC_FLAG_UNLOADABLE_NATIVE);
 
     if (REF(body)) {
-        *FUNC_BODY(fun) = *ARG(code);
+        Move_Value(FUNC_BODY(fun), ARG(code));
     }
     Move_Value(D_OUT, FUNC_VALUE(fun));
     return R_OUT;
@@ -443,12 +458,86 @@ REBNATIVE(unload_native)
 //
 //  Init_Extension_Words: C
 //
-// Intern strings and save their canonical forms
+// Intern strings and save their canonical forms.
+//
+// !!! Are these protected from GC?  If not, then they need to be--one of the
+// better ways to do so might be to load them as API WORD!s and give them
+// a lifetime until they are explicitly freed.
 //
 void Init_Extension_Words(const REBYTE* strings[], REBSTR *canons[], REBCNT n)
 {
     REBCNT i;
     for (i = 0; i < n; ++i) {
-        canons[i] = STR_CANON(Intern_UTF8_Managed(strings[i], LEN_BYTES(strings[i])));
+        REBSTR* s = Intern_UTF8_Managed(strings[i], LEN_BYTES(strings[i]));
+        canons[i] = STR_CANON(s);
     }
+}
+
+
+//
+//  Hook_Datatype: C
+//
+// Poor-man's user-defined type hack: this really just gives the ability to
+// have the only thing the core knows about a "user-defined-type" be its
+// value cell structure and datatype enum number...but have the behaviors
+// come from functions that are optionally registered in an extension.
+//
+// (Actual facets of user-defined types will ultimately be dispatched through
+// Rebol-frame-interfaced functions, not raw C structures like this.)
+//
+void Hook_Datatype(
+    enum Reb_Kind kind,
+    REBACT act,
+    REBPEF pef,
+    REBCTF ctf,
+    MAKE_FUNC make_func,
+    TO_FUNC to_func,
+    MOLD_FUNC mold_func
+) {
+    if (Value_Dispatch[kind] != &T_Unhooked)
+        fail ("Value_Dispatch already hooked.");
+    if (Path_Dispatch[kind] != &PD_Unhooked)
+        fail ("Path_Dispatch already hooked.");
+    if (Compare_Types[kind] != &CT_Unhooked)
+        fail ("Compare_Types already hooked.");
+    if (Make_Dispatch[kind] != &MAKE_Unhooked)
+        fail ("Make_Dispatch already hooked.");
+    if (To_Dispatch[kind] != &TO_Unhooked)
+        fail ("To_Dispatch already hooked.");
+    if (Mold_Or_Form_Dispatch[kind] != &MF_Unhooked)
+        fail ("Mold_Or_Form_Dispatch already hooked.");
+
+    Value_Dispatch[kind] = act;
+    Path_Dispatch[kind] = pef;
+    Compare_Types[kind] = ctf;
+    Make_Dispatch[kind] = make_func;
+    To_Dispatch[kind] = to_func;
+    Mold_Or_Form_Dispatch[kind] = mold_func;
+}
+
+
+//
+//  Unhook_Datatype: C
+//
+void Unhook_Datatype(enum Reb_Kind kind)
+{
+    if (Value_Dispatch[kind] == &T_Unhooked)
+        fail ("Value_Dispatch is not hooked.");
+    if (Path_Dispatch[kind] == &PD_Unhooked)
+        fail ("Path_Dispatch is not hooked.");
+    if (Compare_Types[kind] == &CT_Unhooked)
+        fail ("Compare_Types is not hooked.");
+    if (Make_Dispatch[kind] == &MAKE_Unhooked)
+        fail ("Make_Dispatch is not hooked.");
+    if (To_Dispatch[kind] == &TO_Unhooked)
+        fail ("To_Dispatch is not hooked.");
+    if (Mold_Or_Form_Dispatch[kind] == &MF_Unhooked)
+        fail ("Mold_Or_Form_Dispatch is not hooked.");
+
+    Value_Dispatch[kind] = &T_Unhooked;
+    Path_Dispatch[kind] = &PD_Unhooked;
+    Compare_Types[kind] = &CT_Unhooked;
+    Make_Dispatch[kind] = &MAKE_Unhooked;
+    To_Dispatch[kind] = &TO_Unhooked;
+    Mold_Or_Form_Dispatch[kind] = &MF_Unhooked;
 }

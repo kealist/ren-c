@@ -117,16 +117,16 @@ static REB_R Transport_Actor(
     REBCTX *port,
     REBSYM action,
     enum Transport_Types proto
-) {
+){
+    FAIL_IF_BAD_PORT(port);
+
     // Initialize the IO request
     //
     REBREQ *sock = Ensure_Port_State(port, RDI_NET);
     if (proto == TRANSPORT_UDP)
-        SET_FLAG(sock->modes, RST_UDP);
+        sock->modes |= RST_UDP;
 
     REBVAL *spec = CTX_VAR(port, STD_PORT_SPEC);
-    if (!IS_OBJECT(spec))
-        fail (Error_Invalid_Port_Raw());
 
     // sock->timeout = 4000; // where does this go? !!!
 
@@ -135,9 +135,26 @@ static REB_R Transport_Actor(
 
     // Actions for an unopened socket:
 
-    if (!IS_OPEN(sock)) {
+    if (NOT(sock->flags & RRF_OPEN)) {
 
         switch (action) { // Ordered by frequency
+
+        case SYM_REFLECT: {
+            INCLUDE_PARAMS_OF_REFLECT;
+
+            UNUSED(ARG(value)); // covered by `port`
+            REBSYM property = VAL_WORD_SYM(ARG(property));
+            assert(property != SYM_0);
+
+            switch (property) {
+            case SYM_OPEN_Q:
+                return R_FALSE;
+
+            default:
+                break;
+            }
+
+            fail (Error_On_Port(RE_NOT_OPEN, port, -12)); }
 
         case SYM_OPEN: {
             REBVAL *arg = Obj_Value(spec, STD_PORT_SPEC_NET_HOST);
@@ -145,35 +162,41 @@ static REB_R Transport_Actor(
 
             if (OS_DO_DEVICE(sock, RDC_OPEN))
                 fail (Error_On_Port(RE_CANNOT_OPEN, port, -12));
-            SET_OPEN(sock);
+            sock->flags |= RRF_OPEN;
 
             // Lookup host name (an extra TCP device step):
             if (IS_STRING(arg)) {
-                sock->common.data = VAL_BIN(arg);
+                REBCNT index = VAL_INDEX(arg);
+                REBCNT len = VAL_LEN_AT(arg);
+                REBSER *arg_utf8 = Temp_UTF8_At_Managed(arg, &index, &len);
+                PUSH_GUARD_SERIES(arg_utf8);
+
+                sock->common.data = BIN_AT(arg_utf8, index);
                 DEVREQ_NET(sock)->remote_port =
                     IS_INTEGER(val) ? VAL_INT32(val) : 80;
 
                 // Note: sets remote_ip field
                 //
                 REBINT result = OS_DO_DEVICE(sock, RDC_LOOKUP);
+                DROP_GUARD_SERIES(arg_utf8);
+
                 if (result < 0)
                     fail (Error_On_Port(RE_NO_CONNECT, port, sock->error));
 
-                Move_Value(D_OUT, CTX_VALUE(port));
-                return R_OUT;
+                goto return_port;
             }
             else if (IS_TUPLE(arg)) { // Host IP specified:
                 DEVREQ_NET(sock)->remote_port =
                     IS_INTEGER(val) ? VAL_INT32(val) : 80;
                 memcpy(&(DEVREQ_NET(sock)->remote_ip), VAL_TUPLE(arg), 4);
-                break;
+                break; // fall through to open case SYM_OPEN/CONNECT (?)
             }
             else if (IS_BLANK(arg)) { // No host, must be a LISTEN socket:
-                SET_FLAG(sock->modes, RST_LISTEN);
+                sock->modes |= RST_LISTEN;
                 sock->common.sock = 0; // where ACCEPT requests are queued
                 DEVREQ_NET(sock)->local_port =
                     IS_INTEGER(val) ? VAL_INT32(val) : 8000;
-                break;
+                break; // fall through to open case SYM_OPEN/CONNECT (?)
             }
             else
                 fail (Error_On_Port(RE_INVALID_SPEC, port, -10));
@@ -183,10 +206,7 @@ static REB_R Transport_Actor(
             Move_Value(D_OUT, CTX_VALUE(port));
             return R_OUT;
 
-        case SYM_OPEN_Q:
-            return R_FALSE;
-
-        case SYM_UPDATE:  // allowed after a close
+        case SYM_ON_WAKE_UP:  // allowed after a close
             break;
 
         default:
@@ -198,7 +218,37 @@ static REB_R Transport_Actor(
 
     switch (action) { // Ordered by frequency
 
-    case SYM_UPDATE: {
+    case SYM_REFLECT: {
+        INCLUDE_PARAMS_OF_REFLECT;
+
+        UNUSED(ARG(value)); // covered by `port`
+        REBSYM property = VAL_WORD_SYM(ARG(property));
+        assert(property != SYM_0);
+
+        switch (property) {
+        case SYM_LENGTH: {
+            REBVAL *port_data = CTX_VAR(port, STD_PORT_DATA);
+            Init_Integer(
+                D_OUT,
+                ANY_SERIES(port_data) ? VAL_LEN_HEAD(port_data) : 0
+            );
+            return R_OUT; }
+
+        case SYM_OPEN_Q:
+            //
+            // Connect for clients, bind for servers:
+            //
+            return R_FROM_BOOL (
+                LOGICAL((sock->state & (RSM_CONNECT | RSM_BIND)) != 0)
+            );
+
+        default:
+            break;
+        }
+
+        break; }
+
+    case SYM_ON_WAKE_UP: {
         //
         // Update the port object after a READ or WRITE operation.
         // This is normally called by the WAKE-UP function.
@@ -236,9 +286,9 @@ static REB_R Transport_Actor(
         // Read data into a buffer, expanding the buffer if needed.
         // If no length is given, program must stop it at some point.
         if (
-            !GET_FLAG(sock->modes, RST_UDP)
-            && !GET_FLAG(sock->state, RSM_CONNECT)
-        ) {
+            NOT(sock->modes & RST_UDP)
+            && NOT(sock->state & RSM_CONNECT)
+        ){
             fail (Error_On_Port(RE_NOT_CONNECTED, port, -15));
         }
 
@@ -268,8 +318,7 @@ static REB_R Transport_Actor(
         if (result < 0)
             fail (Error_On_Port(RE_READ_ERROR, port, sock->error));
 
-        Move_Value(D_OUT, CTX_VALUE(port));
-        return R_OUT; }
+        goto return_port; }
 
     case SYM_WRITE: {
         INCLUDE_PARAMS_OF_WRITE;
@@ -293,8 +342,8 @@ static REB_R Transport_Actor(
         // The lower level write code continues until done.
 
         if (
-            !GET_FLAG(sock->modes, RST_UDP)
-            && !GET_FLAG(sock->state, RSM_CONNECT)
+            NOT(sock->modes & RST_UDP)
+            && NOT(sock->state & RSM_CONNECT)
         ){
             fail (Error_On_Port(RE_NOT_CONNECTED, port, -15));
         }
@@ -325,8 +374,7 @@ static REB_R Transport_Actor(
         if (result == DR_DONE)
             Init_Blank(CTX_VAR(port, STD_PORT_DATA));
 
-        Move_Value(D_OUT, CTX_VALUE(port));
-        return R_OUT; }
+        goto return_port; }
 
     case SYM_PICK_P: {
         INCLUDE_PARAMS_OF_PICK_P;
@@ -335,8 +383,13 @@ static REB_R Transport_Actor(
         // FIRST server-port returns new port connection.
         //
         REBCNT len = Get_Num_From_Arg(ARG(picker));
-        if (len == 1 && GET_FLAG(sock->modes, RST_LISTEN) && sock->common.data)
+        if (
+            len == 1
+            && LOGICAL(sock->modes & RST_LISTEN)
+            && sock->common.data != NULL
+        ){
             Accept_New_Port(SINK(D_OUT), port, DEVREQ_NET(sock));
+        }
         else
             fail (Error_Out_Of_Range(ARG(picker)));
         return R_OUT; }
@@ -349,36 +402,18 @@ static REB_R Transport_Actor(
         Ret_Query_Net(port, DEVREQ_NET(sock), D_OUT);
         return R_OUT; }
 
-    case SYM_OPEN_Q:
-        //
-        // Connect for clients, bind for servers:
-        //
-        return R_FROM_BOOL (
-            LOGICAL(sock->state & ((1 << RSM_CONNECT) | (1 << RSM_BIND)))
-        );
-
     case SYM_CLOSE: {
-        if (IS_OPEN(sock)) {
+        if (sock->flags & RRF_OPEN) {
             OS_DO_DEVICE(sock, RDC_CLOSE);
-            SET_CLOSED(sock);
+            sock->flags &= ~RRF_OPEN;
         }
-        Move_Value(D_OUT, CTX_VALUE(port));
-        return R_OUT; }
-
-    case SYM_LENGTH_OF: {
-        REBVAL *port_data = CTX_VAR(port, STD_PORT_DATA);
-        Init_Integer(
-            D_OUT,
-            ANY_SERIES(port_data) ? VAL_LEN_HEAD(port_data) : 0
-        );
-        return R_OUT; }
+        goto return_port; }
 
     case SYM_OPEN: {
         REBINT result = OS_DO_DEVICE(sock, RDC_CONNECT);
         if (result < 0)
             fail (Error_On_Port(RE_NO_CONNECT, port, sock->error));
-        Move_Value(D_OUT, CTX_VALUE(port));
-        return R_OUT; }
+        goto return_port; }
 
     case SYM_DELETE: {
         //
@@ -389,14 +424,17 @@ static REB_R Transport_Actor(
         VAL_EVENT_TYPE(event) = EVT_ERROR;
         VAL_EVENT_DATA(event) = 101;
         VAL_EVENT_REQ(event) = sock;
-        Move_Value(D_OUT, CTX_VALUE(port));
-        return R_OUT; }
+        goto return_port; }
 
     default:
         break;
     }
 
     fail (Error_Illegal_Action(REB_PORT, action));
+
+return_port:
+    Move_Value(D_OUT, CTX_VALUE(port));
+    return R_OUT;
 }
 
 

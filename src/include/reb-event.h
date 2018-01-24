@@ -75,14 +75,18 @@ typedef struct {
 #pragma pack()
 
 // Special event flags:
+//
+// !!! So long as events are directly hooking into the low-level REBVAL
+// implementation, this could just use EVENT_FLAG_XXX flags.  eventee could
+// be a binding to a REBNOD that was able to inspect that node to get the
+// data "model".  
 
 enum {
-    EVF_COPIED,     // event data has been copied
-    EVF_HAS_XY,     // map-event will work on it
-    EVF_DOUBLE,     // double click detected
-    EVF_CONTROL,
-    EVF_SHIFT,
-    EVF_MAX
+    EVF_COPIED = 1 << 0, // event data has been copied
+    EVF_HAS_XY = 1 << 1, // map-event will work on it
+    EVF_DOUBLE = 1 << 2, // double click detected
+    EVF_CONTROL = 1 << 3,
+    EVF_SHIFT = 1 << 4
 };
 
 

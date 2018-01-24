@@ -29,7 +29,7 @@ decode-lines: function [
         replace/all text join-of newline indent newline
     ]
     remove text
-    remove back tail text
+    remove back tail of text
     text
 ]
 
@@ -51,34 +51,35 @@ encode-lines: func [
     if not equal? newline pos/1 [insert pos indent]
 
     ; Clear indent from tail if present.
-    if indent = pos: skip tail text 0 - length-of indent [clear pos]
+    if indent = pos: skip tail of text 0 - length of indent [clear pos]
     append text newline
 
     text
 ]
 
-for-each-line: func [
+for-each-line: function [
     {Iterate over text lines.}
-    'record [word!] {Word set to metadata for each line.}
-    text [string!] {Text with lines.}
-    body [block!] {Block to evaluate each time.}
-    /local eol
-] [
 
-    set/opt 'result while [not tail? text] [
-
+    'record [word!]
+        {Word set to metadata for each line.}
+    text [string!]
+        {Text with lines.}
+    body [block!]
+        {Block to evaluate each time.}
+][
+    while [not tail? text] [
         eol: any [
             find text newline
-            tail text
+            tail of text
         ]
 
-        set record compose [position (text) length (subtract index-of eol index-of text)]
+        set record compose [
+            position (text) length (subtract index of eol index of text)
+        ]
         text: next eol
 
         do body
     ]
-
-    get/opt 'result
 ]
 
 lines-exceeding: function [
@@ -92,7 +93,7 @@ lines-exceeding: function [
     count-line: [
         (
             line: 1 + any [line 0]
-            if line-length < subtract index-of eol index-of bol [
+            if line-length < subtract index-of eol index of bol [
                 append line-list: any [line-list copy []] line
             ]
         )
@@ -106,7 +107,7 @@ lines-exceeding: function [
     line-list
 ]
 
-line-of: function [
+line-from-pos: function [
     {Returns line number of position within text.}
     text [string! binary!]
     position [string! binary! integer!]

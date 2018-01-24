@@ -130,12 +130,10 @@
 // To formalize this rule, these definitions will help catch uses of <stdio.h>
 // in the release build, and give a hopefully informative error.
 //
-#ifdef NDEBUG
-    #if !defined(REN_C_STDIO_OK)
-        #define printf dont_include_stdio_h
-        #define fprintf dont_include_stdio_h
-        #define putc dont_include_stdio_h
-    #endif
+#if defined(NDEBUG) && !defined(REN_C_STDIO_OK)
+    #define printf dont_include_stdio_h
+    #define fprintf dont_include_stdio_h
+    #define putc dont_include_stdio_h
 #else
     // Desire to not bake in <stdio.h> notwithstanding, in debug builds it
     // can be convenient (or even essential) to have access to stdio.  This
@@ -176,17 +174,15 @@
 // macros and tools for C programming.
 //
 #include "reb-c.h"
+#include "reb-defs.h"
 
-
-// !!! Is there a more ideal location for these prototypes?
-typedef int cmp_t(void *, const void *, const void *);
-extern void reb_qsort_r(void *a, size_t n, size_t es, void *thunk, cmp_t *cmp);
-
-
-// Must be defined at the end of reb-c.h, but not *in* reb-c.h so that
-// files including sys-core.h and reb-host.h can have differing
-// definitions of REBCHR.  (We want it opaque to the core, but the
-// host to have it compatible with the native character type w/o casting)
+// Must be defined at the end of reb-defs.h, but not *in* reb-defs.h so that
+// files including sys-core.h and reb-host.h can have differing definitions of
+// REBCHR.  (We want it opaque to the core, but the host to have it compatible
+// with the native character type w/o casting)
+//
+// !!! This should become obsolete when all string exchanges with non-core
+// code are done via STRING! values.
 //
 #ifdef OS_WIDE_CHAR
     #ifdef NDEBUG
@@ -206,15 +202,11 @@ extern void reb_qsort_r(void *a, size_t n, size_t es, void *thunk, cmp_t *cmp);
     #endif
 #endif
 
-#include "reb-defs.h"
-
 #include "reb-device.h"
 #include "reb-types.h"
 #include "reb-event.h"
 
 #include "reb-file.h"
-#include "reb-filereq.h"
-#include "reb-math.h"
 
 #include "sys-rebnod.h"
 
@@ -239,8 +231,8 @@ typedef void (*TO_FUNC)(REBVAL*, enum Reb_Kind, const REBVAL*);
 //-- Port actions (for native port schemes):
 
 typedef struct rebol_port_action_map {
-    const REBSYM action;
-    const REBPAF func;
+    REBSYM action;
+    REBPAF func;
 } PORT_ACTION;
 
 typedef struct rebol_mold {
@@ -267,6 +259,17 @@ typedef struct rebol_mold {
 #define Pop_Molded_String_Len(mo,len) \
     Pop_Molded_String_Core((mo), (len))
 
+#define Mold_Value(mo,v) \
+    Mold_Or_Form_Value((mo), (v), FALSE)
+
+#define Form_Value(mo,v) \
+    Mold_Or_Form_Value((mo), (v), TRUE)
+
+#define Copy_Mold_Value(v,opts) \
+    Copy_Mold_Or_Form_Value((v), (opts), FALSE)
+
+#define Copy_Form_Value(v,opts) \
+    Copy_Mold_Or_Form_Value((v), (opts), TRUE)
 
 
 /***********************************************************************
@@ -357,48 +360,81 @@ enum {
     COPY_SAME = 16
 };
 
+// Mathematical set operations for UNION, INTERSECT, DIFFERENCE
+enum {
+    SOP_NONE = 0, // used by UNIQUE (other flags do not apply)
+    SOP_FLAG_BOTH = 1 << 0, // combine and interate over both series
+    SOP_FLAG_CHECK = 1 << 1, // check other series for value existence
+    SOP_FLAG_INVERT = 1 << 2 // invert the result of the search
+};
 
-// Breakpoint hook callback
-typedef REBOOL (*REBBRK)(REBVAL *instruction_out, REBOOL interrupted);
+
+// Breakpoint hook callback, signature:
+//
+//     REBOOL Do_Breakpoint_Throws(
+//         REBVAL *out,
+//         REBOOL interrupted, // Ctrl-C (as opposed to a BREAKPOINT)
+//         const REBVAL *default_value,
+//         REBOOL do_default
+//      );
+//
+// Typically, the handler will be set up to dispatch back into the REPL.
+//
+typedef REBOOL (*REBBRK)(REBVAL *, REBOOL, const REBVAL*, REBOOL);
 
 
 // Flags used for Protect functions
 //
 enum {
-    PROT_SET,
-    PROT_DEEP,
-    PROT_HIDE,
-    PROT_WORD,
-    PROT_FREEZE,
-    PROT_MAX
+    PROT_SET = 1 << 0,
+    PROT_DEEP = 1 << 1,
+    PROT_HIDE = 1 << 2,
+    PROT_WORD = 1 << 3,
+    PROT_FREEZE = 1 << 4
 };
 
 // Mold and form options:
 enum REB_Mold_Opts {
-    MOPT_MOLD_ALL,      // Output lexical types in #[type...] format
-    MOPT_COMMA_PT,      // Decimal point is a comma.
-    MOPT_SLASH_DATE,    // Date as 1/1/2000
-    MOPT_FILE,          // Molding %file
-    MOPT_INDENT,        // Indentation
-    MOPT_TIGHT,         // No space between block values
-    MOPT_EMAIL,         // ?
-    MOPT_ONLY,          // Mold/only - no outer block []
-    MOPT_LINES,         // add a linefeed between each value
-    MOPT_LIMIT,         // Limit length of mold to mold->limit, then "..."
-    MOPT_RESERVE,       // At outset, reserve space for buffer (with length 0)
-    MOPT_MAX
+    MOLD_FLAG_0 = 0,
+    MOLD_FLAG_ALL = 1 << 0, // Output lexical types in #[type...] format
+    MOLD_FLAG_COMMA_PT = 1 << 1, // Decimal point is a comma.
+    MOLD_FLAG_SLASH_DATE = 1 << 2, // Date as 1/1/2000
+    MOLD_FLAG_INDENT = 1 << 3, // Indentation
+    MOLD_FLAG_TIGHT = 1 << 4, // No space between block values
+    MOLD_FLAG_ONLY = 1 << 5, // Mold/only - no outer block []
+    MOLD_FLAG_LINES  = 1 << 6, // add a linefeed between each value
+    MOLD_FLAG_LIMIT = 1 << 7, // Limit length to mold->limit, then "..."
+    MOLD_FLAG_RESERVE = 1 << 8  // At outset, reserve capacity for buffer
 };
 
-#define GET_MOPT(v, f) GET_FLAG(v->opts, f)
+// Temporary:
+#define MOLD_FLAG_NON_ANSI_PARENED \
+    MOLD_FLAG_ALL // Non ANSI chars are ^() escaped
+
+#define DECLARE_MOLD(name) \
+    REB_MOLD mold_struct; \
+    CLEARS(&mold_struct); \
+    REB_MOLD *name = &mold_struct; \
+
+#define SET_MOLD_FLAG(mo,f) \
+    ((mo)->opts |= (f))
+
+#define GET_MOLD_FLAG(mo,f) \
+    LOGICAL((mo)->opts & (f))
+
+#define NOT_MOLD_FLAG(mo,f) \
+    NOT((mo)->opts & (f))
+
+#define CLEAR_MOLD_FLAG(mo,f) \
+    ((mo)->opts &= ~(f))
+
+typedef void (*MOLD_FUNC)(REB_MOLD *mo, const RELVAL *v, REBOOL form);
 
 // Special flags for decimal formatting:
 enum {
     DEC_MOLD_PERCENT = 1 << 0,      // follow num with %
     DEC_MOLD_MINIMAL = 1 << 1       // allow decimal to be integer
 };
-
-// Temporary:
-#define MOPT_NON_ANSI_PARENED MOPT_MOLD_ALL // Non ANSI chars are ^() escaped
 
 // Options for To_REBOL_Path
 enum {
@@ -407,15 +443,6 @@ enum {
     PATH_OPT_SRC_IS_DIR         = 1 << 2
 };
 
-// Load option flags:
-enum {
-    LOAD_ALL = 0,       // Returns header along with script if present
-    LOAD_HEADER,        // Converts header to object, checks values
-    LOAD_NEXT,          // Load next value
-    LOAD_NORMAL,        // Convert header, load script
-    LOAD_REQUIRE,       // Header is required, else error
-    LOAD_MAX
-};
 
 #define TAB_SIZE 4
 
@@ -460,25 +487,23 @@ enum rebol_signals {
     // be in the middle of code that is halfway through manipulating a
     // managed series.
     //
-    SIG_RECYCLE,
+    SIG_RECYCLE = 1 << 0,
 
     // SIG_HALT means return to the topmost level of the evaluator, regardless
     // of how deep a debug stack might be.  It is the only instruction besides
     // QUIT and RESUME that can currently get past a breakpoint sandbox.
     //
-    SIG_HALT,
+    SIG_HALT = 1 << 1,
 
     // SIG_INTERRUPT indicates a desire to enter an interactive debugging
     // state.  Because the ability to manage such a state may not be
     // registered by the host, this could generate an error.
     //
-    SIG_INTERRUPT,
+    SIG_INTERRUPT = 1 << 2,
 
     // SIG_EVENT_PORT is to-be-documented
     //
-    SIG_EVENT_PORT,
-
-    SIG_MAX
+    SIG_EVENT_PORT = 1 << 3
 };
 
 // Security flags:
@@ -531,6 +556,25 @@ enum Reb_Vararg_Op {
     VARARG_OP_TAKE // doesn't modify underlying data stream--advances index
 };
 
+// %sys-do.h needs to call into the scanner if Fetch_Next_In_Frame() is to
+// be inlined at all (at its many time-critical callsites), so the scanner
+// API has to be exposed with SCAN_STATE before %tmp-funcs.h
+//
+#include "sys-scan.h"
+
+// Historically, Rebol source did not include %reb-ext.h...because it was
+// assumed the core would never want to use the less-privileged and higher
+// overhead API.  Hence data types like REBRXT were not included in the core,
+// except in the one file that was implementing the "user library".
+//
+// However, there are cases where code is being migrated to use the internal
+// API over to using the external one, so it's helpful to allow calling both.
+// We therefore include %reb-ext so it defines RX* for all of the core, and
+// these types must be available to process %tmp-funcs.h since the RL_API
+// functions appear there too.
+//
+#include "reb-ext.h"
+#include "reb-lib.h"
 
 
 //=////////////////////////////////////////////////////////////////////////=//
@@ -549,7 +593,7 @@ enum Reb_Vararg_Op {
 // naturally in individual includes, it could be cleaner...at the cost of
 // needing to update prototypes separately from the definitions.
 //
-// See %tools/make-headers.r for the generation of this list.
+// See %make/make-headers.r for the generation of this list.
 //
 #include "tmp-funcs.h"
 
@@ -614,16 +658,17 @@ enum Reb_Vararg_Op {
 #include "sys-node.h"
 
 #include "sys-value.h" // basic definitions that don't need series accessrors
+#include "sys-time.h"
 
 #include "sys-series.h"
 #include "sys-binary.h"
 #include "sys-string.h"
+#include "sys-typeset.h"
 
 #include "sys-array.h"
 
 #include "sys-handle.h"
 
-#include "sys-typeset.h"
 #include "sys-context.h"
 #include "sys-function.h"
 #include "sys-word.h"
@@ -638,9 +683,7 @@ enum Reb_Vararg_Op {
 #include "sys-frame.h"
 #include "sys-bind.h"
 
-#include "sys-scan.h"
-
-#include "reb-struct.h"
+#include "sys-library.h"
 
 #include "host-lib.h"
 
@@ -653,20 +696,21 @@ enum Reb_Vararg_Op {
 // Generic defines:
 #define ALIGN(s, a) (((s) + (a)-1) & ~((a)-1))
 
-#define MEM_CARE 5              // Lower number for more frequent checks
-
 #define UP_CASE(c) Upper_Cases[c]
 #define LO_CASE(c) Lower_Cases[c]
 #define IS_WHITE(c) ((c) <= 32 && (White_Chars[c]&1) != 0)
 #define IS_SPACE(c) ((c) <= 32 && (White_Chars[c]&2) != 0)
 
 inline static void SET_SIGNAL(REBFLGS f) {
-    SET_FLAG(Eval_Signals, f);
+    Eval_Signals |= f;
     Eval_Count = 1;
 }
 
-#define GET_SIGNAL(f) GET_FLAG(Eval_Signals, (f))
-#define CLR_SIGNAL(f) CLR_FLAG(Eval_Signals, (f))
+#define GET_SIGNAL(f) \
+    LOGICAL(Eval_Signals & (f))
+
+#define CLR_SIGNAL(f) \
+    cast(void, Eval_Signals &= ~(f))
 
 
 //-- Temporary Buffers
@@ -678,68 +722,47 @@ inline static void SET_SIGNAL(REBFLGS f) {
 #define UNI_BUF        VAL_SERIES(TASK_UNI_BUF)
 #define BUF_UTF8        VAL_SERIES(TASK_BUF_UTF8)
 
+enum {
+    TRACE_FLAG_FUNCTION = 1 << 0
+};
 
-/***********************************************************************
-**
-**  Legacy Modes Checking
-**
-**      Ren/C wants to try out new things that will likely be included
-**      it the official Rebol3 release.  But it also wants transitioning
-**      to be feasible from Rebol2 and R3-Alpha, without paying that
-**      much to check for "old" modes if they're not being used.  So
-**      system/options contains flags used for enabling specific
-**      features relied upon by old code.
-**
-**      In order to keep these easements from adding to the measured
-**      performance cost in the system (and to keep them from being
-**      used for anything besides porting), they are only supported in
-**      debug builds.
-**
-***********************************************************************/
-
-#ifdef NDEBUG
-    #define SET_VOID_UNLESS_LEGACY_NONE(v) \
-        Init_Void(v) // LEGACY() only available in Debug builds
-#else
+// Most of Ren-C's backwards compatibility with R3-Alpha is attempted through
+// usermode "shim" functions.  But some things affect fundamental mechanics
+// and can't be done that way.  So in the debug build, system/options
+// contains some flags that enable the old behavior to be turned on.
+//
+// !!! These are not meant to be kept around long term.
+//
+#if !defined(NDEBUG)
     #define LEGACY(option) ( \
         (PG_Boot_Phase >= BOOT_ERRORS) \
-        && IS_CONDITIONAL_TRUE(Get_System(SYS_OPTIONS, (option))) \
+        && IS_TRUTHY(Get_System(SYS_OPTIONS, (option))) \
     )
-
-    #define LEGACY_RUNNING(option) \
-        (LEGACY(option) && In_Legacy_Function_Debug())
-
-    // In legacy mode Ren-C still supports the old convention that IFs that
-    // don't take the true branch or a WHILE loop that never runs a body
-    // return a BLANK! value instead of no value.  See implementation notes.
-    //
-    #ifdef NDEBUG
-        #define SET_VOID_UNLESS_LEGACY_NONE(v) \
-            Init_Void(v) // LEGACY() only available in Debug builds
-    #else
-        #define SET_VOID_UNLESS_LEGACY_NONE(v) \
-            SET_VOID_UNLESS_LEGACY_NONE_Debug(v, __FILE__, __LINE__);
-    #endif
-
 #endif
 
 
 //
 // Dispatch Table Prototypes
 //
-// These dispatch tables are generated and have data declarations in .inc
-// files.  Those data declarations can only be included once, yet the tables
-// may be used in multiple modules.
+// These dispatch tables are generated and have data declarations in the
+// %tmp-dispatch.c file.  Those data declarations can only be included once,
+// yet the tables may be used in multiple modules.
 //
 // The tables never contain NULL values.  Instead there is a dispatcher in
 // the slot which will fail if it is ever called.
 //
+// !!! These used to be const, but the desire to move REB_STRUCT and REB_GOB
+// into extensions required the tables to be dynamically modified.  This
+// should likely be changed back in the future in case it helps performance,
+// as these will be "user defined types" that are more like a context than
+// a built-in "kind".
 
-extern const REBACT Value_Dispatch[REB_MAX]; // in %tmp-evaltypes.inc
-extern const REBPEF Path_Dispatch[REB_MAX]; // in %tmp-evaltypes.inc
-extern const REBCTF Compare_Types[REB_MAX]; // in %tmp-comptypes.inc
-extern const MAKE_FUNC Make_Dispatch[REB_MAX]; // in %tmp-maketypes.inc
-extern const TO_FUNC To_Dispatch[REB_MAX]; // in %tmp-maketypes.inc
+extern REBACT Value_Dispatch[REB_MAX];
+extern REBPEF Path_Dispatch[REB_MAX];
+extern REBCTF Compare_Types[REB_MAX];
+extern MAKE_FUNC Make_Dispatch[REB_MAX];
+extern TO_FUNC To_Dispatch[REB_MAX];
+extern MOLD_FUNC Mold_Or_Form_Dispatch[REB_MAX];
 
 
 #include "sys-do.h"

@@ -31,27 +31,32 @@ assert: func [
     ; a default hijacking to set it to be equivalent to VERIFY, late in boot.)
 ]
 
-set/lookback quote enfix: proc [
-    "Convenience version of SET/LOOKBACK, e.g `+: enfix :add`"
+
+set/enfix quote enfix: proc [
+    "Convenience version of SET/ENFIX, e.g `+: enfix :add`"
     :target [set-word! set-path!]
     action [function!]
 ][
-    set/lookback target :action
+    set/enfix target :action
 
     ; return value can't currently be given back as enfix, since it is a
-    ; property of words and not values.  Should it be given back at all?
+    ; property of words and not values.  So it isn't given back at all (as
+    ; this is a PROC).  Is this sensible?
 ]
+
 
 default: enfix func [
     "Set word or path to a default value if it is not set yet or blank."
 
     return: [any-value!]
-    :target [set-word! set-path!]
-        "The word"
-    value [any-value!] ; not <opt> on purpose
-        "Value to set (blocks and 0-arity functions evaluated)"
-    <local>
-        gotten
+    'target [set-word! set-path!]
+        "The word to which might be set"
+    branch [block! function!]
+        "Will be evaluated and used as value to set only if not set already"
+    /only
+        "Consider target being BLANK! to be a value not to overwrite"
+
+    <local> gotten
 ][
     ; A lookback quoting function that quotes a SET-WORD! on its left is
     ; responsible for setting the value if it wants it to change since the
@@ -59,22 +64,49 @@ default: enfix func [
     ; assignment, it's good practice to evaluate the whole expression to
     ; the result the SET-WORD! was set to, so `x: y: op z` makes `x = y`.
     ;
-    if all [any-value? gotten: get/opt target | not blank? :gotten] [
-        :gotten
-    ]
-    else [
-        set/opt target if true :value ;-- executed if block or function
-    ]
+    ; Note: This overwrites the variable with SET* even if it's setting it
+    ; back to its old value.  That's potentially wasteful, but also might
+    ; bother a data breakpoint.  Though you might see it either way, if a
+    ; variable -could- be modified by a line, you may want to know that...
+    ; perhaps the debugger could monitor for *changes*.  Either way, this
+    ; should be a native, so it's not worth worrying about.
+    ;
+    set* target either-test/only
+        (only ?? :any-value? !! :something?) ;-- test function
+        get* target ;-- value to test, and to return if passes test
+        :branch ;-- branch to use if test fails
+]
+
+update: enfix func [
+    "Set word or path to a default value if that value is set and not blank."
+
+    return: [any-value!]
+    'target [set-word! set-path!]
+        "The word to which might be set"
+    code [block! function!]
+        "Code that is always evaluated, result only assigned if not nothing"
+    /only
+        "Consider value being BLANK! to be a value to use for overwriting"
+
+    <local> gotten
+][
+    set* target either-test/only
+        (only ?? :any-value? !! :something?) ;-- test function
+        do :code ;-- value being tested, return result if it passes
+        [get* target] ;-- branch to evaluate and return if test fails
 ]
 
 
-does: func [
-    {A shortcut to define a function that has no arguments or locals.}
-    return: [function!]
-    body [block!]
-        {The body block of the function}
+was: func [
+    {Return a variable's value prior to an assignment, then do the assignment}
+
+    return: [<opt> any-value!]
+        {Value of the following SET-WORD! or SET-PATH! before assignment}
+    evaluation [<opt> any-value! <...>]
+        {Used to take the assigned value}
+    :look [set-word! set-path! <...>]
 ][
-    func [] body ;-- no spec documentation permits any return value
+    (get* first look) also-do [take evaluation]
 ]
 
 
@@ -92,21 +124,23 @@ make-action: func [
         new-body exclusions locals defaulters statics
 ][
     exclusions: copy []
-    new-spec: make block! length-of spec
+
+    ; Rather than MAKE BLOCK! LENGTH OF SPEC here, we copy the spec and clear
+    ; it.  This costs slightly more, but it means we inherit the file and line
+    ; number of the original spec...so when we pass NEW-SPEC to FUNC or PROC
+    ; it uses that to give the FILE OF and LINE OF the function itself.
+    ;
+    ; !!! General API control to set the file and line on blocks is another
+    ; possibility, but since it's so new, we'd rather get experience first.
+    ;
+    new-spec: clear copy spec
+
     new-body: _
     statics: _
     defaulters: _
     var: _
 
     ;; dump [spec]
-
-    ; Insert <durable> into the spec.  This is based on the belief that
-    ; indefinite duration is a fair user expectation without having to ask.
-    ; Consider the legitimacy of:
-    ;
-    ;    foo: function [x] [y: x * 2 | return func [z] [x + y + z]
-    ;
-    append new-spec <durable>
 
     ; Gather the SET-WORD!s in the body, excluding the collected ANY-WORD!s
     ; that should not be considered.  Note that COLLECT is not defined by
@@ -144,9 +178,7 @@ make-action: func [
         )
     |
         (var: void) ;-- everything below this line clears var
-        fail ;-- failing here means rolling over to next rule (<durable>)
-    |
-        <durable> ;-- don't add to new-spec as we already added it
+        fail ;-- failing here means rolling over to next rule
     |
         <local>
         any [set var: word! (other: _) opt set other: group! (
@@ -171,7 +203,7 @@ make-action: func [
         )
         any [
             set other: [word! | path!] (
-                other: ensure any-context! get other
+                other: really any-context! get other
                 bind new-body other
                 for-each [key val] other [
                     append exclusions key
@@ -185,11 +217,7 @@ make-action: func [
             string! ;-- skip over as commentary
         ]
     |
-        ; While <static> is a well-known computer science term, it is an
-        ; un-intuitive word.  <has> is Ren-C's preference in mezzanine or
-        ; official code, relating it to the HAS object constructor.
-        ;
-        [<has> | <static>] (
+        <static> (
             unless statics [
                 statics: copy []
             ]
@@ -250,6 +278,7 @@ make-action: func [
 ;
 function: specialize :make-action [generator: :func]
 procedure: specialize :make-action [generator: :proc]
+does: specialize 'func [spec: []]
 
 
 ; Functions can be chained, adapted, and specialized--repeatedly.  The meta
@@ -361,7 +390,7 @@ redescribe: function [
                 fail [{archetype META-OF doesn't have DESCRIPTION slot} meta]
             ]
 
-            not notes: to-value :meta/parameter-notes [
+            not notes: get 'meta/parameter-notes [
                 return () ; specialized or adapted, HELP uses original notes
             ]
 
@@ -435,7 +464,7 @@ redescribe: function [
                             fail [param "not found in frame to describe"]
                         ]
 
-                        actual: first find words-of :value param
+                        actual: first find words of :value param
                         unless strict-equal? param actual [
                             fail [param {doesn't match word type of} actual]
                         ]
@@ -468,11 +497,33 @@ redescribe [
     {Define an action with set-words as locals, that doesn't return a value.}
 ] :procedure
 
+redescribe [
+    {A shortcut to define a function that has no arguments or locals.}
+] :does
+
+
+default*: enfix redescribe [
+    {Would be the same as DEFAULT/ONLY if paths could dispatch infix}
+](
+    specialize 'default [only: true]
+)
+
+update*: enfix redescribe [
+    {Would be the same as UPDATE/ONLY if paths could dispatch infix}
+](
+    specialize 'update [only: true]
+)
+
+
+; Though this name is questionable, it's nice to be easier to call
+;
+semiquote: specialize 'identity [quote: true]
+
 
 get*: redescribe [
     {Variation of GET which returns void if the source is not set}
 ](
-    specialize 'get [opt: true]
+    specialize 'get [only: true]
 )
 
 get-value: redescribe [
@@ -481,11 +532,10 @@ get-value: redescribe [
     chain [
         :get*
             |
-        func [x [<opt> any-value!]] [
-            unless set? 'x [
+        specialize 'either-test-value [
+            branch: [
                 fail "GET-VALUE requires source variable to be set"
             ]
-            :x
         ]
     ]
 )
@@ -493,8 +543,9 @@ get-value: redescribe [
 set*: redescribe [
     {Variation of SET where voids are tolerated for unsetting variables.}
 ](
-    specialize 'set [opt: true]
+    specialize 'set [only: true]
 )
+
 
 ; LOGIC VERSIONS OF CONTROL STRUCTURES
 ;
@@ -510,9 +561,9 @@ if?: redescribe [
 )
 
 if*: redescribe [
-    {Same as IF/OPT (return void, not blank, if branch evaluates to void)}
+    {Same as IF/ONLY (void, not blank, if branch evaluates to void)}
 ](
-    specialize 'if [opt: true]
+    specialize 'if [only: true]
 )
 
 unless?: redescribe [
@@ -522,15 +573,15 @@ unless?: redescribe [
 )
 
 unless*: redescribe [
-    {Same as UNLESS/OPT (return void, not blank, if branch evaluates to void)}
+    {Same as UNLESS/ONLY (void, not blank, if branch evaluates to void)}
 ](
-    specialize 'unless [opt: true]
+    specialize 'unless [only: true]
 )
 
 either*: redescribe [
-    {Same as EITHER/OPT (return void, not blank, if branch evaluates to void)}
+    {Same as EITHER/ONLY (void, not blank, if branch evaluates to void)}
 ](
-    specialize 'either [opt: true]
+    specialize 'either [only: true]
 )
 
 while?: redescribe [
@@ -546,9 +597,9 @@ case?: redescribe [
 )
 
 case*: redescribe [
-    {Same as CASE/OPT (return void, not blank, if branch evaluates to void)}
+    {Same as CASE/ONLY (void, not blank, if branch evaluates to void)}
 ](
-    specialize 'case [opt: true]
+    specialize 'case [only: true]
 )
 
 switch?: redescribe [
@@ -558,9 +609,9 @@ switch?: redescribe [
 )
 
 switch*: redescribe [
-    {Same as SWITCH/OPT (return void, not blank, if branch evaluates to void)}
+    {Same as SWITCH/ONLY (void, not blank, if branch evaluates to void)}
 ](
-    specialize 'switch [opt: true]
+    specialize 'switch [only: true]
 )
 
 trap?: redescribe [
@@ -587,18 +638,93 @@ all?: redescribe [
     chain [:all | :to-value | :to-logic]
 )
 
+maybe: redescribe [
+   {Check value using tests (match types, TRUE? or FALSE?, filter function)}
+](
+    adapt specialize 'either-test [
+        ;
+        ; return blank on test failure (can't be plain _ due to "evaluative
+        ; bit" rules...should this be changed so exemplars clear the bit?)
+        ;
+        branch: []
+        only: false ;-- no /ONLY, hence void branch returns BLANK!
+    ][
+        if void? :value [ ; !!! TBD: filter this via REDESCRIBE when possible
+            fail "Cannot use MAYBE on void values (try using EITHER-TEST)"
+        ]
+
+        ; !!! Since a BLANK! result means test failure, an input of blank
+        ; can't discern a success or failure.  Yet prohibiting blanks as
+        ; input seems bad.  A previous iteration of MAYBE would get past this
+        ; by returning blank on failure, but void on success...to help cue
+        ; a problem to conditionals.  That is not easy to do with a
+        ; specialization in this style, so just let people deal with it for
+        ; now...e.g. `maybe [function! block!] blank` will be blank, but so
+        ; will be `maybe [blank!] blank`.
+    ]
+)
+
 maybe?: redescribe [
     {Check value using tests (match types, TRUE? or FALSE?, filter function)}
     ; return: [logic!] ;-- blocks for type changes not supported yet
     ;    {TRUE if match, FALSE if no match (use MAYBE to pass through value)}
 ](
-    specialize 'maybe [?: true]
+    adapt chain [
+        specialize 'either-test [
+            branch: [] ; return void on test failure
+            only: true
+        ]
+            |
+        :any-value?
+    ][
+        if void? :value [ ; !!! TBD: filter this via REDESCRIBE when possible
+            fail "Cannot use MAYBE? on void values (try using EITHER-TEST)"
+        ]
+    ]
 )
+
+really: redescribe [
+    {Pass through value if it matches test, otherwise trigger a FAIL}
+](
+    specialize 'either-test [
+        branch: func [value [<opt> any-value!]] [
+            fail [
+                "REALLY did not expect argument of type" type of :value
+            ]
+
+            ; !!! There is currently no good way to SPECIALIZE a conditional
+            ; which takes a branch, with a branch that refers to parameters
+            ; of the running specialization.  Hence, there's no way to say
+            ; something like /WHERE 'TEST to indicate a parameter from the
+            ; callsite, until a solution is found for that. :-(
+        ]
+        only: false ;-- Doesn't matter (it fails) just hide the refinement
+    ]
+)
+
+ensure: func [
+    {FAIL if value is void (or blank if not /ONLY), otherwise pass it through}
+
+    value [any-value!] ;-- always checked for void, since no <opt>
+    /only
+        {Just make sure the value isn't void, pass through BLANK!}
+][
+    only ?? :value else [
+        either-test :something? :value [
+            fail/where
+                ["ENSURE received a BLANK! (use ENSURE* if this is ok)"]
+                'value
+        ] 
+    ]
+]
+
+ensure*: specialize 'ensure [only: true]
+
 
 find?: redescribe [
     {Variant of FIND that returns TRUE if present and FALSE if not.}
 ](
-    chain [:find | :to-logic]
+    chain [:find | :something?]
 )
 
 select: redescribe [
@@ -625,13 +751,8 @@ take: redescribe [
     chain [
         :take*
             |
-        func [
-            return: [any-value!]
-            took [<opt> any-value!]
-        ][
-            either set? 'took [
-                :took
-            ][
+        specialize 'either-test-value [
+            branch: [
                 fail "Can't TAKE from series end (see TAKE* to get void)"
             ]
         ]
@@ -644,13 +765,13 @@ parse?: redescribe [
     chain [
         :parse
             |
-        func [x][
-            unless logic? :x [
+        specialize 'either-test [
+            test: :logic?
+            branch: [
                 fail [
                     "Rules passed to PARSE? returned non-LOGIC!:" (mold :x)
                 ]
             ]
-            x
         ]
     ]
 )
@@ -666,6 +787,7 @@ for-back: redescribe [
 ](
     specialize 'for-skip [skip: -1]
 )
+
 
 lock-of: redescribe [
     "If value is already locked, return it...otherwise CLONE it and LOCK it."
@@ -714,7 +836,7 @@ nfix?: function [
     source [any-word! any-path!]
 ][
     case [
-        not lookback? source [false]
+        not enfixed? source [false]
         equal? n arity: arity-of source [true]
         n < arity [
             ; If the queried arity is lower than the arity of the function,
@@ -724,63 +846,23 @@ nfix?: function [
         ]
     ] else [
         fail [
-            name "used on lookback function with arity" arity
+            name "used on enfixed function with arity" arity
                 |
-            "Use LOOKBACK? for generalized (tricky) testing"
+            "Use ENFIXED? for generalized (tricky) testing"
         ]
     ]
-
-
 ]
 
-endfix?: redescribe [
-    {TRUE if a no-argument function is SET/LOOKBACK to not allow right infix.}
-](
-    specialize :nfix? [n: 0 | name: "ENDFIX?"]
-)
-
 postfix?: redescribe [
-    {TRUE if an arity 1 function is SET/LOOKBACK to act as postfix.}
+    {TRUE if an arity 1 function is SET/ENFIX to act as postfix.}
 ](
     specialize :nfix? [n: 1 | name: "POSTFIX?"]
 )
 
 infix?: redescribe [
-    {TRUE if an arity 2 function is SET/LOOKBACK to act as infix.}
+    {TRUE if an arity 2 function is SET/ENFIX to act as infix.}
 ](
     specialize :nfix? [n: 2 | name: "INFIX?"]
-)
-
-
-set-nfix: function [
-    return: [function!]
-    n [integer!]
-    name [string!]
-    target [any-word! any-path!]
-    value [function!]
-][
-    unless equal? n arity-of :value [
-        fail [name "requires arity" n "functions, see SET/LOOKAHEAD"]
-    ]
-    set/lookback target :value
-]
-
-set-endfix: redescribe [
-    {Convenience wrapper for SET/LOOKBACK that ensures function is arity 0.}
-](
-    specialize :set-nfix [n: 0 | name: "SET-ENDFIX"]
-)
-
-set-postfix: redescribe [
-    {Convenience wrapper for SET/LOOKBACK that ensures a function is arity 1.}
-](
-    specialize :set-nfix [n: 1 | name: "SET-POSTFIX"]
-)
-
-set-infix: redescribe [
-    {Convenience wrapper for SET/LOOKBACK that ensures a function is arity 2.}
-](
-    specialize :set-nfix [n: 2 | name: "SET-INFIX"]
 )
 
 
@@ -798,7 +880,7 @@ lambda: function [
     f: either only [:func] [:function]
 
     f (
-        :args then [to block! args] else [[]]
+        :args then [to block! args] !! []
     )(
         if block? first body [
             take body
@@ -808,63 +890,39 @@ lambda: function [
     )
 ]
 
-left-bar: func [
-    {Expression barrier that evaluates to left side but executes right.}
-    return: [<opt> any-value!]
-        {Evaluative result of `left`.}
-    left [<opt> <end> any-value!]
-        {A single complete expression on the left.}
-    right [<opt> any-value! <...>]
-        {Any number of expressions on the right.}
-    :look [any-value! <...>]
-][
-    ; !!! Should this fail if left is END?  How would it tell the difference
-    ; between left being void or end, is that exposed with SEMIQUOTED?
 
-    loop-until [
-        while [bar? first look] [take look] ;-- want to feed past BAR!s
-        take* right ;-- a void eval or an end both give back void here
-        tail? look
-    ]
-    :left
+invisible-eval-all: func [
+    {Evaluate any number of expressions, but completely elide the results.}
+
+    return: []
+        {Returns nothing, not even void ("invisible function", like COMMENT)}
+    expressions [<opt> any-value! <...>]
+        {Any number of expressions on the right.}
+][
+    do expressions
 ]
 
 right-bar: func [
-    {Expression barrier that evaluates to first expression on right.}
-    return: [<opt> any-value!]
-        {Evaluative result of first of the right expressions.}
-    left [<opt> <end> any-value!]
-        {A single complete expression on the left.}
-    right [<opt> any-value! <...>]
-        {Any number of expressions on the right.}
-    :look [any-value! <...>]
-][
-    ; !!! This could fail if `tail? right`, but should it?  Might make
-    ; COMPOSE situations less useful, e.g. `compose [thing |> (may-be-void)]`
+    {Evaluates to first expression on right, discarding ensuing expressions.}
 
-    also (
-        ; We want to make sure `1 |> | 2 3 4` is void, not BAR!
-        ;
-        either* bar? first look [void] [take* right]
-    )(
-        loop-until [
-            while [bar? first look] [take look]
-            take* right ;-- a void eval or an end both give back void here
-            tail? look
-        ]
-    )
+    return: [<opt> any-value!]
+        {Evaluative result of first of the following expressions.}
+    expressions [<opt> any-value! <...>]
+        {Any number of expression.}
+][
+    if* not tail? expressions [take* expressions] also-do [do expressions]
 ]
 
 
 once-bar: func [
     {Expression barrier that's willing to only run one expression after it}
+
     return: [<opt> any-value!]
-    left [<opt> <end> any-value!]
     right [<opt> any-value! <...>]
     :lookahead [any-value! <...>]
     look:
 ][
-    also take right (
+    take right also-do [
         unless any [
             tail? right
                 |
@@ -874,29 +932,9 @@ once-bar: func [
                 "|| expected single expression, found residual of" :look
             ]
         ]
-    )
+    ]
 ]
 
-
-use: func [
-    {Defines words local to a block.}
-    return: [<opt> any-value!]
-    vars [block! word!] {Local word(s) to the block}
-    body [block!] {Block to evaluate}
-][
-    ; We are building a FUNC out of the body that was passed to us, and that
-    ; body may have RETURN words with bindings in them already that we do
-    ; not want to disturb with the definitional bindings in the new code.
-    ; So that means either using MAKE FUNCTION! (which wouldn't disrupt
-    ; RETURN bindings) or using the more friendly FUNC and `<with> return`
-    ; (they do the same thing, just FUNC is arity-2)
-    ;
-    ; <durable> is used so that the data for the locals will still be
-    ; available if any of the words leak out and are accessed after the
-    ; execution is finished.
-    ;
-    eval func compose [<durable> <local> (vars) <with> return] body
-]
 
 ; Shorthand helper for CONSTRUCT (similar to DOES for FUNCTION).
 ;
@@ -910,12 +948,19 @@ has: func [
     construct/(all [only 'only]) [] body
 ]
 
+
 module: func [
-    "Creates a new module."
-    spec [block! object!] "The header block of the module (modified)"
-    body [block!] "The body block of the module (modified)"
-    /mixin "Mix in words from other modules"
-    mixins [object!] "Words collected into an object"
+    {Creates a new module.}
+    
+    spec [block! object!]
+        "The header block of the module (modified)"
+    body [block!]
+        "The body block of the module (modified)"
+    /mixin
+        "Mix in words from other modules"
+    mixins [object!]
+        "Words collected into an object"
+    
     <local> hidden w mod
 ][
     mixins: to-value :mixins
@@ -964,7 +1009,7 @@ module: func [
         spec/version [tuple! blank!]
         spec/options [block! blank!]
     ][
-        do compose/only [ensure (types) (var)] ;-- names to show if fails
+        do compose/only [really (types) (var)] ;-- names to show if fails
     ]
 
     ; In Ren-C, MAKE MODULE! acts just like MAKE OBJECT! due to the generic
@@ -1105,7 +1150,7 @@ fail: function [
 ][
     ; By default, make the originating frame the FAIL's frame
     ;
-    unless where [location: context-of 'reason]
+    unless where [location: context of 'reason]
 
     ; Ultimately we might like FAIL to use some clever error-creating dialect
     ; when passed a block, maybe something like:
@@ -1138,34 +1183,4 @@ fail: function [
     ; Raise error to the nearest TRAP up the stack (if any)
     ;
     do error
-]
-
-
-ensure: function [
-    {Pass through a value only if it matches types (or TRUE?/FALSE? state)}
-    return: [<opt> any-value!]
-    test [function! datatype! typeset! block! logic!]
-    arg [<opt> any-value!]
-][
-    case* [
-        void? temp: maybe test :arg [
-            assert [any [void? :arg | not :arg]]
-
-            ; The test passed but we want to avoid an accidental usage like
-            ; `if ensure [logic!] some-false-thing [...]` where the test
-            ; passed but the passthru gets used conditionally.  So FALSE?
-            ; things are converted to void.
-            ;
-            ()
-        ]
-        blank? :temp [
-            fail/where [
-                "ENSURE expected arg to match" (test)
-            ] 'arg
-        ]
-        true [
-            assert [all [:temp | :arg = :temp]]
-            :temp
-        ]
-    ]
 ]

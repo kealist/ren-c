@@ -207,16 +207,36 @@ enum rebol_esc_codes {
 */
 
 typedef struct rebol_scan_state {
+    //
+    // If vaptr is NULL, then it is assumed that the `begin` is the source of
+    // the UTF-8 data to scan.  Otherwise, it is a variadic feed of UTF-8
+    // strings and values that are spliced in.
+    //
+    va_list *vaptr;
+
     const REBYTE *begin;
     const REBYTE *end;
-    const REBYTE *limit;    /* no chars after this point */
+
+    // The "limit" feature was not implemented, scanning stopped on a null
+    // terminator.  It may be interesting in the future, but it doesn't mix
+    // well with scanning variadics which merge REBVAL and UTF-8 strings
+    // together...
+    //
+    /* const REBYTE *limit; */
     
     REBCNT line;
     const REBYTE *line_head; // head of current line (used for errors)
+
     REBCNT start_line;
     const REBYTE *start_line_head;
 
-    REBSTR *filename;
+    REBSTR *file;
+
+    // VALUE_FLAG_LINE appearing on a value means that there is a line break
+    // *before* that value.  Hence when a newline is seen, it means the *next*
+    // value to be scanned will receive the flag.
+    //
+    REBOOL newline_pending;
 
     REBFLGS opts;
     enum Reb_Token token;
@@ -225,10 +245,9 @@ typedef struct rebol_scan_state {
 #define ANY_CR_LF_END(c) (!(c) || (c) == CR || (c) == LF)
 
 enum {
-    SCAN_NEXT,  // load/next feature
-    SCAN_ONLY,  // only single value (no blocks)
-    SCAN_RELAX, // no error throw
-    SCAN_MAX
+    SCAN_NEXT = 1 << 0, // load/next feature
+    SCAN_ONLY = 1 << 1, // only single value (no blocks)
+    SCAN_RELAX = 1 << 2 // no error throw
 };
 
 
@@ -264,36 +283,3 @@ enum {
 **  Externally Accessed Variables
 */
 extern const REBYTE Lex_Map[256];
-
-
-// R3-Alpha did not support unicode codepoints higher than 0xFFFF, because
-// strings were only 1 or 2 bytes per character.  Future plans for Ren-C may
-// use the "UTF8 everywhere" philosophy as opposed to extending this to
-// strings which have more bytes.
-//
-// Until support for "astral plane" characters is added, this inline function
-// traps large characters when strings are being scanned.  If a client wishes
-// to handle them explicitly, use Back_Scan_UTF8_Char_Core().
-//
-// Though the machinery can decode a UTF32 32-bit codepoint, the interface
-// uses a 16-bit REBUNI (due to that being all that Rebol supports at this
-// time).  If a codepoint that won't fit in 16-bits is found, it will raise
-// an error vs. return NULL.  This makes it clear that the problem is not
-// with the data itself being malformed (the usual assumption of callers)
-// but rather a limit of the implementation.
-//
-inline static const REBYTE *Back_Scan_UTF8_Char(
-    REBUNI *out,
-    const REBYTE *bp,
-    REBCNT *len
-){
-    unsigned long ch; // "UTF32" is defined as unsigned long
-    const REBYTE *bp_new = Back_Scan_UTF8_Char_Core(&ch, bp, len);
-    if (bp_new != NULL && ch > 0xFFFF) {
-        DECLARE_LOCAL (num);
-        Init_Integer(num, cast(REBI64, ch));
-        fail (Error_Codepoint_Too_High_Raw(num));
-    }
-    *out = cast(REBUNI, ch);
-    return bp_new;
-}

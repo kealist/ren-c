@@ -12,13 +12,6 @@
 ]
 ; no structural equality for function!
 [not same? func [] [] func [] []]
-; reflexivity test for closure!
-[
-    a-value: closure [] []
-    same? :a-value :a-value
-]
-; no structural equality for closure!
-[not same? closure [] [] closure [] []]
 ; binary!
 [not same? #{00} #{00}]
 ; binary versus bitset
@@ -100,8 +93,8 @@
 ]
 ; reflexivity for past-tail blocks
 [
-    a-value: tail [1]
-    clear head a-value
+    a-value: tail of [1]
+    clear head of a-value
     same? a-value a-value
 ]
 ; reflexivity for cyclic blocks

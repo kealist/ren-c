@@ -101,17 +101,6 @@ enum Reb_Result {
     //
     R_OUT_VOID_IF_UNWRITTEN_TRUTHIFY,
 
-    // This converts void into BLANK!, and is used by control constructs
-    // so that they can reserve void for the case they didn't run any branch.
-    //
-    R_OUT_BLANK_IF_VOID,
-
-    // This combines the unwritten and blank path for control constructs.
-    // While it may seem they could do it themselves, having a different
-    // return code is a reminder that some optimization may be possible.
-    //
-    R_OUT_VOID_IF_UNWRITTEN_BLANK_IF_VOID,
-
     // If Do_Core gets back an R_REDO from a dispatcher, it will re-execute
     // the f->phase in the frame.  This function may be changed by the
     // dispatcher from what was originally called.
@@ -124,8 +113,40 @@ enum Reb_Result {
     // argument during that evaluation, so it writes into the frame's
     // "eval cell".
     //
-    R_REEVALUATE,
-    R_REEVALUATE_ONLY,
+    R_REEVALUATE_CELL,
+    R_REEVALUATE_CELL_ONLY,
+
+    // See FUNC_FLAG_INVISIBLE...this is what any function with that flag
+    // needs to return.
+    //
+    // It is also used by path dispatch when it has taken performing a
+    // SET-PATH! into its own hands, but doesn't want to bother saying to
+    // move the value into the output slot...instead leaving that to the
+    // evaluator (as a SET-PATH! should always evaluate to what was just set)
+    //
+    R_INVISIBLE,
+
+    // Path dispatch used to have a return value PE_SET_IF_END which meant
+    // that the dispatcher itself should realize whether it was doing a path
+    // get or set, and if it were doing a set then to write the value to set
+    // into the target cell.  That means it had to keep track of a pointer to
+    // a cell vs. putting the bits of the cell into the output.  This is now
+    // done with a special REB_0_REFERENCE type which holds in its payload
+    // a RELVAL and a specifier, which is enough to be able to do either a
+    // read or a write, depending on the need.
+    //
+    // !!! See notes in %c-path.c of why the R3-Alpha path dispatch is hairier
+    // than that.  It hasn't been addressed much in Ren-C yet, but needs a
+    // more generalized design.
+    //
+    R_REFERENCE,
+
+    // This is used in path dispatch, signifying that a SET-PATH! assignment
+    // resulted in the updating of an immediate expression in pvs->out,
+    // meaning it will have to be copied back into whatever reference cell
+    // it had been in.
+    //
+    R_IMMEDIATE,
 
     // This is a signal that isn't accepted as a return value from a native,
     // so it can be used by common routines that return REB_R values and need
@@ -165,7 +186,7 @@ inline static REB_R R_FROM_BOOL(REBOOL b) {
 // will appear to be equal.  It's a tricky enough bug to catch to warrant an
 // extra check in C++ that disallows comparing SYMs with ==
 //
-#if !defined(NDEBUG) && defined(__cplusplus)
+#if !defined(NDEBUG) && defined(CPLUSPLUS_11)
     struct REBSYM;
 
     struct OPT_REBSYM { // can only be converted to REBSYM, no comparisons
@@ -177,10 +198,10 @@ inline static REB_R R_FROM_BOOL(REBOOL b) {
         REBOOL operator!=(enum REBOL_Symbols other) const {
             return LOGICAL(n != other);
         }
-    #if __cplusplus >= 201103L // http://stackoverflow.com/a/35399513/211160
+
         REBOOL operator==(OPT_REBSYM &&other) const;
         REBOOL operator!=(OPT_REBSYM &&other) const;
-    #endif
+
         operator unsigned int() const {
             return cast(unsigned int, n);
         }
@@ -248,6 +269,12 @@ typedef REB_R (*REBPAF)(REBFRM *frame_, REBCTX *p, REBSYM a);
 
 // COMMAND! function
 typedef REB_R (*CMD_FUNC)(REBCNT n, REBSER *args);
+
+// Path evaluator function
+//
+typedef REB_R (*REBPEF)(
+    REBPVS *pvs, const REBVAL *picker, const REBVAL *opt_setval
+);
 
 // "Routine INfo" was once a specialized C structure, now an ordinary Rebol
 // REBARR pointer.

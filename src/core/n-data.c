@@ -116,151 +116,29 @@ REBNATIVE(verify)
     DECLARE_FRAME (f);
     Push_Frame(f, ARG(conditions));
 
-    DECLARE_LOCAL (temp);
-
-    while (NOT_END(f->value)) {
+    while (FRM_HAS_MORE(f)) {
         const RELVAL *start = f->value;
         if (Do_Next_In_Frame_Throws(D_OUT, f)) {
             Drop_Frame(f);
             return R_OUT_IS_THROWN;
         }
 
-        if (!IS_VOID(D_OUT) && IS_CONDITIONAL_TRUE(D_OUT))
+        if (!IS_VOID(D_OUT) && IS_TRUTHY(D_OUT))
             continue;
 
         Init_Block(
-            temp,
+            D_CELL,
             Copy_Values_Len_Shallow(start, f->specifier, f->value - start)
         );
 
         if (IS_VOID(D_OUT))
-            fail (Error_Verify_Void_Raw(temp));
+            fail (Error_Verify_Void_Raw(D_CELL));
 
-        fail (Error_Verify_Failed_Raw(temp));
+        fail (Error_Verify_Failed_Raw(D_CELL));
     }
 
     Drop_Frame(f);
     return R_VOID;
-}
-
-
-// Test used iteratively by MAYBE native.  Returns R_BLANK if the test fails,
-// R_OUT if success, or R_OUT_IS_THROWN if a test throws.
-//
-inline static REB_R Do_Test_For_Maybe(
-    REBVAL *out,
-    const REBVAL *value,
-    const RELVAL *test
-) {
-    if (IS_DATATYPE(test)) {
-        if (VAL_TYPE_KIND(test) != VAL_TYPE(value))
-            return R_BLANK;
-        Move_Value(out, value);
-        return R_OUT;
-    }
-
-    if (IS_TYPESET(test)) {
-        if (!TYPE_CHECK(test, VAL_TYPE(value)))
-            return R_BLANK;
-        Move_Value(out, value);
-        return R_OUT;
-    }
-
-    if (IS_FUNCTION(test)) {
-        if (Apply_Only_Throws(out, TRUE, const_KNOWN(test), value, END))
-            return R_OUT_IS_THROWN;
-
-        if (IS_VOID(out))
-            fail (Error_No_Return_Raw());
-
-        if (IS_CONDITIONAL_FALSE(out))
-            return R_BLANK;
-
-        Move_Value(out, value);
-        return R_OUT;
-    }
-
-    fail (Error_Invalid_Type(VAL_TYPE(test)));
-}
-
-
-//
-//  maybe: native [
-//
-//  {Check value using tests (match types, TRUE? or FALSE?, filter function)}
-//
-//      return: [<opt> any-value!]
-//          {The input value or BLANK! if no match, void if FALSE? and matched}
-//      test [function! datatype! typeset! block! logic!]
-//      value [<opt> any-value!]
-//      /?
-//          "Return LOGIC! of match vs. pass-through of value or blank"
-//  ]
-//
-REBNATIVE(maybe)
-{
-    INCLUDE_PARAMS_OF_MAYBE; // ? is renamed as "q"
-
-    REBVAL *test = ARG(test);
-    REBVAL *value = ARG(value);
-
-    if (IS_LOGIC(test)) {
-        if (!IS_VOID(value) && VAL_LOGIC(test) == IS_CONDITIONAL_TRUE(value))
-            goto type_matched;
-        return REF(q) ? R_FALSE : R_BLANK;
-    }
-
-    REB_R r;
-    if (IS_BLOCK(test)) {
-        //
-        // !!! What should the behavior for `MAYBE [] ...` be?  Should that be
-        // an error?  People wouldn't write it literally, but could wind up
-        // with an empty array as the product of a COMPOSE or something.
-        // Consider it ambiguous for now and give back void...
-        //
-        r = R_VOID;
-
-        const RELVAL *item;
-        for (item = VAL_ARRAY_AT(test); NOT_END(item); ++item) {
-            r = Do_Test_For_Maybe(
-                D_OUT,
-                value,
-                IS_WORD(item)
-                    ? Get_Opt_Var_May_Fail(item, VAL_SPECIFIER(test))
-                    : item
-            );
-
-            if (r != R_BLANK)
-                goto type_matched;
-        }
-    }
-    else
-        r = Do_Test_For_Maybe(D_OUT, value, test);
-
-    if (r == R_OUT_IS_THROWN)
-        return r;
-
-    if (REF(q))
-        return r == R_BLANK ? R_FALSE : R_TRUE;
-
-    if (r == R_BLANK)
-        return r;
-
-    assert(r == R_OUT); // must have matched!
-
-type_matched:
-    if (REF(q))
-        return R_TRUE;
-
-    // Because there may be usages like `if maybe logic! x [print "logic!"]`,
-    // it would be bad to take in a FALSE and pass back a FALSE.  This is
-    // why /? (and its specialization MAYBE?) exist, but to help avoid
-    // likely mistakes this returns a void.
-    //
-    if (IS_CONDITIONAL_FALSE(value))
-        return R_VOID;
-
-    return R_OUT;
 }
 
 
@@ -313,12 +191,9 @@ REBNATIVE(bind)
 {
     INCLUDE_PARAMS_OF_BIND;
 
-    REBVAL *value = ARG(value);
+    REBVAL *v = ARG(value);
     REBVAL *target = ARG(target);
 
-    REBCTX *context;
-
-    REBARR *array;
     REBCNT flags = REF(only) ? BIND_0 : BIND_DEEP;
 
     REBU64 bind_types = TS_ANY_WORD;
@@ -333,6 +208,10 @@ REBNATIVE(bind)
     else
         add_midstream_types = 0;
 
+    REBCTX *context;
+
+    // !!! For now, force reification before doing any binding.
+
     if (ANY_CONTEXT(target)) {
         //
         // Get target from an OBJECT!, ERROR!, PORT!, MODULE!, FRAME!
@@ -340,38 +219,31 @@ REBNATIVE(bind)
         context = VAL_CONTEXT(target);
     }
     else {
-        //
-        // Extract target from whatever word we were given
-        //
         assert(ANY_WORD(target));
         if (IS_WORD_UNBOUND(target))
             fail (Error_Not_Bound_Raw(target));
 
-        // The word in hand may be a relatively bound one.  To return a
-        // specific frame, this needs to ensure that the Reb_Frame's data
-        // is a real context, not just a chunk of data.
-        //
         context = VAL_WORD_CONTEXT(target);
     }
 
-    if (ANY_WORD(value)) {
+    if (ANY_WORD(v)) {
         //
         // Bind a single word
 
-        if (Try_Bind_Word(context, value)) {
-            Move_Value(D_OUT, value);
+        if (Try_Bind_Word(context, v)) {
+            Move_Value(D_OUT, v);
             return R_OUT;
         }
 
         // not in context, bind/new means add it if it's not.
         //
-        if (REF(new) || (IS_SET_WORD(value) && REF(set))) {
-            Append_Context(context, value, NULL);
-            Move_Value(D_OUT, value);
+        if (REF(new) || (IS_SET_WORD(v) && REF(set))) {
+            Append_Context(context, v, NULL);
+            Move_Value(D_OUT, v);
             return R_OUT;
         }
 
-        fail (Error_Not_In_Context_Raw(ARG(value)));
+        fail (Error_Not_In_Context_Raw(v));
     }
 
     // Copy block if necessary (/copy)
@@ -382,15 +254,23 @@ REBNATIVE(bind)
     // because there could be code that depends on the existing (mis)behavior
     // but it should be followed up on.
     //
-    Move_Value(D_OUT, value);
+    Move_Value(D_OUT, v);
+
+    REBARR *array;
     if (REF(copy)) {
-        array = Copy_Array_At_Deep_Managed(
-            VAL_ARRAY(value), VAL_INDEX(value), VAL_SPECIFIER(value)
+        array = Copy_Array_Core_Managed(
+            VAL_ARRAY(v),
+            VAL_INDEX(v), // at
+            VAL_SPECIFIER(v),
+            ARR_LEN(VAL_ARRAY(v)), // tail
+            0, // extra
+            SERIES_FLAG_FILE_LINE, // flags
+            TS_ARRAY // types to copy deeply
         );
         INIT_VAL_ARRAY(D_OUT, array); // warning: macro copies args
     }
     else
-        array = VAL_ARRAY(value);
+        array = VAL_ARRAY(v);
 
     Bind_Values_Core(
         ARR_HEAD(array),
@@ -405,29 +285,141 @@ REBNATIVE(bind)
 
 
 //
-//  context-of: native [
+//  use: native [
 //
-//  "Returns the context in which a word is bound."
+//  {Defines words local to a block.}
 //
-//      word [any-word!]
+//      return: [<opt> any-value!]
+//      vars [block! word!]
+//          {Local word(s) to the block}
+//      body [block!]
+//          {Block to evaluate}
 //  ]
 //
-REBNATIVE(context_of)
+REBNATIVE(use)
+//
+// !!! R3-Alpha's USE was written in userspace and was based on building a
+// CLOSURE! that it would DO.  Hence it took advantage of the existing code
+// for tying function locals to a block, and could be relatively short.  This
+// was wasteful in terms of creating an unnecessary function that would only
+// be called once.  The fate of CLOSURE-like semantics is in flux in Ren-C
+// (how much automatic-gathering and indefinite-lifetime will be built-in),
+// yet it's also more efficient to just make a native.
+//
+// As it stands, the code already existed for loop bodies to do this more
+// efficiently.  The hope is that with virtual binding, such constructs will
+// become even more efficient--for loops, BIND, and USE.
+//
+// !!! Should USE allow LIT-WORD!s to mean basically a no-op, just for common
+// interface with the loops?
 {
-    INCLUDE_PARAMS_OF_CONTEXT_OF;
+    INCLUDE_PARAMS_OF_USE;
 
-    if (IS_WORD_UNBOUND(ARG(word))) return R_BLANK;
+    REBCTX *context;
+    Virtual_Bind_Deep_To_New_Context(
+        ARG(body), // may be replaced with rebound copy, or left the same
+        &context, // winds up managed; if no references exist, GC is ok
+        ARG(vars) // similar to the "spec" of a loop: WORD!/LIT-WORD!/BLOCK!
+    );
 
-    // Requesting the context of a word that is relatively bound may result
-    // in that word having a FRAME! incarnated as a REBSER node (if it
-    // was not already reified.)
-    //
-    // !!! Mechanically it is likely that in the future, all FRAME!s for
-    // user functions will be reified from the moment of invocation.
-    //
-    Move_Value(D_OUT, CTX_VALUE(VAL_WORD_CONTEXT(ARG(word))));
+    if (Do_Any_Array_At_Throws(D_OUT, ARG(body)))
+        return R_OUT_IS_THROWN;
 
     return R_OUT;
+}
+
+
+//
+//  Get_Context_Of: C
+//
+REBOOL Get_Context_Of(REBVAL *out, const REBVAL *v)
+{
+    switch (VAL_TYPE(v)) {
+    case REB_FUNCTION: {
+        //
+        // The only examples of functions bound to contexts that exist at the
+        // moment are RETURN and LEAVE.  While there are archetypal natives
+        // for these functions, the REBVAL instances can contain a binding
+        // to the specific frame they exit.  Assume what is desired is that
+        // frame...
+        //
+        REBNOD *n = VAL_BINDING(v);
+        if (n == UNBOUND)
+            return FALSE;
+
+        REBCTX *c;
+        if (n->header.bits & NODE_FLAG_CELL) {
+            REBFRM *f = cast(REBFRM*, n);
+            c = Context_For_Frame_May_Reify_Managed(f);
+        }
+        else {
+            assert(n->header.bits & (SERIES_FLAG_ARRAY | ARRAY_FLAG_VARLIST));
+            c = cast(REBCTX*, n);
+        }
+        Move_Value(out, CTX_VALUE(c));
+        assert(IS_FRAME(out));
+        break; }
+
+    case REB_WORD:
+    case REB_SET_WORD:
+    case REB_GET_WORD:
+    case REB_LIT_WORD:
+    case REB_REFINEMENT:
+    case REB_ISSUE: {
+        if (IS_WORD_UNBOUND(v))
+            return FALSE;
+
+        // Requesting the context of a word that is relatively bound may
+        // result in that word having a FRAME! incarnated as a REBSER node (if
+        // it was not already reified.)
+        //
+        // !!! In the future Reb_Context will refer to a REBNOD*, and only
+        // be reified based on the properties of the cell into which it is
+        // moved (e.g. OUT would be examined here to determine if it would
+        // have a longer lifetime than the REBFRM* or other node)
+        //
+        REBCTX *c = VAL_WORD_CONTEXT(v);
+        Move_Value(out, CTX_VALUE(c));
+        break; }
+
+    default:
+        //
+        // Will OBJECT!s or FRAME!s have "contexts"?  Or if they are passed
+        // in should they be passed trough as "the context"?  For now, keep
+        // things clear?
+        //
+        assert(FALSE);
+    }
+
+    // A FRAME! has special properties of ->phase and ->binding which
+    // affect the interpretation of which layer of a function composition
+    // they correspond to.  If you REDO a FRAME! value it will restart at
+    // different points based on these properties.  Assume the time of
+    // asking is the layer in the composition the user is interested in.
+    //
+    // !!! This may not be the correct answer, but it seems to work in
+    // practice...keep an eye out for counterexamples.
+    //
+    if (IS_FRAME(out)) {
+        REBCTX *c = VAL_CONTEXT(out);
+        REBFRM *f = CTX_FRAME_IF_ON_STACK(c);
+        if (f != NULL) {
+            out->payload.any_context.phase = f->phase;
+            INIT_BINDING(out, f->binding);
+        }
+        else {
+            // !!! Assume the canon FRAME! value in varlist[0] is useful?
+            //
+            assert(VAL_BINDING(out) == UNBOUND); // canons have no binding
+        }
+
+        assert(
+            SER(FUNC_PARAMLIST(out->payload.any_context.phase))->header.bits
+            & ARRAY_FLAG_PARAMLIST
+        );
+    }
+
+    return TRUE;
 }
 
 
@@ -496,37 +488,20 @@ REBNATIVE(collect_words)
 {
     INCLUDE_PARAMS_OF_COLLECT_WORDS;
 
-    REBARR *words;
-    REBCNT modes;
-    RELVAL *values = VAL_ARRAY_AT(ARG(block));
-    RELVAL *prior_values;
-
+    REBFLGS flags;
     if (REF(set))
-        modes = COLLECT_ONLY_SET_WORDS;
+        flags = COLLECT_ONLY_SET_WORDS;
     else
-        modes = COLLECT_ANY_WORD;
+        flags = COLLECT_ANY_WORD;
 
-    if (REF(deep)) modes |= COLLECT_DEEP;
+    if (REF(deep))
+        flags |= COLLECT_DEEP;
 
-    // If ignore, then setup for it:
-    if (REF(ignore)) {
-        if (ANY_CONTEXT(ARG(hidden))) {
-            //
-            // !!! These are typesets and not words.  Is Collect_Words able
-            // to handle that?
-            //
-            prior_values = CTX_KEYS_HEAD(VAL_CONTEXT(ARG(hidden)));
-        }
-        else {
-            assert(IS_BLOCK(ARG(hidden)));
-            prior_values = VAL_ARRAY_AT(ARG(hidden));
-        }
-    }
-    else
-        prior_values = NULL;
+    UNUSED(REF(ignore)); // implied used or unused by ARG(hidden)'s voidness
 
-    words = Collect_Words(values, prior_values, modes);
-    Init_Block(D_OUT, words);
+    RELVAL *head = VAL_ARRAY_AT(ARG(block));
+
+    Init_Block(D_OUT, Collect_Unique_Words_Managed(head, flags, ARG(hidden)));
     return R_OUT;
 }
 
@@ -537,10 +512,10 @@ REBNATIVE(collect_words)
 //  {Gets the value of a word or path, or values of a context.}
 //
 //      return: [<opt> any-value!]
-//          {If the source looks up to a value, that value--else void}
+//          {If the source looks up to a value, that value--else blank}
 //      source [blank! any-word! any-path! block!]
 //          {Word or path to get, or block of words or paths (blank is no-op)}
-//      /opt
+//      /only
 //          {Return void if no value instead of blank}
 //  ]
 //
@@ -548,7 +523,9 @@ REBNATIVE(get)
 //
 // Note: GET* cannot be the fundamental operation, because GET could not be
 // written for blocks (since voids can't be put in blocks, so they couldn't
-// be "blankified")
+// be "blankified").  Well, technically it *could* be fundamental, but GET
+// would have to make multiple calls to GET* in order to process a block and
+// deal with any voids.
 {
     INCLUDE_PARAMS_OF_GET;
 
@@ -561,10 +538,10 @@ REBNATIVE(get)
     if (IS_BLOCK(ARG(source))) {
         //
         // If a BLOCK! of gets are performed, voids cannot be put into the
-        // resulting BLOCK!.  Hence for /OPT to be legal, it would have to
+        // resulting BLOCK!.  Hence for /ONLY to be legal, it would have to
         // give back a BLANK! or other placeholder.  However, since GET-VALUE
-        // is built on GET/OPT, we defer the error until we actually encounter
-        // an unset variable...which produces that error case that could not
+        // is built on GET/ONLY, we defer the error an unset variable is
+        // actually encountered, which produces that error case that could not
         // be done by "checking the block for voids"
 
         source = VAL_ARRAY_AT(ARG(source));
@@ -606,42 +583,14 @@ REBNATIVE(get)
         }
         else if (ANY_PATH(source)) {
             //
-            // Make sure the path does not contain any GROUP!s, because that
-            // would trigger evaluations.  GET does not sound like something
-            // that should have such a side-effect, the user should go with
-            // a REDUCE operation if that's what they want.
+            // `get 'foo/bar` acts like `:foo/bar`
+            // Get_Path_Core() will raise an error if there are any GROUP!s.
             //
-            RELVAL *temp = VAL_ARRAY_AT(source);
-            for (; NOT_END(temp); ++temp)
-                if (IS_GROUP(temp))
-                    fail ("GROUP! can't be in paths with GET, use REDUCE");
-
-            // Piggy-back on the GET-PATH! mechanic by copying to a temp
-            // value and changing its type bits.
-            //
-            // !!! Review making a more efficient method of doing this.
-            //
-            Derelativize(get_path_hack, source, specifier);
-            VAL_SET_TYPE_BITS(get_path_hack, REB_GET_PATH);
-
-            // Here we DO it, which means that `get 'foo/bar` will act the
-            // same as `:foo/bar` for all types.
-            //
-            if (Do_Path_Throws_Core(
-                dest,
-                NULL,
-                get_path_hack,
-                SPECIFIED,
-                NULL
-            )){
-                // Should not be possible if there's no GROUP!
-                //
-                fail (Error_No_Catch_For_Throw(dest));
-            }
+            Get_Path_Core(dest, source, specifier);
         }
 
         if (IS_VOID(dest)) {
-            if (REF(opt)) {
+            if (REF(only)) {
                 if (IS_BLOCK(ARG(source))) // can't put voids in blocks
                     fail (Error_No_Value_Core(source, specifier));
             }
@@ -739,8 +688,6 @@ REBNATIVE(in)
                         context, VAL_WORD_CANON(word), FALSE
                     );
                     if (index != 0) {
-                        CLEAR_VAL_FLAG(word, VALUE_FLAG_RELATIVE);
-                        SET_VAL_FLAG(word, WORD_FLAG_BOUND);
                         INIT_WORD_CONTEXT(word, context);
                         INIT_WORD_INDEX(word, index);
                         Move_Value(D_OUT, word);
@@ -830,18 +777,16 @@ REBNATIVE(resolve)
 //      value [<opt> any-value!]
 //          "Value or block of values"
 //      /only
-//          {If target and value are blocks, set each item to the same value}
-//      /opt
 //          {Treat void values as unsetting the target instead of an error}
+//      /single
+//          {If target and value are blocks, set each item to the same value}
 //      /some
 //          {Blank values (or values past end of block) are not set.}
-//      /lookback
-//          {Function uses evaluator lookahead to "look back" (see ENFIX)}
+//      /enfix
+//          {Function calls through this word should get first arg from left}
 //  ]
 //
 REBNATIVE(set)
-//
-// !!! Note that r3-legacy has a SET which overrides this one at the moment
 //
 // Blocks are supported as:
 //
@@ -850,8 +795,6 @@ REBNATIVE(set)
 //     1
 //     >> print b
 //     2
-//
-// !!! Should the /LOOKBACK refinement be called /ENFIX?
 {
     INCLUDE_PARAMS_OF_SET;
 
@@ -861,7 +804,7 @@ REBNATIVE(set)
     const RELVAL *target;
     REBSPC *target_specifier;
 
-    REBOOL only;
+    REBOOL single;
     if (IS_BLOCK(ARG(target))) {
         //
         // R3-Alpha and Red let you write `set [a b] 10`, since the thing
@@ -871,22 +814,22 @@ REBNATIVE(set)
         // differently, which can bite you if you `set [a b] value` for some
         // generic value.
         //
-        if (IS_BLOCK(ARG(value)) && NOT(REF(only))) {
+        if (IS_BLOCK(ARG(value)) && NOT(REF(single))) {
             //
             // There is no need to check values for voidness in this case,
             // since arrays cannot contain voids.
             //
             value = VAL_ARRAY_AT(ARG(value));
             value_specifier = VAL_SPECIFIER(ARG(value));
-            only = FALSE;
+            single = FALSE;
         }
         else {
-            if (IS_VOID(ARG(value)) && NOT(REF(opt)))
+            if (IS_VOID(ARG(value)) && NOT(REF(only)))
                 fail (Error_No_Value(ARG(value)));
 
             value = ARG(value);
             value_specifier = SPECIFIED;
-            only = TRUE;
+            single = TRUE;
         }
 
         target = VAL_ARRAY_AT(ARG(target));
@@ -906,20 +849,20 @@ REBNATIVE(set)
         target = D_CELL;
         target_specifier = SPECIFIED;
 
-        if (IS_VOID(ARG(value)) && NOT(REF(opt)))
+        if (IS_VOID(ARG(value)) && NOT(REF(only)))
             fail (Error_No_Value(ARG(value)));
 
         value = ARG(value);
         value_specifier = SPECIFIED;
-        only = TRUE;
+        single = TRUE;
     }
 
-    DECLARE_LOCAL (get_path_hack); // runs prep code, don't put inside loop
+    DECLARE_LOCAL (set_path_hack); // runs prep code, don't put inside loop
 
     for (
         ;
         NOT_END(target);
-        ++target, only || IS_END(value) ? NOOP : (++value, NOOP)
+        ++target, single || IS_END(value) ? NOOP : (++value, NOOP)
      ){
         if (REF(some)) {
             if (IS_END(value))
@@ -927,6 +870,9 @@ REBNATIVE(set)
             if (IS_BLANK(value))
                 continue;
         }
+
+        if (REF(enfix) && NOT(IS_FUNCTION(ARG(value))))
+            fail ("Attempt to SET/ENFIX on a non-function");
 
         if (IS_BAR(target)) {
             //
@@ -937,63 +883,30 @@ REBNATIVE(set)
             // is not there, so it leads to too many silent errors.
         }
         else if (ANY_WORD(target)) {
-            if (REF(lookback) && NOT(IS_FUNCTION(ARG(value))))
-                fail ("Attempt to SET/LOOKBACK on a non-function");
-
             REBVAL *var = Sink_Var_May_Fail(target, target_specifier);
             Derelativize(
                 var,
                 IS_END(value) ? BLANK_VALUE : value,
                 value_specifier
             );
-            if (REF(lookback))
+            if (REF(enfix))
                 SET_VAL_FLAG(var, VALUE_FLAG_ENFIXED);
         }
         else if (ANY_PATH(target)) {
-            //
-            // Make sure the path does not contain any GROUP!s, because that
-            // would trigger evaluations.  SET does sound like it has a
-            // side effect (unlike GET), but you don't expect the side effect
-            // to do things like PRINT, which arbitrary code can do.
-            //
-            RELVAL *temp = VAL_ARRAY_AT(target);
-            for (; NOT_END(temp); ++temp)
-                if (IS_GROUP(temp))
-                    fail ("GROUP! can't be in paths with SET");
-
-            // !!! For starters, just the word form is supported for lookback.
-            // Though you can't dispatch a lookback from a path, you should be
-            // able to set a word in a context to one.
-            //
-            if (REF(lookback))
-                fail ("Cannot currently SET/LOOKBACK on a PATH!");
-
             DECLARE_LOCAL (specific);
             if (IS_END(value))
                 Init_Blank(specific);
             else
                 Derelativize(specific, value, value_specifier);
 
-            // Currently we have to tweak the bits of the path so that it's a
-            // GET-PATH!, since Do_Path is sensitive to the path type, and we
-            // want all to act the same.
+            // `set 'foo/bar 1` acts as `foo/bar: 1`
+            // Set_Path_Core() will raise an error if there are any GROUP!s
             //
-            Derelativize(get_path_hack, target, target_specifier);
-            VAL_SET_TYPE_BITS(get_path_hack, REB_GET_PATH);
-
-            if (
-                Do_Path_Throws_Core(
-                    D_OUT,
-                    NULL,
-                    get_path_hack,
-                    SPECIFIED,
-                    specific
-                )
-            ){
-                fail (Error_No_Catch_For_Throw(D_OUT));
-            }
-
-            // If not a throw, then there is no result out of a setting a path
+            // Though you can't dispatch enfix from a path (at least not at
+            // present), the flag tells it to enfix a word in a context, or
+            // it will error if that's not what it looks up to.
+            //
+            Set_Path_Core(target, target_specifier, specific, REF(enfix));
         }
         else
             fail (Error_Invalid_Arg_Core(target, target_specifier));
@@ -1002,28 +915,6 @@ REBNATIVE(set)
     Move_Value(D_OUT, ARG(value));
     return R_OUT;
 }
-
-
-//
-//  type-of: native [
-//
-//  "Returns the datatype of a value."
-//
-//      value [<opt> any-value!]
-//  ]
-//
-REBNATIVE(type_of)
-{
-    INCLUDE_PARAMS_OF_TYPE_OF;
-
-    enum Reb_Kind kind = VAL_TYPE(ARG(value));
-    if (kind == REB_MAX_VOID)
-        return R_BLANK;
-
-    Val_Init_Datatype(D_OUT, kind);
-    return R_OUT;
-}
-
 
 
 //
@@ -1064,16 +955,16 @@ REBNATIVE(unset)
 
 
 //
-//  lookback?: native [
+//  enfixed?: native [
 //
 //  {TRUE if looks up to a function and gets first argument before the call}
 //
 //      source [any-word! any-path!]
 //  ]
 //
-REBNATIVE(lookback_q)
+REBNATIVE(enfixed_q)
 {
-    INCLUDE_PARAMS_OF_LOOKBACK_Q;
+    INCLUDE_PARAMS_OF_ENFIXED_Q;
 
     REBVAL *source = ARG(source);
 
@@ -1092,7 +983,7 @@ REBNATIVE(lookback_q)
 
         // Not implemented yet...
 
-        fail ("LOOKBACK? testing is not currently implemented on PATH!");
+        fail ("ENFIXED? testing is not currently implemented on PATH!");
     }
 }
 
@@ -1126,24 +1017,37 @@ REBNATIVE(semiquoted_q)
 
 
 //
-//  semiquote: native [
+//  identity: native [
 //
-//  {Marks a function argument to be treated as if it had been literal source}
+//  {Function for returning the same value that it got in (identity function)}
 //
-//      value [any-value!]
+//      return: [<opt> any-value!]
+//      value [<opt> any-value!]
+//      /quote
+//          {Make it seem that the return result was quoted}
 //  ]
 //
-REBNATIVE(semiquote)
+REBNATIVE(identity)
+//
+// https://en.wikipedia.org/wiki/Identity_function
+// https://stackoverflow.com/q/3136338
+//
+// !!! Quoting version is currently specialized as SEMIQUOTE, for convenience.
 {
-    INCLUDE_PARAMS_OF_SEMIQUOTE;
+    INCLUDE_PARAMS_OF_IDENTITY;
 
     Move_Value(D_OUT, ARG(value));
 
-    // We cannot set the VALUE_FLAG_UNEVALUATED bit here and make it stick,
-    // because the bit would just get cleared off by Do_Core when the
-    // function finished.  So ask the evaluator to set the bit for us.
+    if (REF(quote)) {
+        //
+        // We can't set the VALUE_FLAG_UNEVALUATED bit here and make it stick,
+        // because the bit would just get cleared off by Do_Core when the
+        // function finished.  So ask the evaluator to set the bit for us.
+        //
+        return R_OUT_UNEVALUATED;
+    }
 
-    return R_OUT_UNEVALUATED;
+    return R_OUT; // clears VALUE_FLAG_UNEVALUATED by default
 }
 
 
@@ -1214,56 +1118,27 @@ REBNATIVE(aliases_q)
 {
     INCLUDE_PARAMS_OF_ALIASES_Q;
 
-    if (VAL_SERIES(ARG(value1)) == VAL_SERIES(ARG(value2)))
-        return R_TRUE;
-
-    return R_FALSE;
+    return R_FROM_BOOL(
+        LOGICAL(VAL_SERIES(ARG(value1)) == VAL_SERIES(ARG(value2)))
+    );
 }
 
 
-// Common routine for both SET? and UNSET?  Note that location is modified
-// into a GET-PATH! value if it is originally a path (okay for the natives,
-// since they can modify values in their frames.)
+// Common routine for both SET? and UNSET?
 //
-inline static REBOOL Is_Set_Modifies(REBVAL *location)
+//     SET? 'UNBOUND-WORD -> will error
+//     SET? 'OBJECT/NON-MEMBER -> will return false
+//     SET? 'OBJECT/NON-MEMBER/XXX -> will error
+//     SET? 'DATE/MONTH -> is true, even though not a variable resolution
+//
+inline static REBOOL Is_Set(const REBVAL *location)
 {
-    if (ANY_WORD(location)) {
-        //
-        // Note this will fail if unbound
-        //
-        const RELVAL *var = Get_Opt_Var_May_Fail(location, SPECIFIED);
-        if (IS_VOID(var))
-            return FALSE;
-    }
-    else {
-        assert(ANY_PATH(location));
+    if (ANY_WORD(location))
+        return IS_ANY_VALUE(Get_Opt_Var_May_Fail(location, SPECIFIED));
 
-    #if !defined(NDEBUG)
-        REBDSP dsp_orig = DSP;
-    #endif
-
-        // !!! We shouldn't be evaluating but currently the path machinery
-        // doesn't "turn off" GROUP! evaluations for GET-PATH!.
-        //
-        VAL_SET_TYPE_BITS(location, REB_GET_PATH);
-
-        DECLARE_LOCAL (temp);
-        if (Do_Path_Throws_Core(
-            temp, NULL, location, VAL_SPECIFIER(location), NULL
-        )) {
-            // !!! Shouldn't be evaluating, much less throwing--so fail
-            //
-            fail (Error_No_Catch_For_Throw(temp));
-        }
-
-        // We did not pass in a symbol ID
-        //
-        assert(DSP == dsp_orig);
-        if (IS_VOID(temp))
-            return FALSE;
-    }
-
-    return TRUE;
+    DECLARE_LOCAL (temp); // result may be generated
+    Get_Path_Core(temp, location, SPECIFIED);
+    return IS_ANY_VALUE(temp);
 }
 
 
@@ -1274,14 +1149,14 @@ inline static REBOOL Is_Set_Modifies(REBVAL *location)
 //
 //      location [any-word! any-path!]
 //  ][
-//      any-value? get/opt location
+//      any-value? get/only location
 //  ]
 //
 REBNATIVE(set_q)
 {
     INCLUDE_PARAMS_OF_SET_Q;
 
-    return R_FROM_BOOL(Is_Set_Modifies(ARG(location)));
+    return R_FROM_BOOL(Is_Set(ARG(location)));
 }
 
 
@@ -1292,14 +1167,14 @@ REBNATIVE(set_q)
 //
 //      location [any-word! any-path!]
 //  ][
-//      void? get/opt location
+//      void? get/only location
 //  ]
 //
 REBNATIVE(unset_q)
 {
     INCLUDE_PARAMS_OF_UNSET_Q;
 
-    return R_FROM_BOOL(NOT(Is_Set_Modifies(ARG(location))));
+    return R_FROM_BOOL(NOT(Is_Set(ARG(location))));
 }
 
 
@@ -1319,41 +1194,83 @@ REBNATIVE(to_logic)
 {
     INCLUDE_PARAMS_OF_TO_LOGIC;
 
-    return R_FROM_BOOL(IS_CONDITIONAL_TRUE(ARG(value)));
+    return R_FROM_BOOL(IS_TRUTHY(ARG(value)));
 }
 
 
 //
 //  quote: native/body [
 //
-//  "Returns the value passed to it without evaluation."
+//  "Returns value passed in without evaluation."
 //
-//      return: [any-value!]
+//      return: [<opt> any-value!]
+//          {The input value, verbatim--unless /SOFT and soft quoted type}
 //      :value [any-value!]
+//          {Value to quote, with BAR! or <opt> not allowed (use UNEVAL)}
+//      /soft
+//          {Evaluate if a GROUP!, GET-WORD!, or GET-PATH!}
 //  ][
 //      if bar? :value [
 //          fail "Cannot quote expression barrier" ;-- not actual error
 //      ]
-//      :value ;-- actually also sets unevaluated bit, how could a user do so?
+//      if any [group! :value | get-word? :value | get-path? :value] [
+//          reduce value
+//      ] else [
+//          :value ;-- also sets unevaluated bit, how could a user do so?
+//      ]
 //  ]
 //
 REBNATIVE(quote)
 {
     INCLUDE_PARAMS_OF_QUOTE;
 
-    // Generally speaking, a hard quoting operation is permitted to quote
-    // BAR! if it really wants to.  The general advice is to fail in this
-    // case, but it is not enforced.
+    REBVAL *v = ARG(value);
+
+    // At the moment, a hard quoting operation is permitted to quote BAR! if
+    // it really wants to.  The general advice is to fail in this case, but it
+    // is not enforced.  (Hard quotes are also generally not recommended in
+    // situations where a soft quote would do.)
     //
-    if (IS_BAR(ARG(value)))
+    if (IS_BAR(v))
         fail (Error_Expression_Barrier_Raw());
 
-    Move_Value(D_OUT, ARG(value));
+    // While we could use Eval_Value_Throws() here and do the evaluation
+    // ourself, that call would need to spawn a new frame.  Using the same
+    // re-evaluation feature that EVAL is based on is more efficient, since it
+    // just runs in the current frame.
+    //
+    if (REF(soft) && IS_QUOTABLY_SOFT(v)) {
+        Move_Value(D_CELL, v);
+        return R_REEVALUATE_CELL;
+    }
 
     // We cannot set the VALUE_FLAG_UNEVALUATED bit here and make it stick,
     // because the bit would just get cleared off by Do_Core when the
     // function finished.  Ask evaluator to add the bit for us.
+    //
+    Move_Value(D_OUT, v);
+    return R_OUT_UNEVALUATED;
+}
 
+
+//
+//  uneval: native/body [
+//
+//  "Returns value passed in without evaluation (including BAR! and void)"
+//
+//      return: [<opt> any-value!]
+//          {The input value, verbatim.}
+//      :value [<opt> any-value!]
+//          {Value to quote.  Voids are only possible via C rebDo() API.}
+//  ][
+//      :value ;-- also sets unevaluated bit, how could a user do so?
+//  ]
+//
+REBNATIVE(uneval)
+{
+    INCLUDE_PARAMS_OF_UNEVAL;
+
+    Move_Value(D_OUT, ARG(value));
     return R_OUT_UNEVALUATED;
 }
 
@@ -1365,7 +1282,7 @@ REBNATIVE(quote)
 //
 //      value [<opt> any-value!]
 //  ][
-//      blank? type-of :value
+//      blank? type of :value
 //  ]
 //
 REBNATIVE(void_q)

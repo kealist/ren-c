@@ -75,8 +75,8 @@ static struct {
     void (*final)(REBYTE *, void *);
     int (*ctxsize)(void);
     REBSYM sym;
-    REBINT len;
-    REBINT hmacblock;
+    REBCNT len;
+    REBCNT hmacblock;
 } digests[] = {
 
 #ifdef HAS_SHA1
@@ -157,7 +157,7 @@ REBNATIVE(spelling_of)
         // because the binding bits need to stay consistent
         //
         VAL_SET_TYPE_BITS(value, REB_WORD);
-        series = Copy_Mold_Value(value, 0 /* opts... MOPT_0? */);
+        series = Copy_Mold_Value(value, MOLD_FLAG_0);
     }
 
     Init_String(D_OUT, series);
@@ -189,7 +189,7 @@ REBNATIVE(spelling_of)
 //          "Methods: SHA1 MD5 CRC32"
 //      /key
 //          "Returns keyed HMAC value"
-//      key-value [any-string!]
+//      key-value [binary! string!]
 //          "Key to use"
 //  ]
 //
@@ -256,13 +256,29 @@ REBNATIVE(checksum)
             else {
                 REBVAL *key = ARG(key_value);
 
-                int blocklen = digests[i].hmacblock;
+                REBCNT blocklen = digests[i].hmacblock;
 
                 REBYTE tmpdigest[20]; // size must be max of all digest[].len
-                REBYTE *keycp = VAL_BIN_AT(key);
-                int keylen = VAL_LEN_AT(key);
+
+                REBSER *temp;
+                REBYTE *keycp;
+                REBCNT keylen;
+                if (IS_BINARY(key)) {
+                    temp = NULL;
+                    keycp = VAL_BIN_AT(key);
+                    keylen = VAL_LEN_AT(key);
+                }
+                else {
+                    assert(IS_STRING(key));
+
+                    REBCNT index = VAL_INDEX(key);
+                    temp = Temp_UTF8_At_Managed(key, &index, &keylen);
+                    PUSH_GUARD_SERIES(temp);
+                    keycp = BIN_AT(temp, index);
+                }
+
                 if (keylen > blocklen) {
-                    digests[i].digest(keycp,keylen,tmpdigest);
+                    digests[i].digest(keycp, keylen, tmpdigest);
                     keycp = tmpdigest;
                     keylen = digests[i].len;
                 }
@@ -275,7 +291,7 @@ REBNATIVE(checksum)
                 memset(opad, 0, blocklen);
                 memcpy(opad, keycp, keylen);
 
-                REBINT j;
+                REBCNT j;
                 for (j = 0; j < blocklen; j++) {
                     ipad[j] ^= 0x36; // !!! why do people write this kind of
                     opad[j] ^= 0x5c; // thing without a comment? !!! :-(
@@ -292,6 +308,9 @@ REBNATIVE(checksum)
                 digests[i].final(BIN_HEAD(digest),ctx);
 
                 FREE_N(char, digests[i].ctxsize(), ctx);
+
+                if (temp != NULL)
+                    DROP_GUARD_SERIES(temp);
             }
 
             TERM_BIN_LEN(digest, digests[i].len);
@@ -349,9 +368,19 @@ REBNATIVE(compress)
     Partial1(ARG(data), ARG(limit), &len);
 
     REBCNT index;
-    REBSER *ser = Temp_Bin_Str_Managed(ARG(data), &index, &len);
+    REBSER *ser = Temp_UTF8_At_Managed(ARG(data), &index, &len);
 
-    Init_Binary(D_OUT, Compress(ser, index, len, REF(gzip), REF(only)));
+    assert(BYTE_SIZE(ser)); // must be BINARY!
+
+    const REBOOL raw = REF(only); // use /ONLY to signal raw too?
+    REBSER *compressed = Deflate_To_Series(
+        BIN_AT(ser, index),
+        len,
+        REF(gzip),
+        raw,
+        REF(only)
+    );
+    Init_Binary(D_OUT, compressed);
 
     return R_OUT;
 }
@@ -402,14 +431,16 @@ REBNATIVE(decompress)
     if (len > BIN_LEN(VAL_SERIES(data)))
         len = BIN_LEN(VAL_SERIES(data));
 
-
-    Init_Binary(D_OUT, Decompress(
+    const REBOOL raw = REF(only); // use /ONLY to signal raw also?
+    REBSER *decompressed = Inflate_To_Series(
         BIN_HEAD(VAL_SERIES(data)) + VAL_INDEX(data),
         len,
         max,
         REF(gzip),
+        raw,
         REF(only)
-    ));
+    );
+    Init_Binary(D_OUT, decompressed);
 
     return R_OUT;
 }
@@ -436,7 +467,7 @@ REBNATIVE(debase)
 
     REBCNT index;
     REBCNT len = 0;
-    REBSER *ser = Temp_Bin_Str_Managed(ARG(value), &index, &len);
+    REBSER *ser = Temp_UTF8_At_Managed(ARG(value), &index, &len);
 
     REBINT base = 64;
     if (REF(base))
@@ -480,21 +511,22 @@ REBNATIVE(enbase)
     // Will convert STRING!s to UTF-8 if necessary.
     //
     REBCNT index;
-    REBSER *temp = Temp_Bin_Str_Managed(arg, &index, NULL);
+    REBSER *temp = Temp_UTF8_At_Managed(arg, &index, NULL);
     Init_Any_Series_At(arg, REB_BINARY, temp, index);
 
     REBSER *ser;
+    const REBOOL brk = FALSE;
     switch (base) {
     case 64:
-        ser = Encode_Base64(arg, 0, FALSE);
+        ser = Encode_Base64(NULL, arg, brk);
         break;
 
     case 16:
-        ser = Encode_Base16(arg, 0, FALSE);
+        ser = Encode_Base16(NULL, arg, brk);
         break;
 
     case 2:
-        ser = Encode_Base2(arg, 0, FALSE);
+        ser = Encode_Base2(NULL, arg, brk);
         break;
 
     default:
@@ -541,18 +573,18 @@ REBNATIVE(dehex)
     }
     else {
         REBUNI *up = VAL_UNI_AT(ARG(value));
-        REBUNI *dp;
-        REB_MOLD mo;
-        CLEARS(&mo);
 
-        Push_Mold(&mo);
+        DECLARE_MOLD (mo);
+
+        Push_Mold(mo);
 
         // Do a conservative expansion, assuming there are no %NNs in the
-        // series and the output string will be the same length as input
+        // series and the output string will be the same length as input.
+        // Note expand series may change the pointer, so UNI_AT must be after.
         //
-        Expand_Series(mo.series, mo.start, len);
+        Expand_Series(mo->series, mo->start, len);
 
-        dp = UNI_AT(mo.series, mo.start); // Expand_Series may change pointer
+        REBUNI *dp = UNI_AT(mo->series, mo->start);
 
         for (; len > 0; len--) {
             if (
@@ -573,7 +605,7 @@ REBNATIVE(dehex)
         // actual size after the %NNs have been accounted for.
         //
         ser = Pop_Molded_String_Len(
-            &mo, cast(REBCNT, dp - UNI_AT(mo.series, mo.start))
+            mo, cast(REBCNT, dp - UNI_AT(mo->series, mo->start))
         );
     }
 
@@ -906,220 +938,3 @@ REBNATIVE(invalid_utf8_q)
     Move_Value(D_OUT, arg);
     return R_OUT;
 }
-
-
-#ifndef NDEBUG
-//
-//  b_cast_: C
-//
-// Debug-only version of b_cast() that does type checking.
-// If you get a complaint you probably meant to use cb_cast().
-//
-REBYTE *b_cast_(char *s)
-{
-    return cast(REBYTE *, s);
-}
-
-
-//
-//  cb_cast_: C
-//
-// Debug-only version of cb_cast() that does type checking.
-// If you get a complaint you probably meant to use b_cast().
-//
-const REBYTE *cb_cast_(const char *s)
-{
-    return cast(const REBYTE *, s);
-}
-
-
-//
-//  s_cast_: C
-//
-// Debug-only version of s_cast() that does type checking.
-// If you get a complaint you probably meant to use cs_cast().
-//
-char *s_cast_(REBYTE *s)
-{
-    return cast(char*, s);
-}
-
-
-//
-//  cs_cast_: C
-//
-// Debug-only version of cs_cast() that does type checking.
-// If you get a complaint you probably meant to use s_cast().
-//
-const char *cs_cast_(const REBYTE *s)
-{
-    return cast(const char *, s);
-}
-
-
-//
-//  COPY_BYTES_: C
-//
-// Debug-only REBYTE-checked substitute for COPY_BYTES macro
-// If you meant characters, consider if you wanted strncpy()
-//
-REBYTE *COPY_BYTES_(REBYTE *dest, const REBYTE *src, size_t count)
-{
-    return b_cast(strncpy(s_cast(dest), cs_cast(src), count));
-}
-
-
-//
-//  LEN_BYTES_: C
-//
-// Debug-only REBYTE-checked substitute for LEN_BYTES macro
-// If you meant characters, consider if you wanted strlen()
-//
-size_t LEN_BYTES_(const REBYTE *str)
-{
-    return strlen(cs_cast(str));
-}
-
-
-//
-//  COMPARE_BYTES_: C
-//
-// Debug-only REBYTE-checked function for COMPARE_BYTES macro
-// If you meant characters, consider if you wanted strcmp()
-//
-int COMPARE_BYTES_(const REBYTE *lhs, const REBYTE *rhs)
-{
-    return strcmp(cs_cast(lhs), cs_cast(rhs));
-}
-
-
-//
-//  APPEND_BYTES_LIMIT_: C
-//
-// REBYTE-checked function for APPEND_BYTES_LIMIT macro in Debug
-// If you meant characters, you'll have to use strncat()/strlen()
-// (there's no single <string.h> entry point for this purpose)
-//
-REBYTE *APPEND_BYTES_LIMIT_(REBYTE *dest, const REBYTE *src, size_t max)
-{
-    return b_cast(strncat(
-        s_cast(dest), cs_cast(src), MAX(max - LEN_BYTES(dest) - 1, 0)
-    ));
-}
-
-
-//
-//  OS_STRNCPY_: C
-//
-// Debug-only REBCHR-checked substitute for OS_STRNCPY macro
-//
-REBCHR *OS_STRNCPY_(REBCHR *dest, const REBCHR *src, size_t count)
-{
-#ifdef OS_WIDE_CHAR
-    return cast(REBCHR*,
-        wcsncpy(cast(wchar_t*, dest), cast(const wchar_t*, src), count)
-    );
-#else
-    #ifdef TO_OPENBSD
-        return cast(REBCHR*,
-            strlcpy(cast(char*, dest), cast(const char*, src), count)
-        );
-    #else
-        return cast(REBCHR*,
-            strncpy(cast(char*, dest), cast(const char*, src), count)
-        );
-    #endif
-#endif
-}
-
-
-//
-//  OS_STRNCAT_: C
-//
-// Debug-only REBCHR-checked function for OS_STRNCAT macro
-//
-REBCHR *OS_STRNCAT_(REBCHR *dest, const REBCHR *src, size_t max)
-{
-#ifdef OS_WIDE_CHAR
-    return cast(REBCHR*,
-        wcsncat(cast(wchar_t*, dest), cast(const wchar_t*, src), max)
-    );
-#else
-    #ifdef TO_OPENBSD
-        return cast(REBCHR*,
-            strlcat(cast(char*, dest), cast(const char*, src), max)
-        );
-    #else
-        return cast(REBCHR*,
-            strncat(cast(char*, dest), cast(const char*, src), max)
-        );
-    #endif
-#endif
-}
-
-
-//
-//  OS_STRNCMP_: C
-//
-// Debug-only REBCHR-checked substitute for OS_STRNCMP macro
-//
-int OS_STRNCMP_(const REBCHR *lhs, const REBCHR *rhs, size_t max)
-{
-#ifdef OS_WIDE_CHAR
-    return wcsncmp(cast(const wchar_t*, lhs), cast(const wchar_t*, rhs), max);
-#else
-    return strncmp(cast(const char*, lhs), cast (const char*, rhs), max);
-#endif
-}
-
-
-//
-//  OS_STRLEN_: C
-//
-// Debug-only REBCHR-checked substitute for OS_STRLEN macro
-//
-size_t OS_STRLEN_(const REBCHR *str)
-{
-#ifdef OS_WIDE_CHAR
-    return wcslen(cast(const wchar_t*, str));
-#else
-    return strlen(cast(const char*, str));
-#endif
-}
-
-
-//
-//  OS_STRCHR_: C
-//
-// Debug-only REBCHR-checked function for OS_STRCHR macro
-//
-REBCHR *OS_STRCHR_(const REBCHR *str, REBCNT ch)
-{
-    // We have to m_cast because C++ actually has a separate overloads of
-    // wcschr and strchr which will return a const pointer if the in pointer
-    // was const.
-#ifdef OS_WIDE_CHAR
-    return cast(REBCHR*,
-        m_cast(wchar_t*, wcschr(cast(const wchar_t*, str), ch))
-    );
-#else
-    return cast(REBCHR*,
-        m_cast(char*, strchr(cast(const char*, str), ch))
-    );
-#endif
-}
-
-
-//
-//  OS_MAKE_CH_: C
-//
-// Debug-only REBCHR-checked function for OS_MAKE_CH macro
-//
-REBCHR OS_MAKE_CH_(REBCNT ch)
-{
-    REBCHR result;
-    result.num = ch;
-    return result;
-}
-
-#endif

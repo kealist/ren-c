@@ -47,12 +47,15 @@ static void Setup_File(struct devreq_file *file, REBFLGS flags, REBVAL *path)
     REBSER *ser;
     REBREQ *req = AS_REBREQ(file);
 
-    if (flags & AM_OPEN_WRITE) SET_FLAG(req->modes, RFM_WRITE);
-    if (flags & AM_OPEN_READ) SET_FLAG(req->modes, RFM_READ);
-    if (flags & AM_OPEN_SEEK) SET_FLAG(req->modes, RFM_SEEK);
+    if (flags & AM_OPEN_WRITE)
+        req->modes |= RFM_WRITE;
+    if (flags & AM_OPEN_READ)
+        req->modes |= RFM_READ;
+    if (flags & AM_OPEN_SEEK)
+        req->modes |= RFM_SEEK;
 
     if (flags & AM_OPEN_NEW) {
-        SET_FLAG(req->modes, RFM_NEW);
+        req->modes |= RFM_NEW;
         if (NOT(flags & AM_OPEN_WRITE))
             fail (Error_Bad_File_Mode_Raw(path));
     }
@@ -72,7 +75,7 @@ static void Setup_File(struct devreq_file *file, REBFLGS flags, REBVAL *path)
 
     file->path = SER_HEAD(REBCHR, ser);
 
-    SET_FLAG(req->modes, RFM_NAME_MEM);
+    req->modes |= RFM_NAME_MEM;
 
     Secure_Port(SYM_FILE, req, path, ser);
 }
@@ -85,12 +88,12 @@ static void Cleanup_File(struct devreq_file *file)
 {
     REBREQ *req = AS_REBREQ(file);
 
-    if (GET_FLAG(req->modes, RFM_NAME_MEM)) {
+    if (req->modes & RFM_NAME_MEM) {
         //NOTE: file->path will get GC'd
         file->path = 0;
-        CLR_FLAG(req->modes, RFM_NAME_MEM);
+        req->modes &= ~RFM_NAME_MEM;
     }
-    SET_CLOSED(req);
+    req->flags &= ~RRF_OPEN;
 }
 
 
@@ -113,7 +116,7 @@ void Ret_Query_File(REBCTX *port, struct devreq_file *file, REBVAL *ret)
     Init_Object(ret, context);
     Init_Word(
         CTX_VAR(context, STD_FILE_INFO_TYPE),
-        GET_FLAG(req->modes, RFM_DIR) ? Canon(SYM_DIR) : Canon(SYM_FILE)
+        LOGICAL(req->modes & RFM_DIR) ? Canon(SYM_DIR) : Canon(SYM_FILE)
     );
     Init_Integer(
         CTX_VAR(context, STD_FILE_INFO_SIZE), file->size
@@ -209,13 +212,12 @@ static void Write_File_Port(struct devreq_file *file, REBVAL *data, REBCNT len, 
         // Form the values of the block
         // !! Could be made more efficient if we broke the FORM
         // into 32K chunks for writing.
-        REB_MOLD mo;
-        CLEARS(&mo);
-        Push_Mold(&mo);
+        DECLARE_MOLD (mo);
+        Push_Mold(mo);
         if (lines)
-            mo.opts = 1 << MOPT_LINES;
-        Mold_Value(&mo, data, FALSE);
-        Init_String(data, Pop_Molded_String(&mo)); // fall to next section
+            SET_MOLD_FLAG(mo, MOLD_FLAG_LINES);
+        Form_Value(mo, data);
+        Init_String(data, Pop_Molded_String(mo)); // fall to next section
         len = VAL_LEN_HEAD(data);
     }
 
@@ -275,7 +277,7 @@ static void Set_Seek(struct devreq_file *file, REBVAL *arg)
 
     file->index = cnt;
 
-    SET_FLAG(req->modes, RFM_RESEEK); // force a seek
+    req->modes |= RFM_RESEEK; // force a seek
 }
 
 
@@ -307,6 +309,59 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
 
     switch (action) {
 
+    case SYM_REFLECT: {
+        INCLUDE_PARAMS_OF_REFLECT;
+
+        UNUSED(ARG(value)); // implicitly comes from `port`
+        REBSYM property = VAL_WORD_SYM(ARG(property));
+        assert(property != SYM_0);
+
+        switch (property) {
+        case SYM_INDEX:
+            Init_Integer(D_OUT, file->index + 1);
+            return R_OUT;
+
+        case SYM_LENGTH:
+            //
+            // Comment said "clip at zero"
+            ///
+            Init_Integer(D_OUT, file->size - file->index);
+            return R_OUT;
+
+        case SYM_HEAD:
+            file->index = 0;
+            req->modes |= RFM_RESEEK;
+            Move_Value(D_OUT, CTX_VALUE(port));
+            return R_OUT;
+
+        case SYM_TAIL:
+            file->index = file->size;
+            req->modes |= RFM_RESEEK;
+            Move_Value(D_OUT, CTX_VALUE(port));
+            return R_OUT;
+
+        case SYM_HEAD_Q:
+            return R_FROM_BOOL(LOGICAL(file->index == 0));
+
+        case SYM_TAIL_Q:
+            return R_FROM_BOOL(
+                LOGICAL(file->index >= file->size)
+            );
+
+        case SYM_PAST_Q:
+            return R_FROM_BOOL(
+                LOGICAL(file->index > file->size)
+            );
+
+        case SYM_OPEN_Q:
+            return R_FROM_BOOL(LOGICAL(req->flags & RRF_OPEN));
+
+        default:
+            break;
+        }
+
+        break; }
+
     case SYM_READ: {
         INCLUDE_PARAMS_OF_READ;
 
@@ -320,7 +375,7 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         // converted into a PORT! but has not been opened yet.
 
         REBOOL opened;
-        if (IS_OPEN(req))
+        if (req->flags & RRF_OPEN)
             opened = FALSE; // was already open
         else {
             REBCNT nargs = AM_OPEN_READ;
@@ -371,8 +426,8 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         // to a PORT! but it hasn't been opened yet.
 
         REBOOL opened;
-        if (IS_OPEN(req)) {
-            if (!GET_FLAG(req->modes, RFM_WRITE))
+        if (req->flags & RRF_OPEN) {
+            if (NOT(req->modes & RFM_WRITE))
                 fail (Error_Read_Only_Raw(path));
 
             opened = FALSE; // already open
@@ -390,7 +445,7 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
 
         if (REF(append)) {
             file->index = -1; // append
-            SET_FLAG(req->modes, RFM_RESEEK);
+            req->modes |= RFM_RESEEK;
         }
         if (REF(seek))
             Set_Seek(file, ARG(index));
@@ -454,7 +509,7 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
             fail (Error_Bad_Refines_Raw());
         }
 
-        if (!IS_OPEN(req))
+        if (NOT(req->flags & RRF_OPEN))
             fail (Error_Not_Open_Raw(path)); // !!! wrong msg
 
         REBCNT len = Set_Length(file, REF(part) ? VAL_INT64(ARG(limit)) : -1);
@@ -462,14 +517,11 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         Read_File_Port(D_OUT, port, file, path, flags, len);
         return R_OUT; }
 
-    case SYM_OPEN_Q:
-        return R_FROM_BOOL(IS_OPEN(req));
-
     case SYM_CLOSE: {
         INCLUDE_PARAMS_OF_CLOSE;
         UNUSED(PAR(port));
 
-        if (IS_OPEN(req)) {
+        if (req->flags & RRF_OPEN) {
             OS_DO_DEVICE(req, RDC_CLOSE);
             Cleanup_File(file);
         }
@@ -480,7 +532,7 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         INCLUDE_PARAMS_OF_DELETE;
         UNUSED(PAR(port));
 
-        if (IS_OPEN(req))
+        if (req->flags & RRF_OPEN)
             fail (Error_No_Delete_Raw(path));
         Setup_File(file, 0, path);
         if (OS_DO_DEVICE(req, RDC_DELETE) < 0)
@@ -492,7 +544,7 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
     case SYM_RENAME: {
         INCLUDE_PARAMS_OF_RENAME;
 
-        if (IS_OPEN(req))
+        if (req->flags & RRF_OPEN)
             fail (Error_No_Rename_Raw(path));
 
         Setup_File(file, 0, path);
@@ -512,7 +564,7 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         return R_OUT; }
 
     case SYM_CREATE: {
-        if (!IS_OPEN(req)) {
+        if (NOT(req->flags & RRF_OPEN)) {
             Setup_File(file, AM_OPEN_WRITE | AM_OPEN_NEW, path);
             if (OS_DO_DEVICE(req, RDC_CREATE) < 0)
                 fail (Error_On_Port(RE_CANNOT_OPEN, port, req->error));
@@ -533,7 +585,7 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
             fail (Error_Bad_Refines_Raw());
         }
 
-        if (!IS_OPEN(req)) {
+        if (NOT(req->flags & RRF_OPEN)) {
             Setup_File(file, 0, path);
             if (OS_DO_DEVICE(req, RDC_QUERY) < 0) return R_BLANK;
         }
@@ -551,34 +603,11 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         UNUSED(PAR(value));
 
         // !!! Set_Mode_Value() was called here, but a no-op in R3-Alpha
-        if (!IS_OPEN(req)) {
+        if (NOT(req->flags & RRF_OPEN)) {
             Setup_File(file, 0, path);
             if (OS_DO_DEVICE(req, RDC_MODIFY) < 0) return R_BLANK;
         }
         return R_TRUE; }
-
-    case SYM_INDEX_OF:
-        Init_Integer(D_OUT, file->index + 1);
-        return R_OUT;
-
-    case SYM_LENGTH_OF:
-        //
-        // Comment said "clip at zero"
-        ///
-        Init_Integer(D_OUT, file->size - file->index);
-        return R_OUT;
-
-    case SYM_HEAD_OF: {
-        file->index = 0;
-        SET_FLAG(req->modes, RFM_RESEEK);
-        Move_Value(D_OUT, CTX_VALUE(port));
-        return R_OUT; }
-
-    case SYM_TAIL_OF: {
-        file->index = file->size;
-        SET_FLAG(req->modes, RFM_RESEEK);
-        Move_Value(D_OUT, CTX_VALUE(port));
-        return R_OUT; }
 
     case SYM_SKIP: {
         INCLUDE_PARAMS_OF_SKIP;
@@ -586,27 +615,14 @@ static REB_R File_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         UNUSED(PAR(series));
 
         file->index += Get_Num_From_Arg(ARG(offset));
-        SET_FLAG(req->modes, RFM_RESEEK);
+        req->modes |= RFM_RESEEK;
         Move_Value(D_OUT, CTX_VALUE(port));
         return R_OUT; }
 
-    case SYM_HEAD_Q:
-        return R_FROM_BOOL(LOGICAL(file->index == 0));
-
-    case SYM_TAIL_Q:
-        return R_FROM_BOOL(
-            LOGICAL(file->index >= file->size)
-        );
-
-    case SYM_PAST_Q:
-        return R_FROM_BOOL(
-            LOGICAL(file->index > file->size)
-        );
-
     case SYM_CLEAR:
         // !! check for write enabled?
-        SET_FLAG(req->modes, RFM_RESEEK);
-        SET_FLAG(req->modes, RFM_TRUNCATE);
+        req->modes |= RFM_RESEEK;
+        req->modes |= RFM_TRUNCATE;
         req->length = 0;
         if (OS_DO_DEVICE(req, RDC_WRITE) < 0) {
             DECLARE_LOCAL(i);

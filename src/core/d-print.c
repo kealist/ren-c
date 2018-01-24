@@ -121,7 +121,7 @@ void Prin_OS_String(const void *p, REBCNT len, REBFLGS opts)
     // Determine length if not provided:
     if (len == UNKNOWN) len = unicode ? Strlen_Uni(up) : LEN_BYTES(bp);
 
-    SET_FLAG(Req_SIO->flags, RRF_FLUSH);
+    Req_SIO->flags |= RRF_FLUSH;
 
     Req_SIO->actual = 0;
     Req_SIO->common.data = buf;
@@ -175,95 +175,19 @@ void Prin_OS_String(const void *p, REBCNT len, REBFLGS opts)
 
 
 
-/***********************************************************************
-**
-**  Debug Print Interface
-**
-**      If the Trace_Buffer exists, then output goes there,
-**      otherwise output goes to OS output.
-**
-***********************************************************************/
-
-
-//
-//  Enable_Backtrace: C
-//
-void Enable_Backtrace(REBOOL on)
-{
-    if (on) {
-        if (Trace_Limit == 0) {
-            Trace_Limit = 100000;
-            Trace_Buffer = Make_Binary(Trace_Limit);
-        }
-    }
-    else {
-        if (Trace_Limit) Free_Series(Trace_Buffer);
-        Trace_Limit = 0;
-        Trace_Buffer = 0;
-    }
-}
-
-
-//
-//  Display_Backtrace: C
-//
-void Display_Backtrace(REBCNT lines)
-{
-    REBCNT tail;
-    REBCNT i;
-
-    if (Trace_Limit > 0) {
-        tail = SER_LEN(Trace_Buffer);
-        i = tail - 1;
-        for (lines++ ;lines > 0; lines--, i--) {
-            i = Find_Str_Char(LF, Trace_Buffer, 0, i, tail, -1, 0);
-            if (i == NOT_FOUND || i == 0) {
-                i = 0;
-                break;
-            }
-        }
-
-        if (lines == 0) i += 2; // start of next line
-        Prin_OS_String(BIN_AT(Trace_Buffer, i), tail - i, OPT_ENC_CRLF_MAYBE);
-    }
-    else {
-        Debug_Fmt(RM_BACKTRACE_NOT_ENABLED);
-    }
-}
-
-
 //
 //  Debug_String: C
 //
 void Debug_String(const void *p, REBCNT len, REBOOL unicode, REBINT lines)
 {
-    REBUNI uni;
-    const REBYTE *bp = unicode ? NULL : cast(const REBYTE *, p);
-    const REBUNI *up = unicode ? cast(const REBUNI *, p) : NULL;
-
     REBOOL disabled = GC_Disabled;
     GC_Disabled = TRUE;
 
-    if (Trace_Limit > 0) {
-        if (SER_LEN(Trace_Buffer) >= Trace_Limit)
-            Remove_Series(Trace_Buffer, 0, 2000);
-
-        if (len == UNKNOWN) len = unicode ? Strlen_Uni(up) : LEN_BYTES(bp);
-
-        for (; len > 0; len--) {
-            uni = unicode ? *up++ : *bp++;
-            Append_Codepoint_Raw(Trace_Buffer, uni);
-        }
-
-        for (; lines > 0; lines--) Append_Codepoint_Raw(Trace_Buffer, LF);
-        /* Append_Unencoded_Len(Trace_Buffer, bp, len); */ // !!! alternative?
-    }
-    else {
-        Prin_OS_String(
-            p, len, (unicode ? OPT_ENC_UNISRC : 0) | OPT_ENC_CRLF_MAYBE
-        );
-        for (; lines > 0; lines--) Print_OS_Line();
-    }
+    Prin_OS_String(
+        p, len, (unicode ? OPT_ENC_UNISRC : 0) | OPT_ENC_CRLF_MAYBE
+    );
+    for (; lines > 0; lines--)
+        Print_OS_Line();
 
     assert(GC_Disabled == TRUE);
     GC_Disabled = disabled;
@@ -362,33 +286,33 @@ void Debug_Values(const RELVAL *value, REBCNT count, REBCNT limit)
         Debug_Space(1);
         if (n > 0 && VAL_TYPE(value) <= REB_BLANK) Debug_Chars('.', 1);
         else {
-            REB_MOLD mo;
-            CLEARS(&mo);
+            DECLARE_MOLD (mo);
             if (limit != 0) {
-                SET_FLAG(mo.opts, MOPT_LIMIT);
-                mo.limit = limit;
+                SET_MOLD_FLAG(mo, MOLD_FLAG_LIMIT);
+                mo->limit = limit;
             }
-            Push_Mold(&mo);
+            Push_Mold(mo);
 
-            Mold_Value(&mo, value, TRUE);
-            Throttle_Mold(&mo); // not using Pop_Mold(), must do explicitly
+            Mold_Value(mo, value);
+            Throttle_Mold(mo); // not using Pop_Mold(), must do explicitly
 
-            for (i1 = i2 = mo.start; i1 < SER_LEN(mo.series); i1++) {
-                uc = GET_ANY_CHAR(mo.series, i1);
+            for (i1 = i2 = mo->start; i1 < SER_LEN(mo->series); i1++) {
+                uc = GET_ANY_CHAR(mo->series, i1);
                 if (uc < ' ') uc = ' ';
-                if (uc > ' ' || pc > ' ') SET_ANY_CHAR(mo.series, i2++, uc);
+                if (uc > ' ' || pc > ' ')
+                    SET_ANY_CHAR(mo->series, i2++, uc);
                 pc = uc;
             }
-            SET_ANY_CHAR(mo.series, i2, '\0');
-            assert(SER_WIDE(mo.series) == sizeof(REBUNI));
+            SET_ANY_CHAR(mo->series, i2, '\0');
+            assert(SER_WIDE(mo->series) == sizeof(REBUNI));
             Debug_String(
-                UNI_AT(mo.series, mo.start),
-                i2 - mo.start,
+                UNI_AT(mo->series, mo->start),
+                i2 - mo->start,
                 TRUE,
                 0
             );
 
-            Drop_Mold(&mo);
+            Drop_Mold(mo);
         }
     }
     Debug_Line();
@@ -419,13 +343,12 @@ void Debug_Buf(const char *fmt, va_list *vaptr)
     REBOOL disabled = GC_Disabled;
     GC_Disabled = TRUE;
 
-    REB_MOLD mo;
-    CLEARS(&mo);
-    Push_Mold(&mo);
+    DECLARE_MOLD (mo);
+    Push_Mold(mo);
 
-    Form_Args_Core(&mo, fmt, vaptr);
+    Form_Args_Core(mo, fmt, vaptr);
 
-    REBSER *bytes = Pop_Molded_UTF8(&mo);
+    REBSER *bytes = Pop_Molded_UTF8(mo);
 
     // Don't send the Debug_String routine more than 1024 bytes at a time,
     // but chunk it to 1024 byte sections.
@@ -500,13 +423,13 @@ void Debug_Fmt(const char *fmt, ...)
 //
 REBYTE *Form_Hex_Pad(REBYTE *buf, REBI64 val, REBINT len)
 {
-    REBYTE buffer[MAX_HEX_LEN+4];
+    REBYTE buffer[MAX_HEX_LEN + 4];
     REBYTE *bp = buffer + MAX_HEX_LEN + 1;
-    REBI64 sgn;
 
-    // !!! val parameter was REBI64 at one point; changed to REBI64
+    // !!! val parameter was REBU64 at one point; changed to REBI64
     // as this does signed comparisons (val < 0 was never true...)
-    sgn = (val < 0) ? -1 : 0;
+
+    REBI64 sgn = (val < 0) ? -1 : 0;
 
     len = MIN(len, MAX_HEX_LEN);
     *bp-- = 0;
@@ -515,10 +438,14 @@ REBYTE *Form_Hex_Pad(REBYTE *buf, REBI64 val, REBINT len)
         val >>= 4;
         len--;
     }
-    for (; len > 0; len--) *bp-- = (sgn != 0) ? 'F' : '0';
+
+    for (; len > 0; len--)
+        *bp-- = (sgn != 0) ? 'F' : '0';
+
     bp++;
-    while ((*buf++ = *bp++));
-    return buf-1;
+    while ((*buf++ = *bp++) != '\0')
+        NOOP;
+    return buf - 1;
 }
 
 
@@ -655,7 +582,7 @@ void Form_Args_Core(REB_MOLD *mo, const char *fmt, va_list *vaptr)
         // Copy format string until next % escape
         //
         while ((*fmt != '\0') && (*fmt != '%'))
-            Append_Codepoint_Raw(ser, *fmt++);
+            Append_Codepoint(ser, *fmt++);
 
         if (*fmt != '%') break;
 
@@ -695,7 +622,8 @@ pick:
             if (pad < 0) {
                 pad = -pad;
                 pad -= LEN_BYTES(cp);
-                for (; pad > 0; pad--) Append_Codepoint_Raw(ser, ' ');
+                for (; pad > 0; pad--)
+                    Append_Codepoint(ser, ' ');
             }
             Append_Unencoded(ser, s_cast(cp));
 
@@ -705,19 +633,20 @@ pick:
             //
             pad -= LEN_BYTES(cp);
 
-            for (; pad > 0; pad--) Append_Codepoint_Raw(ser, ' ');
+            for (; pad > 0; pad--)
+                Append_Codepoint(ser, ' ');
             break;
 
         case 'r':   // use Mold
         case 'v':   // use Form
-            Mold_Value(
+            Mold_Or_Form_Value(
                 mo,
                 va_arg(*vaptr, const REBVAL*),
-                LOGICAL(desc != 'v')
+                LOGICAL(desc == 'v')
             );
 
             // !!! This used to "filter out ctrl chars", which isn't a bad
-            // idea as a mold option (MOPT_FILTER_CTRL) but it would involve
+            // idea as a mold option (MOLD_FLAG_FILTER_CTRL) but it involves
             // some doing, as molding doesn't have a real "moment" that
             // it can always filter...since sometimes the buffer is examined
             // directly by clients vs. getting handed back.
@@ -741,19 +670,19 @@ pick:
                 INIT_VAL_SERIES(value, temp);
             }
             VAL_INDEX(value) = 0;
-            Mold_Value(mo, value, TRUE);
+            Mold_Value(mo, value);
             break;
         }
 
         case 'c':
-            Append_Codepoint_Raw(
+            Append_Codepoint(
                 ser,
                 cast(REBYTE, va_arg(*vaptr, REBINT))
             );
             break;
 
         case 'x':
-            Append_Codepoint_Raw(ser, '#');
+            Append_Codepoint(ser, '#');
             if (pad == 1) pad = 8;
             cp = Form_Hex_Pad(
                 buf,
@@ -764,7 +693,7 @@ pick:
             break;
 
         default:
-            Append_Codepoint_Raw(ser, *fmt);
+            Append_Codepoint(ser, *fmt);
         }
     }
 
@@ -792,5 +721,5 @@ void Form_Args(REB_MOLD *mo, const char *fmt, ...)
 //
 void Startup_Raw_Print(void)
 {
-    Init_String(TASK_BYTE_BUF,  Make_Binary(1000));
+    Init_Binary(TASK_BYTE_BUF, Make_Binary(1000));
 }

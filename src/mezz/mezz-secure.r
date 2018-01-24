@@ -17,7 +17,7 @@ secure: function [
     'policy [<opt> word! lit-word! block!]
         "Set single or multiple policies (or HELP)"
 
-    <has>
+    <static>
 
     ; Permanent values and sub-functions of SECURE:
 
@@ -44,7 +44,7 @@ secure: function [
         if word? pol [
             n: find acts pol
             assert-policy n target pol
-            return (index-of n) - 1 * 1.1.1
+            return (index of n) - 1 * 1.1.1
         ]
         ; Detailed case: [file [allow read throw write]]
         flags: 0.0.0
@@ -54,7 +54,7 @@ secure: function [
             assert-policy n target act
             m: select [read 1.0.0 write 0.1.0 execute 0.0.1] perm
             assert-policy m target perm
-            flags: (index-of n) - 1 * m or+ flags
+            flags: (index of n) - 1 * m or+ flags
         ]
         flags
     ])
@@ -67,7 +67,7 @@ secure: function [
     ][
         case [
             file? target [
-                val: to-local-file/full target
+                val: file-to-local/full target
                 ; This string must have OS-local encoding, because
                 ; the check is done at a lower level of I/O.
                 if system/version/4 != 3 [val: to binary! val]
@@ -97,7 +97,7 @@ secure: function [
         n: 1
         for-each act [read write execute] [
             join blk [pick acts 1 + pol/:n act]
-            ++ n
+            n: ++ 1
         ]
         blk
     ])
@@ -135,7 +135,7 @@ secure: function [
     ]
 
     if policy = 'query [
-        out: make block! 2 * length-of pol-obj
+        out: make block! 2 * length of pol-obj
         for-each [target pol] pol-obj [
             case [
                 ; file 0.0.0 (policies)
@@ -144,7 +144,7 @@ secure: function [
                 block? pol [
                     for-each [item pol] pol [
                         if binary? item [item: to-string item] ; utf-8 decode
-                        if string? item [item: to-rebol-file item]
+                        if string? item [item: local-to-file item]
                         join out [item word-policy pol]
                     ]
                 ]
@@ -163,15 +163,15 @@ secure: function [
     ; Bulk-set all policies:
     if word? policy [
         n: make-policy 'all policy
-        for-each word words-of pol-obj [set word n]
+        for-each word words of pol-obj [set word n]
         set-policies pol-obj
         return ()
     ]
 
     ; Set each policy target separately:
     for-each [target pol] policy [
-        ensure [word! file! url!] target
-        ensure [block! word! integer!] pol
+        really [word! file! url!] target
+        really [block! word! integer!] pol
         set-policy target make-policy target pol pol-obj
     ]
 

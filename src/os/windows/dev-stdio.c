@@ -42,12 +42,6 @@
 
 #define BUF_SIZE (16 * 1024)    // MS restrictions apply
 
-#define SF_DEV_NULL 31          // Local flag to mark NULL device.
-
-#define CONSOLE_MODES \
-        ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_ECHO_INPUT \
-        | 0x0040 | 0x0020       // quick edit and insert mode (not defined in VC6)
-
 static HANDLE Std_Out = NULL;
 static HANDLE Std_Inp = NULL;
 static wchar_t *Std_Buf = NULL; // Used for UTF-8 conversion of stdin/stdout.
@@ -76,8 +70,8 @@ DEVICE_CMD Quit_IO(REBREQ *dr)
     REBDEV *dev = (REBDEV*)dr; // just to keep compiler happy above
 
     Close_Stdio();
-    //if (GET_FLAG(dev->flags, RDF_OPEN)) FreeConsole();
-    CLR_FLAG(dev->flags, RDF_OPEN);
+    //if (dev->flags & RDF_OPEN)) FreeConsole();
+    dev->flags &= ~RDF_OPEN;
     return DR_DONE;
 }
 
@@ -92,15 +86,15 @@ DEVICE_CMD Open_IO(REBREQ *req)
     dev = Devices[req->device];
 
     // Avoid opening the console twice (compare dev and req flags):
-    if (GET_FLAG(dev->flags, RDF_OPEN)) {
+    if (dev->flags & RDF_OPEN) {
         // Device was opened earlier as null, so req must have that flag:
-        if (GET_FLAG(dev->flags, SF_DEV_NULL))
-            SET_FLAG(req->modes, RDM_NULL);
-        SET_FLAG(req->flags, RRF_OPEN);
+        if (dev->flags & SF_DEV_NULL)
+            req->modes |= RDM_NULL;
+        req->flags |= RRF_OPEN;
         return DR_DONE; // Do not do it again
     }
 
-    if (!GET_FLAG(req->modes, RDM_NULL)) {
+    if (NOT(req->modes & RDM_NULL)) {
         // Get the raw stdio handles:
         Std_Out = GetStdHandle(STD_OUTPUT_HANDLE);
         Std_Inp = GetStdHandle(STD_INPUT_HANDLE);
@@ -116,15 +110,36 @@ DEVICE_CMD Open_IO(REBREQ *req)
         }
 
         if (!Redir_Inp) {
-            // Make the Win32 console a bit smarter by default.
-            SetConsoleMode(Std_Inp, CONSOLE_MODES);
+            //
+            // Windows offers its own "smart" line editor (with history
+            // management, etc.) in the form of the Windows Terminal.  These
+            // modes only apply if a the input is coming from the terminal,
+            // not if Rebol has a file redirection connected to the input.
+            //
+            // While the line editor is running with ENABLE_LINE_INPUT, there
+            // are very few hooks offered.  (See remarks on ReadConsole() call
+            // about how even being able to terminate the input with escape
+            // is not possible--much less reading function keys, etc.)  For
+            // the moment, delegating the editing process to proven code
+            // built into the OS is considered worth it for the limitations in
+            // the console client--given development priorities.
+            //
+            SetConsoleMode(
+                Std_Inp,
+                ENABLE_LINE_INPUT
+                | ENABLE_PROCESSED_INPUT
+                | ENABLE_ECHO_INPUT
+                | 0x0080 // ENABLE_EXTENDED_FLAGS (need for quick edit/insert)
+                | 0x0040 // quick edit (not defined in VC6)
+                | 0x0020 // quick insert (not defined in VC6)
+            );
         }
     }
     else
-        SET_FLAG(dev->flags, SF_DEV_NULL);
+        dev->flags |= SF_DEV_NULL;
 
-    SET_FLAG(req->flags, RRF_OPEN);
-    SET_FLAG(dev->flags, RDF_OPEN);
+    req->flags |= RRF_OPEN;
+    dev->flags |= RDF_OPEN;
 
     return DR_DONE;
 }
@@ -139,7 +154,7 @@ DEVICE_CMD Close_IO(REBREQ *req)
 
     Close_Stdio();
 
-    CLR_FLAG(dev->flags, RRF_OPEN);
+    dev->flags &= ~RRF_OPEN;
 
     return DR_DONE;
 }
@@ -156,7 +171,7 @@ DEVICE_CMD Close_IO(REBREQ *req)
 //
 DEVICE_CMD Write_IO(REBREQ *req)
 {
-    if (GET_FLAG(req->modes, RDM_NULL)) {
+    if (req->modes & RDM_NULL) {
         req->actual = req->length;
         return DR_DONE;
     }
@@ -211,7 +226,7 @@ DEVICE_CMD Write_IO(REBREQ *req)
 
         req->actual = req->length; // want byte count written, assume success
 
-        //if (GET_FLAG(req->flags, RRF_FLUSH)) {
+        //if (req->flags & RRF_FLUSH) {
         //  FLUSH();
         //}
     }
@@ -231,56 +246,175 @@ DEVICE_CMD Write_IO(REBREQ *req)
 //
 DEVICE_CMD Read_IO(REBREQ *req)
 {
-    DWORD total = 0;
-    DWORD len;
-    BOOL ok;
+    assert(req->length >= 2); // abort is signaled with (ESC '\0')
 
-    if (GET_FLAG(req->modes, RDM_NULL)) {
+    if (req->modes & RDM_NULL) {
         req->common.data[0] = 0;
         return DR_DONE;
     }
 
-    req->actual = 0;
+    if (Std_Inp == NULL) {
+        req->actual = 0;
+        return DR_DONE;
+    }
 
-    if (Std_Inp) {
+    if (Redir_Inp) { // always UTF-8
+        DWORD len = MIN(req->length, BUF_SIZE);
 
-        if (Redir_Inp) { // always UTF-8
-            len = MIN(req->length, BUF_SIZE);
-            ok = ReadFile(Std_Inp, req->common.data, len, &total, 0);
-        }
-        else {
-            ok = ReadConsoleW(Std_Inp, Std_Buf, BUF_SIZE-1, &total, 0);
-            if (ok) {
-                if (total == 0) {
-                    // WideCharToMultibyte fails if cchWideChar is 0.
-                    assert(req->length >= 2);
-                    strcpy(s_cast(req->common.data), "");
-                }
-                else {
-                    total = WideCharToMultiByte(
-                        CP_UTF8,
-                        0,
-                        Std_Buf,
-                        total,
-                        s_cast(req->common.data),
-                        req->length,
-                        0,
-                        0
-                    );
-                    if (total == 0)
-                        ok = FALSE;
-                }
-            }
-        }
-
+        DWORD total;
+        REBOOL ok = ReadFile(Std_Inp, req->common.data, len, &total, 0);
         if (NOT(ok)) {
             req->error = GetLastError();
             return DR_ERROR;
         }
 
         req->actual = total;
+        return DR_DONE;
     }
 
+    // !!! ReadConsole() in the ENABLE_LINE_INPUT mode is a terribly limited
+    // API, and if you don't use that mode you are basically completely on
+    // your own for line editing (backspace, cursoring, etc.)  It's all or
+    // nothing--there's no way to hook it--and you can't even tell if an
+    // escape is pressed...it always clears to the beginning of line.
+    //
+    // There might seem to be some hope in the CONSOLE_READCONSOLE_CONTROL
+    // parameter.  The structure is horribly documented on MSDN, but it is
+    // supposed to offer a way to register some control keys to break out of
+    // the input besides a completing newline.  It turns out dwCtrlWakeupMask
+    // is (supposedly) a bit mask of 0-31 ASCII points for control characters:
+    //
+    // https://stackoverflow.com/a/43836992/211160
+    //
+    // Theory is that with ENABLE_LINE_INPUT, a successfully completed line
+    // will always end in CR LF for a `total` of at least 2.  Then if
+    // `dwCtrlWakeupMask` is registered for a key, and `nInitialChars` is
+    // set to 0 (preserve nothing), the fact that the user terminated with the
+    // control key *should* be detectable by `total == 0`.
+    //
+    // But as mentioned, masking escape in as (1 << 27) has no effect.  And
+    // when using ENABLE_PROCESSED_INPUT (which you must in order to get the
+    // backspace/etc. behavior in the line editor) then Ctrl-C will exit
+    // ReadConsole() call and return a total of 0...regardless of whether you
+    // mask (1 << 3) or not.  It also exits before the SetConsoleCtrlHandler()
+    // does for handling CTRL_C_EVENT.  :-/
+    //
+    // Then Ctrl-D can be in the mask.  It does indeed exit the read when it
+    // is hit, but ignores `nInitialChars` and just sticks a codepoint of 4
+    // (^D) wherever the cursor is!!!
+    //
+    // As awful as this all sounds, it actually can be manipulated to give
+    // three different outcomes.  It's just rather rickety-seeming, but the
+    // odds are this all comes from bend-over-backward legacy support of
+    // things that couldn't be changed to be better...so it will probably
+    // be working this way for however long Win32 stays relevant.
+    //
+    // For the moment, having Ctrl-D instead of escape for abort input (vs.
+    // abort script) is accepted as the price paid, to delegate the Unicode
+    // aware cursoring/backspacing/line-editing to the OS.  Which also means
+    // a smaller executable than trying to rewrite it oneself.
+    //
+
+#ifdef PRE_VISTA
+    LPVOID pInputControl = NULL;
+#else
+    CONSOLE_READCONSOLE_CONTROL ctl; // Unavailable before Vista, e.g. Mingw32
+    LPVOID pInputControl = &ctl;
+
+    ctl.nLength = sizeof(CONSOLE_READCONSOLE_CONTROL);
+    ctl.nInitialChars = 0; // when hit, empty buffer...no CR LF
+    ctl.dwCtrlWakeupMask = (1 << 4); // ^D (^C is implicit)
+    ctl.dwControlKeyState = 0; // no alt+shift modifiers (beyond ctrl)
+#endif
+
+    DWORD total;
+    REBOOL ok = ReadConsoleW(
+        Std_Inp,
+        Std_Buf,
+        BUF_SIZE - 1,
+        &total,
+        pInputControl
+    );
+    if (NOT(ok)) {
+        req->error = GetLastError();
+        return DR_ERROR;
+    }
+
+    // Ctrl-C and Ctrl-D will terminate input without the newline that is
+    // expected by code calling INPUT.  If these forms of cancellation are
+    // encountered, we write a line to maintain the visual invariant.
+    //
+    wchar_t cr_lf_term[3];
+    cr_lf_term[0] = CR;
+    cr_lf_term[1] = LF;
+    cr_lf_term[2] = '\0';
+
+    if (total == 0) {
+        //
+        // Has to be a Ctrl-C, because it returns 0 total.  There is no
+        // apparent way to avoid this behavior a priori, nor to resume the
+        // console operation as if nothing had happened.
+        //
+        // Given that, write compensating line.  !!! Check error?
+        //
+        WriteConsoleW(Std_Out, cr_lf_term, 2, NULL, 0);
+
+        // The Ctrl-C will be passed on to the SetConsoleCtrlHandler().
+        // Regardless of what the Ctrl-C event does (it runs on its own thread
+        // in a console app) we'll get here, and have to return *something*
+        // to INPUT or whoever called.
+        //
+        // Give a zero length output.  If halting was enabled, further Rebol
+        // code of INPUT should not run.  In the case that INPUT sees this
+        // signal and a halt does not happen, it will FAIL.  Only special
+        // clients which can run with no cancellability (HOST-CONSOLE)
+        // should trap it and figure out what to do with the non-ideal state.
+        //
+        strcpy(s_cast(req->common.data), "");
+        req->actual = 0;
+
+        return DR_DONE;
+    }
+
+    DWORD i;
+    for (i = 0; i < total; ++i) {
+        if (Std_Buf[i] == 4) {
+            //
+            // A Ctrl-D poked in at any position means escape.  Return it
+            // as a single-character null terminated string of escape.
+            //
+            strcpy(s_cast(req->common.data), "\x1B"); // 0x1B = 27 (escape)
+            req->actual = 1;
+
+            // Write compensating line.  !!! Check error?
+            //
+            WriteConsoleW(Std_Out, cr_lf_term, 2, NULL, 0);
+            return DR_DONE;
+        }
+    }
+
+    DWORD encoded_len = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        Std_Buf,
+        total,
+        s_cast(req->common.data),
+        req->length,
+        0,
+        0
+    );
+
+    // Note: WideCharToMultibyte would fail if cchWideChar was 0.  (we
+    // know total is *not* 0 as it was handled above.)  In any case, a 0
+    // result for the encoded length is how errors are signaled, as it could
+    // not happen any other way.
+    //
+    if (encoded_len == 0) {
+        req->error = GetLastError();
+        return DR_ERROR;
+    }
+
+    req->actual = encoded_len;
     return DR_DONE;
 }
 

@@ -25,7 +25,7 @@
     all [res | pos = next ser]
 ][
     res: parse ser: [x y] [skip skip pos: end]
-    all [res | pos = tail ser]
+    all [res | pos = tail of ser]
 ][
     #2130
     res: parse ser: [x] [set val pos: word!]
@@ -139,7 +139,7 @@
 
 ; self-modifying rule, not legal in Ren-C if it's during the parse
 
-[error? try [not parse? "abcd" rule: ["ab" (remove back tail rule) "cd"]]]
+[error? try [not parse? "abcd" rule: ["ab" (remove back tail of rule) "cd"]]]
 
 [
     https://github.com/metaeducation/ren-c/issues/377
@@ -155,3 +155,12 @@
 [not parse [1 + 2] [do [quote 100]]]
 [parse [reverse copy [a b c]] [do [into ['c 'b 'a]]]]
 [not parse [reverse copy [a b c]] [do [into ['a 'b 'c]]]]
+
+; AHEAD and AND are synonyms
+;
+[parse ["aa"] [ahead string! into ["a" "a"]]]
+[parse ["aa"] [and string! into ["a" "a"]]]
+
+; INTO is not legal if a string parse is already running
+;
+[error? trap [parse "aa" [into ["a" "a"]]]]

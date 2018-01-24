@@ -52,3 +52,62 @@
     #define VARARGS_FLAG(n) \
         (FLAGIT_LEFT(TYPE_SPECIFIC_BIT + (n)) | HEADERIZE_KIND(REB_VARARGS))
 #endif
+
+
+inline static REBOOL Is_Block_Style_Varargs(
+    REBVAL **shared_out,
+    const RELVAL *vararg
+){
+    assert(IS_VARARGS(vararg));
+
+    if (
+        (vararg->extra.binding->header.bits & NODE_FLAG_CELL)
+        || (vararg->extra.binding->header.bits & ARRAY_FLAG_VARLIST)
+    ){
+        TRASH_POINTER_IF_DEBUG(*shared_out);
+        return FALSE; // it's an ordinary vararg, representing a FRAME!
+    }
+
+    // Came from MAKE VARARGS! on some random block, hence not implicitly
+    // filled by the evaluator on a <...> parameter.  Should be a singular
+    // array with one BLOCK!, that is the actual array and index to advance.
+    //
+    REBARR *array1 = ARR(vararg->extra.binding);
+    *shared_out = KNOWN(ARR_HEAD(array1));
+    assert(
+        IS_END(*shared_out)
+        || (IS_BLOCK(*shared_out) && ARR_LEN(array1) == 1)
+    );
+
+    return TRUE;
+}
+
+
+inline static REBOOL Is_Frame_Style_Varargs_May_Fail(
+    REBFRM **f,
+    const RELVAL *vararg
+){
+    assert(IS_VARARGS(vararg));
+
+    if (
+        NOT(vararg->extra.binding->header.bits & NODE_FLAG_CELL)
+        && NOT(vararg->extra.binding->header.bits & ARRAY_FLAG_VARLIST)
+    ){
+        TRASH_POINTER_IF_DEBUG(*f);
+        return FALSE; // it's a block varargs, made via MAKE VARARGS!
+    }
+
+    // "Ordinary" case... use the original frame implied by the VARARGS!
+    // (so long as it is still live on the stack)
+
+    if (vararg->extra.binding->header.bits & NODE_FLAG_CELL) {
+        *f = cast(REBFRM*, vararg->extra.binding);
+    }
+    else {
+        *f = CTX_FRAME_IF_ON_STACK(CTX(vararg->extra.binding));
+        if (*f == NULL)
+            fail (Error_Varargs_No_Stack_Raw());
+    }
+
+    return TRUE;
+}

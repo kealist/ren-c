@@ -101,7 +101,7 @@ read-sync-awake: function [event [event!]] [
             event/port/state/error: _
             fail error
         ]
-    ] else false
+    ] else [false]
 ]
 
 http-awake: function [event] [
@@ -155,14 +155,14 @@ http-awake: function [event] [
             close http-port
             res
         ]
-    ] else true
+    ] else [true]
 ]
 
 make-http-error: func [
     "Make an error for the HTTP protocol"
     msg [string! block!]
     /inf obj
-    /otherhost new-url [url!]
+    /otherhost new-url [url!] headers
 ] [
     ; cannot call it "message" because message is the error template.  :-/
     ; hence when the error is created it has message defined as blank, and
@@ -191,6 +191,7 @@ make-http-error: func [
                 type: 'Access
                 id: 'Protocol
                 arg1: msg
+                arg2: headers
                 arg3: new-url
             ]
         ]
@@ -225,7 +226,7 @@ make-http-request: func [
     ]
     if content [
         content: to binary! content
-        join result ["Content-Length:" space (length-of content) CRLF]
+        join result ["Content-Length:" space (length of content) CRLF]
     ]
     append result CRLF
     result: to binary! result
@@ -258,10 +259,12 @@ do-request: func [
     net-log/C to string! req
 ]
 
+; if a no-redirect keyword is found in the write dialect after 'headers then 302 redirects will not be followed
 parse-write-dialect: func [port block <local> spec debug] [
     spec: port/spec
     parse block [
-        opt [ 'headers ( spec/debug: true ) ]
+        opt ['headers (spec/debug: true)]
+        opt ['no-redirect (spec/follow: 'ok)]
         [set block word! (spec/method: block) | (spec/method: 'post)]
         opt [set block [file! | url!] (spec/path: block)]
         [set block block! (spec/headers: block) | (spec/headers: [])]
@@ -280,6 +283,7 @@ check-response: function [port] [
     line: info/response-line
     awake: :state/awake
     spec: port/spec
+    ; dump spec
     if all [
         not headers
         d1: find conn/data crlfbin
@@ -314,7 +318,11 @@ check-response: function [port] [
             if trap? [
                 body: to string! conn/data
                 dump body
-            ][print ajoin ["S: " length-of conn/data " binary bytes in buffer ..."]]
+            ][
+                print unspaced [
+                    "S: " length of conn/data " binary bytes in buffer ..."
+                ]
+            ]
         ]
     ]
     unless headers [
@@ -333,7 +341,9 @@ check-response: function [port] [
                 ]
                 |
                 #"3" [
-                    "03" (info/response-parsed: 'see-other)
+                    "02" (info/response-parsed: spec/follow)
+                    |
+                    "03" (info/response-parsed: either spec/follow = 'ok ['ok][see-other])
                     |
                     "04" (info/response-parsed: 'not-modified)
                     |
@@ -358,7 +368,7 @@ check-response: function [port] [
     ]
     switch/all info/response-parsed [
         ok [
-            either spec/method = 'head [
+            either spec/method = 'HEAD [
                 state/state: 'ready
                 res: awake make event! [type: 'done port: port]
                 unless res [res: awake make event! [type: 'ready port: port]]
@@ -371,7 +381,7 @@ check-response: function [port] [
             ]
         ]
         redirect see-other [
-            either spec/method = 'head [
+            either spec/method = 'HEAD [
                 state/state: 'ready
                 res: awake make event! [type: 'custom port: port code: 0]
             ] [
@@ -393,7 +403,7 @@ check-response: function [port] [
                     ]
                     in headers 'Location
                 ] [
-                    res: do-redirect port headers/location
+                    res: do-redirect port headers/location headers
                 ] [
                     state/error: make-http-error/inf "Redirect requires manual intervention" info
                     res: awake make event! [type: 'error port: port]
@@ -401,7 +411,7 @@ check-response: function [port] [
             ]
         ]
         unauthorized client-error server-error proxy-auth [
-            either spec/method = 'head [
+            either spec/method = 'HEAD [
                 state/state: 'ready
             ] [
                 check-data port
@@ -461,6 +471,7 @@ http-response-headers: context [
 do-redirect: func [
     port [port!]
     new-uri [url! string! file!]
+    headers
     <local> spec state
 ][
     spec: port/spec
@@ -493,7 +504,7 @@ do-redirect: func [
     ] [
         state/error: make-http-error/otherhost
             "Redirect to other host - requires custom handling"
-            as url! unspaced [new-uri/scheme "://" new-uri/host new-uri/path]
+            as url! unspaced [new-uri/scheme "://" new-uri/host new-uri/path] headers
         state/awake make event! [type: 'error port: port]
     ]
 ]
@@ -507,7 +518,7 @@ check-data: function [port] [
         headers/transfer-encoding = "chunked" [
             data: conn/data
             ;clear the port data only at the beginning of the request --Richard
-            unless port/data [port/data: make binary! length-of data]
+            unless port/data [port/data: make binary! length of data]
             out: port/data
             loop-until [
                 either parse data [
@@ -534,7 +545,7 @@ check-data: function [port] [
                         either parse mk1 [
                             chunk-size skip mk2: crlfbin to end
                         ] [
-                            insert/part tail out mk1 mk2
+                            insert/part tail of out mk1 mk2
                             remove/part data skip mk2 2
                             empty? data
                         ] [
@@ -554,7 +565,7 @@ check-data: function [port] [
         ]
         integer? headers/content-length [
             port/data: conn/data
-            either headers/content-length <= length-of port/data [
+            either headers/content-length <= length of port/data [
                 state/state: 'ready
                 conn/data: make binary! 32000
                 res: state/awake make event! [
@@ -598,6 +609,7 @@ sys/make-scheme [
         content: _
         timeout: 15
         debug: _
+        follow: 'redirect
     ]
     
     info: construct system/standard/file-info [
@@ -625,7 +637,7 @@ sys/make-scheme [
             ][
                 sync-op port []
             ]
-            if lines or string [
+            if lines or (string) [
                 ; !!! When READ is called on an http PORT! (directly or
                 ; indirectly) it bounces its parameters to this routine.  To
                 ; avoid making an error this tolerates the refinements but the
@@ -718,7 +730,7 @@ sys/make-scheme [
         copy: func [
             port [port!]
         ][
-            either all [port/spec/method = 'head port/state] [
+            either all [port/spec/method = 'HEAD | port/state] [
                 reduce bind [name size date] port/state/info
             ][
                 if port/data [copy port/data]
@@ -743,7 +755,7 @@ sys/make-scheme [
             port [port!]
         ][
             ; actor is not an object!, so this isn't a recursive length call
-            either port/data [length-of port/data] [0]
+            if port/data [length of port/data] else [0]
         ]
     ]
 ]

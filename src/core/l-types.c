@@ -59,6 +59,25 @@ void MAKE_Fail(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
 
 
 //
+//  MAKE_Unhooked: C
+//
+// MAKE STRUCT! is part of the FFI extension, but since user defined types
+// aren't ready yet as a general concept, this hook is overwritten in the
+// dispatch table when the extension loads.
+//
+void MAKE_Unhooked(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
+{
+    UNUSED(out);
+    UNUSED(arg);
+
+    REBVAL *type = Get_Type(kind);
+    UNUSED(type); // put in error message?
+
+    fail ("Datatype is provided by an extension that's not currently loaded");
+}
+
+
+//
 //  make: native [
 //
 //  {Constructs or allocates the specified datatype.}
@@ -141,7 +160,7 @@ REBNATIVE(make)
         // If there's any chance that the argument could produce voids, we
         // can't guarantee an array can be made out of it.
         //
-        if (arg->extra.binding == NULL) {
+        if (arg->payload.varargs.facade == NULL) {
             //
             // A vararg created from a block AND never passed as an argument
             // so no typeset or quoting settings available.  Can't produce
@@ -149,7 +168,7 @@ REBNATIVE(make)
             //
             assert(
                 NOT_SER_FLAG(
-                    arg->payload.varargs.feed, ARRAY_FLAG_VARLIST
+                    arg->extra.binding, ARRAY_FLAG_VARLIST
                 )
             );
         }
@@ -184,7 +203,6 @@ REBNATIVE(make)
             assert(r == R_OUT);
 
             DS_PUSH(D_OUT);
-            SET_END(D_OUT); // expected by Do_Vararg_Op
         } while (TRUE);
 
         Init_Any_Array(D_OUT, kind, Pop_Stack_Values(dsp_orig));
@@ -205,7 +223,22 @@ void TO_Fail(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
     UNUSED(kind);
     UNUSED(arg);
 
-    fail ("Datatype does not have a TO handler registered");
+    fail ("Cannot convert to datatype");
+}
+
+
+//
+//  TO_Unhooked: C
+//
+void TO_Unhooked(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
+{
+    UNUSED(out);
+    UNUSED(arg);
+
+    REBVAL *type = Get_Type(kind);
+    UNUSED(type); // use in error message?
+
+    fail ("Datatype does not have extension with a TO handler registered");
 }
 
 
@@ -239,6 +272,22 @@ REBNATIVE(to)
 
     dispatcher(D_OUT, kind, arg); // may fail();
     return R_OUT;
+}
+
+
+//
+//  REBTYPE: C
+//
+// There's no actual "Unhooked" data type, it is used as a placeholder for
+// if a datatype (such as STRUCT!) is going to have its behavior loaded by
+// an extension.
+//
+REBTYPE(Unhooked)
+{
+    UNUSED(frame_);
+    UNUSED(action);
+
+    fail ("Datatype does not have its REBTYPE() handler loaded by extension");
 }
 
 
@@ -703,7 +752,7 @@ const REBYTE *Scan_Date(
     REBINT day;
     REBINT month;
     REBINT year;
-    REBINT tz = 0;
+    REBINT tz;
 
     REBCNT size = cast(REBCNT, ep - cp);
     if (size >= 4) {
@@ -818,17 +867,18 @@ const REBYTE *Scan_Date(
 
     cp = ep;
 
-    VAL_RESET_HEADER(out, REB_DATE);
-    VAL_NANO(out) = NO_TIME;
-
-    if (cp >= end)
-        goto end_date;
+    if (cp >= end) {
+        VAL_RESET_HEADER(out, REB_DATE);
+        goto end_date; // needs header set
+    }
 
     if (*cp == '/' || *cp == ' ') {
         sep = *cp++;
 
-        if (cp >= end)
-            goto end_date;
+        if (cp >= end) {
+            VAL_RESET_HEADER(out, REB_DATE);
+            goto end_date; // needs header set
+        }
 
         cp = Scan_Time(out, cp, 0);
         if (
@@ -839,9 +889,16 @@ const REBYTE *Scan_Date(
         ){
             return_NULL;
         }
-    }
 
-    if (*cp == sep) cp++;
+        VAL_RESET_HEADER_EXTRA(out, REB_DATE, DATE_FLAG_HAS_TIME);
+    }
+    else
+        VAL_RESET_HEADER(out, REB_DATE); // no DATE_FLAG_HAS_TIME
+
+    // past this point, header is set, so `goto end_date` is legal.
+
+    if (*cp == sep)
+        ++cp;
 
     // Time zone can be 12:30 or 1230 (optional hour indicator)
     if (*cp == '-' || *cp == '+') {
@@ -883,10 +940,25 @@ const REBYTE *Scan_Date(
             tz = -tz;
 
         cp = ep;
+
+        SET_VAL_FLAG(out, DATE_FLAG_HAS_ZONE);
+        INIT_VAL_ZONE(out, tz);
     }
 
 end_date:
-    Set_Date_UTC(out, year, month, day, VAL_NANO(out), tz);
+    assert(IS_DATE(out)); // don't reset header here; overwrites flags
+    VAL_YEAR(out)  = year;
+    VAL_MONTH(out) = month;
+    VAL_DAY(out) = day;
+
+    // if VAL_NANO() was set, then DATE_FLAG_HAS_TIME should be true
+    // if VAL_ZONE() was set, then DATE_FLAG_HAS_ZONE should be true
+
+    // This step used to be skipped if tz was 0, but now that is a
+    // state distinguished from "not having a time zone"
+    //
+    Adjust_Date_Zone(out, TRUE);
+
     return cp;
 }
 
@@ -921,16 +993,15 @@ const REBYTE *Scan_File(
         invalid = cb_cast(":;()[]\"");
     }
 
-    REB_MOLD mo;
-    CLEARS(&mo);
+    DECLARE_MOLD (mo);
 
-    cp = Scan_Item_Push_Mold(&mo, cp, cp + len, term, invalid);
+    cp = Scan_Item_Push_Mold(mo, cp, cp + len, term, invalid);
     if (cp == NULL) {
-        Drop_Mold(&mo);
+        Drop_Mold(mo);
         return_NULL;
     }
 
-    Init_File(out, Pop_Molded_String(&mo));
+    Init_File(out, Pop_Molded_String(mo));
     return cp;
 }
 
@@ -982,45 +1053,32 @@ const REBYTE *Scan_Email(
 //
 //  Scan_URL: C
 //
-// Scan and convert a URL.
+// While Rebol2, R3-Alpha, and Red attempted to apply some amount of decoding
+// (e.g. how %20 is "space" in http:// URL!s), Ren-C leaves URLs "as-is".
+// This means a URL may be copied from a web browser bar and pasted back.
+// It also means that the URL may be used with custom schemes (odbc://...)
+// that have different ideas of the meaning of characters like `%`.
+//
+// !!! The current concept is that URL!s typically represent the *decoded*
+// forms, and thus express unicode codepoints normally...preserving either of:
+//
+//     https://duckduckgo.com/?q=hergé+&+tintin
+//     https://duckduckgo.com/?q=hergé+%26+tintin
+//
+// Then, the encoded forms with UTF-8 bytes expressed in %XX form would be
+// converted as STRING!, where their datatype suggests the encodedness:
+//
+//     {https://duckduckgo.com/?q=herg%C3%A9+%26+tintin}
+//
+// (This is similar to how local FILE!s, where e.g. slashes become backslash
+// on Windows, are expressed as STRING!.)
 //
 const REBYTE *Scan_URL(
     REBVAL *out, // may live in data stack (do not call DS_PUSH, GC, eval)
     const REBYTE *cp,
     REBCNT len
-) {
-    TRASH_CELL_IF_DEBUG(out);
-
-//  !!! Need to check for any possible scheme followed by ':'
-
-//  for (n = 0; n < URL_MAX; n++) {
-//      if (str = Match_Bytes(cp, (REBYTE *)(URL_Schemes[n]))) break;
-//  }
-//  if (n >= URL_MAX) return_NULL;
-//  if (*str != ':') return_NULL;
-
-    REBSER *series = Make_Binary(len);
-
-    REBYTE *str = BIN_HEAD(series);
-    for (; len > 0; len--) {
-        //if (*cp == '%' && len > 2 && Scan_Hex2(cp+1, &n, FALSE)) {
-        if (*cp == '%') {
-            REBUNI n;
-            if (len <= 2 || !Scan_Hex2(cp + 1, &n, FALSE))
-                return_NULL;
-
-            *str++ = cast(REBYTE, n);
-            cp += 3;
-            len -= 2;
-        }
-        else
-            *str++ = *cp++;
-    }
-    *str = 0;
-    SET_SERIES_LEN(series, cast(REBCNT, str - BIN_HEAD(series)));
-
-    Init_Url(out, series);
-    return cp;
+){
+    return Scan_Any(out, cp, len, REB_URL);
 }
 
 
@@ -1225,7 +1283,7 @@ REBNATIVE(scan_net_header)
     //
     REBVAL *header = ARG(header);
     REBCNT index;
-    REBSER *utf8 = Temp_Bin_Str_Managed(header, &index, NULL);
+    REBSER *utf8 = Temp_UTF8_At_Managed(header, &index, NULL);
     INIT_VAL_SERIES(header, utf8); // GC protect, unnecessary?
 
     REBYTE *cp = BIN_HEAD(utf8) + index;

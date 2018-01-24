@@ -41,19 +41,108 @@
 #ifndef REB_DEFS_H  // due to sequences within the lib build itself
 #define REB_DEFS_H
 
+
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// REBOL NUMERIC TYPES ("REBXXX")
+//
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// The 64-bit build modifications to R3-Alpha after its open sourcing changed
+// *pointers* internal to data structures to be 64-bit.  But indexes did not
+// get changed to 64-bit: REBINT and REBCNT remained 32-bit.
+//
+// This meant there was often extra space in the structures used on 64-bit
+// machines, and a possible loss of performance for forcing a platform to use
+// a specific size int (instead of deferring to C's generic `int`).
+//
+
+typedef i32 REBINT; // 32 bit (64 bit defined below)
+typedef u32 REBCNT; // 32 bit (counting number)
+typedef i64 REBI64; // 64 bit integer
+typedef u64 REBU64; // 64 bit unsigned integer
+typedef float REBD32; // 32 bit decimal
+typedef double REBDEC; // 64 bit decimal
+typedef i8 REBOOL8; // Small for struct packing (memory optimization vs CPU)
+
+typedef REBUPT REBFLGS; // platform-pointer-size unsigned (like `uintptr_t`)
+
+// Using unsigned characters is good for conveying information is not limited
+// to textual data.  It provides type-checking that helps discern between
+// single-codepoint null terminated data (on which you might legitimately
+// use `strlen()`, for instance) and something like UTF-8 data.
+//
+typedef u8 REBYTE; // unsigned byte data
+
+#define MIN_D64 ((double)-9.2233720368547758e18)
+#define MAX_D64 ((double) 9.2233720368547758e18)
+
+
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// UNICODE CHARACTER TYPE
+//
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// REBUNI is a two-byte UCS-2 representation of a Unicode codepoint.  Some
+// routines once errantly conflated wchar_t with REBUNI, but a wchar_t is not
+// 2 bytes on all platforms (it's 4 on GCC in 64-bit Linux, for instance).
+// Routines for handling UCS-2 must be custom-coded or come from a library.
+// (For example: you can't use wcslen() so Strlen_Uni() is implemented inside
+// of Rebol.)
+//
+// Rebol is able to have its strings start out as UCS-1, with a single byte
+// per character.  For that it uses REBYTEs.  But when you insert something
+// requiring a higher codepoint, it goes to UCS-2 with REBUNI and will not go
+// back (at time of writing).
+//
+// !!! BEWARE that several lower level routines don't do this widening, so be
+// sure that you check which are which.
+//
+// Longer term, the growth of emoji usage in Internet communication has led
+// to supporting higher "astral" codepoints as being a priority.  This means
+// either being able to "double-widen" to UCS-4, as is Red's strategy:
+//
+// http://www.red-lang.org/2012/09/plan-for-unicode-support.html
+//
+// Or it could also mean shifting to "UTF-8 everywhere":
+//
+// http://utf8everywhere.org
+//
+
+typedef u16 REBUNI;
+
+#define MAX_UNI \
+    ((1 << (8 * sizeof(REBUNI))) - 1)
+
+
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// REBOL SERIES TYPES
+//
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // Forward declarations of the series subclasses defined in %sys-series.h
 // Because the Reb_Series structure includes a Reb_Value by value, it
 // must be included *after* %sys-value.h
 //
 #ifdef REB_DEF
-    struct Reb_Value;
-    #define RELVAL struct Reb_Value // maybe IS_RELATIVE()
+    struct Reb_Cell;
 
-    #ifdef __cplusplus
-        #define REBVAL struct Reb_Specific_Value // guaranteed IS_SPECIFIC()
+    #if !defined(CPLUSPLUS_11)
+        #define RELVAL struct Reb_Cell
+        #define REBVAL struct Reb_Cell
+        #define const_RELVAL_NO_END_PTR const struct Reb_Cell *
     #else
-        #define REBVAL struct Reb_Value // IS_SPECIFIC(), unchecked
+        struct Reb_Relative_Value;
+        #define RELVAL struct Reb_Relative_Value // *maybe* IS_RELATIVE()
+
+        struct Reb_Specific_Value;
+        #define REBVAL struct Reb_Specific_Value // guaranteed IS_SPECIFIC()
+
+        struct const_Reb_Relative_Value_No_End_Ptr;
+        #define const_RELVAL_NO_END_PTR \
+            struct const_Reb_Relative_Value_No_End_Ptr
     #endif
 
     struct Reb_Series; // Rebol series node
@@ -78,12 +167,16 @@
     typedef struct Reb_Frame REBFRM;
 
     struct Reb_Binder; // used as argument in %tmp-funcs.h, needs forward decl
+    struct Reb_Collector; // same
 
-    struct Reb_Path_Value_State;
-    typedef struct Reb_Path_Value_State REBPVS;
+    // Paths formerly used their own specialized structure to track the path,
+    // (path-value-state), but now they're just another kind of frame.  It is
+    // helpful for the moment to give them a different name.
+    //
+    typedef struct Reb_Frame REBPVS;
 
-    typedef REBINT (*REBPEF)(REBPVS *pvs); // Path evaluator function
-
+    // Compare Types Function
+    //
     typedef REBINT (*REBCTF)(const RELVAL *a, const RELVAL *b, REBINT s);
 
     // A standard integer is currently used to represent the data stack
@@ -104,6 +197,41 @@
 
     typedef struct Reb_Node REBSPC;
 
+    // This defines END as the address of a global node.  It's important to
+    // point out that several definitions you might think would work for END
+    // will not.  For example, this string literal seems to have the right
+    // bits in the leading byte (NODE_FLAG_NODE and NODE_FLAG_END):
+    //
+    //     #define END ((const REBVAL*)"\x88")
+    //
+    // (Note: it's actually two bytes, C adds a terminator \x00)
+    //
+    // But the special "endlike" value of "the" END global node is set up to
+    // assuming further that it has 0 in its rightmost bits, where the type is
+    // stored.  Why would this be true when you cannot run a VAL_TYPE() on an
+    // arbitrary end marker?
+    //
+    // (Note: the reason you can't run VAL_TYPE() on arbitrary cells that
+    // return true to IS_END() is because some--like the above--only set
+    // enough bits to say that they're ends and not cells, so they can use
+    // subsequent bits for other purposes.  See Init_Endlike_Header())
+    //
+    // The reason there's a special loophole for this END is to help avoid
+    // extra testing for NULL.  So in various internal code where NULL might
+    // be used, this END is...which permits the operation VAL_TYPE_OR_0.
+    //
+    // So you might think that more zero bytes would help.  If you're on a
+    // 64-bit platform, that means you'd need at least 7 bytes plus null
+    // terminator:
+    //
+    //     #define END ((const REBVAL*)"\x88\x00\x00\x00\x00\x00\x00")
+    //
+    // ...but even that doesn't work for the core, since END is expected to
+    // have a single memory address across translation units.  This means if
+    // one C file assigns a variable to END, another C file can turn around
+    // and test `value == END` instead of with `IS_END(value)` (though it's
+    // not clear whether that actually benefits performance much or not.)
+    //
     #define END \
         ((const REBVAL*)&PG_End_Node) // sizeof(REBVAL) but not NODE_FLAG_CELL
 #else
@@ -123,5 +251,65 @@
     typedef void REBVAL;
     typedef void REBFRM;
 #endif
+
+
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// MISCELLANY
+//
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// !!! This is stuff that needs a better home.
+
+// Useful char constants:
+enum {
+    BEL =   7,
+    BS  =   8,
+    LF  =  10,
+    CR  =  13,
+    ESC =  27,
+    DEL = 127
+};
+
+// Used for MOLDing:
+#define MAX_DIGITS 17   // number of digits
+#define MAX_NUMCHR 32   // space for digits and -.e+000%
+
+#define MAX_INT_LEN     21
+#define MAX_HEX_LEN     16
+
+#ifdef ITOA64           // Integer to ascii conversion
+    #define INT_TO_STR(n,s) _i64toa(n, s_cast(s), 10)
+#else
+    #define INT_TO_STR(n,s) Form_Int_Len(s, n, MAX_INT_LEN)
+#endif
+
+#ifdef ATOI64           // Ascii to integer conversion
+#define CHR_TO_INT(s)   _atoi64(cs_cast(s))
+#else
+#define CHR_TO_INT(s)   strtoll(cs_cast(s), 0, 10)
+#endif
+
+#define LDIV            lldiv
+#define LDIV_T          lldiv_t
+
+// Skip to the specified byte but not past the provided end
+// pointer of the byte string.  Return NULL if byte is not found.
+//
+inline static const REBYTE *Skip_To_Byte(
+    const REBYTE *cp,
+    const REBYTE *ep,
+    REBYTE b
+) {
+    while (cp != ep && *cp != b) cp++;
+    if (*cp == b) return cp;
+    return 0;
+}
+
+typedef int cmp_t(void *, const void *, const void *);
+extern void reb_qsort_r(void *a, size_t n, size_t es, void *thunk, cmp_t *cmp);
+
+#define ROUND_TO_INT(d) \
+    (i32)(floor((MAX(MIN_I32, MIN(MAX_I32, d))) + 0.5))
 
 #endif

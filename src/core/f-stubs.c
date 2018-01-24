@@ -327,7 +327,7 @@ void Init_Any_Series_At_Core(
     enum Reb_Kind type,
     REBSER *series,
     REBCNT index,
-    REBSPC *specifier
+    REBNOD *binding
 ) {
     ENSURE_SERIES_MANAGED(series);
 
@@ -351,15 +351,12 @@ void Init_Any_Series_At_Core(
     VAL_RESET_HEADER(out, type);
     out->payload.any_series.series = series;
     VAL_INDEX(out) = index;
-    if (specifier == SPECIFIED)
-        INIT_SPECIFIC(out, SPECIFIED);
-    else
-        INIT_SPECIFIC(out, CTX(specifier));
+    INIT_BINDING(out, binding);
 
 #if !defined(NDEBUG)
-    if (GET_SER_FLAG(series, SERIES_FLAG_ARRAY) && specifier == SPECIFIED) {
+    if (GET_SER_FLAG(series, SERIES_FLAG_ARRAY) && binding == UNBOUND) {
         //
-        // If a SPECIFIED is used for an array, then that top level of the
+        // If UNBOUND is used for an array, then that top level of the
         // array cannot have any relative values in it.  Catch it here vs.
         // waiting until a later assertion.
         //
@@ -413,13 +410,17 @@ void Init_Any_Context_Core(
     assert(VAL_CONTEXT(archetype) == c);
 
     assert(CTX_TYPE(c) == kind);
-    if (CTX_KEYLIST(c) == NULL)
-        panic (c);
 
-    assert(GET_SER_FLAG(CTX_VARLIST(c), ARRAY_FLAG_VARLIST));
+    REBARR *varlist = CTX_VARLIST(c);
+    REBARR *keylist = CTX_KEYLIST(c);
 
-    assert(NOT_SER_FLAG(CTX_VARLIST(c), SERIES_FLAG_FILE_LINE));
-    assert(NOT_SER_FLAG(CTX_KEYLIST(c), SERIES_FLAG_FILE_LINE));
+    assert(GET_SER_FLAG(varlist, ARRAY_FLAG_VARLIST));
+
+    if (GET_SER_FLAG(varlist, SERIES_FLAG_FILE_LINE))
+        panic (varlist);
+
+    assert(NOT_SER_FLAG(varlist, SERIES_FLAG_FILE_LINE));
+    assert(NOT_SER_FLAG(keylist, SERIES_FLAG_FILE_LINE));
 
     if (IS_FRAME(CTX_VALUE(c)))
         assert(IS_FUNCTION(CTX_FRAME_FUNC_VALUE(c)));
@@ -427,7 +428,10 @@ void Init_Any_Context_Core(
     // !!! Currently only a context can serve as the "meta" information,
     // though the interface may expand.
     //
-    assert(CTX_META(c) == NULL || ANY_CONTEXT(CTX_VALUE(CTX_META(c))));
+    assert(
+        MISC(varlist).meta == NULL
+        || ANY_CONTEXT(CTX_VALUE(MISC(varlist).meta))
+    );
 #endif
 
     // Some contexts (stack frames in particular) start out unmanaged, and
@@ -452,21 +456,21 @@ void Init_Any_Context_Core(
 
     Move_Value(out, CTX_VALUE(c));
 
-    // Currently only FRAME! uses the ->binding field.  Following the pattern
-    // of function, we assume the archetype form of a frame has no binding,
-    // and it's only REBVAL instances besides the canon that become bound.
+    // Currently only FRAME! uses the ->binding field, in order to capture the
+    // ->binding of the function value it links to (which is in ->phase)
     //
-    assert(VAL_BINDING(out) == NULL);
+    assert(VAL_BINDING(out) == UNBOUND || CTX_TYPE(c) == REB_FRAME);
 
-    // Only FRAME!s are allowed to have phases.
+    // FRAME!s must always fill in the phase slot, but that piece of the
+    // REBVAL is reserved for future use in other context types...so make
+    // sure it's null at this point in time.
     //
-    assert(
-        out->payload.any_context.phase == NULL
-        || (
-            CTX_TYPE(c) == REB_FRAME
-            && NOT(IS_POINTER_TRASH_DEBUG(out->payload.any_context.phase))
-        )
-    );
+#if !defined(NDEBUG)
+    if (CTX_TYPE(c) == REB_FRAME)
+        assert(out->payload.any_context.phase != NULL);
+    else
+        assert(out->payload.any_context.phase == NULL);
+#endif
 }
 
 

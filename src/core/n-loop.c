@@ -33,7 +33,6 @@
 
 typedef enum {
     LOOP_FOR_EACH,
-    LOOP_REMOVE_EACH,
     LOOP_MAP_EACH,
     LOOP_EVERY
 } LOOP_MODE;
@@ -95,7 +94,8 @@ REBNATIVE(break)
 
     Move_Value(D_OUT, NAT_VALUE(break));
 
-    CONVERT_NAME_TO_THROWN(D_OUT, REF(with) ? ARG(value) : VOID_CELL);
+    UNUSED(REF(with)); // value will be void if no refinement provided
+    CONVERT_NAME_TO_THROWN(D_OUT, ARG(value));
 
     return R_OUT_IS_THROWN;
 }
@@ -121,102 +121,10 @@ REBNATIVE(continue)
 
     Move_Value(D_OUT, NAT_VALUE(continue));
 
-    CONVERT_NAME_TO_THROWN(D_OUT, REF(with) ? ARG(value) : VOID_CELL);
+    UNUSED(REF(with)); // value will be void if no refinement provided
+    CONVERT_NAME_TO_THROWN(D_OUT, ARG(value));
 
     return R_OUT_IS_THROWN;
-}
-
-
-//
-//  Copy_Body_Deep_Bound_To_New_Context: C
-//
-// Looping constructs which are parameterized by WORD!s to set each time
-// through the loop must copy the body in R3-Alpha's model.  For instance:
-//
-//    for-each [x y] [1 2 3] [print ["this body must be copied for" x y]]
-//
-// The reason is because the context in which X and Y live does not exist
-// prior to the execution of the FOR-EACH.  And if the body were destructively
-// rebound, then this could mutate and disrupt bindings of code that was
-// intended to be reused.
-//
-// (Note that R3-Alpha was somewhat inconsistent on the idea of being
-// sensitive about non-destructively binding arguments in this way.
-// MAKE OBJECT! purposefully mutated bindings in the passed-in block.)
-//
-// The context is effectively an ordinary object, and outlives the loop:
-//
-//     x-word: none
-//     for-each x [1 2 3] [x-word: 'x | break]
-//     get x-word ;-- returns 1
-//
-// !!! Ren-C managed to avoid deep copying function bodies yet still get
-// "specific binding" by means of "relative values" (RELVALs) and specifiers.
-// Extending this approach is hoped to be able to avoid the deep copy.  It
-// may also be that the underlying data of the
-//
-// !!! With stack-backed contexts in Ren-C, it may be the case that the
-// chunk stack is used as backing memory for the loop, so it can be freed
-// when the loop is over and word lookups will error.
-//
-// Note that because we are copying the block in order to rebind it, the
-// ensuing loop code will `Do_At_Throws(out, body, 0);`.  Starting at
-// zero is correct because the duplicate body has already had the
-// items before its VAL_INDEX() omitted.
-//
-static REBARR *Copy_Body_Deep_Bound_To_New_Context(
-    REBCTX **context_out,
-    const REBVAL *spec,
-    REBVAL *body
-) {
-    assert(IS_BLOCK(body));
-
-    REBINT num_vars = IS_BLOCK(spec) ? VAL_LEN_AT(spec) : 1;
-    if (num_vars == 0)
-        fail (spec);
-
-    REBCTX *context = Alloc_Context(REB_OBJECT, num_vars);
-    TERM_ARRAY_LEN(CTX_VARLIST(context), num_vars + 1);
-    TERM_ARRAY_LEN(CTX_KEYLIST(context), num_vars + 1);
-
-    REBVAL *key = CTX_KEYS_HEAD(context);
-    REBVAL *var = CTX_VARS_HEAD(context);
-
-    const RELVAL *item;
-    REBSPC *specifier;
-    if (IS_BLOCK(spec)) {
-        item = VAL_ARRAY_AT(spec);
-        specifier = VAL_SPECIFIER(spec);
-    }
-    else {
-        item = spec;
-        specifier = SPECIFIED;
-    }
-
-    while (num_vars-- > 0) {
-        if (!IS_WORD(item) && !IS_SET_WORD(item))
-            fail (Error_Invalid_Arg_Core(item, specifier));
-
-        Init_Typeset(key, ALL_64, VAL_WORD_SPELLING(item));
-        key++;
-
-        Init_Void(var);
-        var++;
-
-        ++item;
-    }
-
-    assert(IS_END(key)); // set above by TERM_ARRAY_LEN
-    assert(IS_END(var)); // ...same
-
-    REBARR *body_out = Copy_Array_At_Deep_Managed(
-        VAL_ARRAY(body), VAL_INDEX(body), VAL_SPECIFIER(body)
-    );
-    Bind_Values_Deep(ARR_HEAD(body_out), context);
-
-    *context_out = context;
-
-    return body_out;
 }
 
 
@@ -226,7 +134,7 @@ static REBARR *Copy_Body_Deep_Bound_To_New_Context(
 static REB_R Loop_Series_Common(
     REBVAL *out,
     REBVAL *var,
-    REBARR *body,
+    const REBVAL *body,
     REBVAL *start,
     REBINT ei,
     REBINT ii
@@ -249,7 +157,7 @@ static REB_R Loop_Series_Common(
         // loop bodies are copies at the moment, so fully specified; there
         // may be a point to making it more efficient by not always copying
         //
-        if (Do_At_Throws(out, body, 0, SPECIFIED)) {
+        if (Do_Any_Array_At_Throws(out, body)) {
             REBOOL stop;
             if (Catching_Break_Or_Continue(out, &stop)) {
                 if (stop)
@@ -274,7 +182,7 @@ static REB_R Loop_Series_Common(
 static REB_R Loop_Integer_Common(
     REBVAL *out,
     REBVAL *var,
-    REBARR *body,
+    const REBVAL *body,
     REBI64 start,
     REBI64 end,
     REBI64 incr
@@ -286,7 +194,7 @@ static REB_R Loop_Integer_Common(
     while ((incr > 0) ? start <= end : start >= end) {
         VAL_INT64(var) = start;
 
-        if (Do_At_Throws(out, body, 0, SPECIFIED)) {
+        if (Do_Any_Array_At_Throws(out, body)) {
             REBOOL stop;
             if (Catching_Break_Or_Continue(out, &stop)) {
                 if (stop)
@@ -316,7 +224,7 @@ static REB_R Loop_Integer_Common(
 static REB_R Loop_Number_Common(
     REBVAL *out,
     REBVAL *var,
-    REBARR *body,
+    const REBVAL *body,
     REBVAL *start,
     REBVAL *end,
     REBVAL *incr
@@ -352,7 +260,7 @@ static REB_R Loop_Number_Common(
     for (; (i > 0.0) ? s <= e : s >= e; s += i) {
         VAL_DECIMAL(var) = s;
 
-        if (Do_At_Throws(out, body, 0, SPECIFIED)) {
+        if (Do_Any_Array_At_Throws(out, body)) {
             REBOOL stop;
             if (Catching_Break_Or_Continue(out, &stop)) {
                 if (stop)
@@ -376,7 +284,7 @@ static REB_R Loop_Number_Common(
 //
 //  Loop_Each: C
 //
-// Common implementation code of FOR-EACH, REMOVE-EACH, MAP-EACH, and EVERY.
+// Common implementation code of FOR-EACH, MAP-EACH, and EVERY.
 //
 // !!! This routine has been slowly clarifying since R3-Alpha, and can
 // likely be factored in a better way...pushing more per-native code into the
@@ -400,13 +308,12 @@ static REB_R Loop_Each(REBFRM *frame_, LOOP_MODE mode)
         SET_END(D_CELL); // Final result is in D_CELL (last TRUE? or a BLANK!)
 
     REBCTX *context;
-    REBARR *body_copy = Copy_Body_Deep_Bound_To_New_Context(
+    Virtual_Bind_Deep_To_New_Context(
+        ARG(body), // may be updated, will still be GC safe
         &context,
-        ARG(vars),
-        ARG(body)
+        ARG(vars)
     );
     Init_Object(ARG(vars), context); // keep GC safe
-    Init_Block(ARG(body), body_copy); // keep GC safe
 
     // Currently the data stack is only used by MAP-EACH to accumulate results
     // but it's faster to just save it than test the loop mode.
@@ -417,7 +324,18 @@ static REB_R Loop_Each(REBFRM *frame_, LOOP_MODE mode)
 
     REBSER *series;
     REBCNT index;
-    if (ANY_CONTEXT(data)) {
+    if (ANY_SERIES(data)) {
+        series = VAL_SERIES(data);
+        index = VAL_INDEX(data);
+        if (index >= SER_LEN(series)) {
+            if (mode == LOOP_MAP_EACH) {
+                Init_Block(D_OUT, Make_Array(0));
+                return R_OUT;
+            }
+            return R_VOID;
+        }
+    }
+    else if (ANY_CONTEXT(data)) {
         series = SER(CTX_VARLIST(VAL_CONTEXT(data)));
         index = 1;
     }
@@ -427,10 +345,10 @@ static REB_R Loop_Each(REBFRM *frame_, LOOP_MODE mode)
     }
     else if (IS_DATATYPE(data)) {
         //
-        // !!! Snapshotting the state is not particularly efficient.  However,
-        // bulletproofing an enumeration of the system against possible GC
-        // would be difficult.  And this is really just a debug/instrumentation
-        // feature anyway.
+        // !!! Snapshotting the state is not particularly efficient.
+        // However, bulletproofing an enumeration of the system against
+        // possible GC would be difficult.  And this is really just a
+        // debug/instrumentation feature anyway.
         //
         switch (VAL_TYPE_KIND(data)) {
         case REB_FUNCTION:
@@ -440,26 +358,11 @@ static REB_R Loop_Each(REBFRM *frame_, LOOP_MODE mode)
             break;
 
         default:
-            fail ("FUNCTION! is the only datatype with global enumeration");
+            fail ("FUNCTION! is the only type with global enumeration");
         }
     }
-    else {
-        series = VAL_SERIES(data);
-        index = VAL_INDEX(data);
-        if (index >= SER_LEN(series)) {
-            if (mode == LOOP_REMOVE_EACH) {
-                Init_Integer(D_OUT, 0);
-                return R_OUT;
-            }
-            else if (mode == LOOP_MAP_EACH) {
-                Init_Block(D_OUT, Make_Array(0));
-                return R_OUT;
-            }
-            return R_VOID;
-        }
-    }
-
-    REBCNT write_index = index;
+    else
+        panic ("Illegal type passed to Loop_Each()");
 
     // Iterate over each value in the data series block:
 
@@ -469,17 +372,27 @@ static REB_R Loop_Each(REBFRM *frame_, LOOP_MODE mode)
         REBCNT j = 0;
 
         REBVAL *key = CTX_KEY(context, 1);
-        REBVAL *var = CTX_VAR(context, 1);
-
-        REBCNT read_index;
-
-        read_index = index;  // remember starting spot
+        REBVAL *pseudo_var = CTX_VAR(context, 1);
 
         // Set the FOREACH loop variables from the series:
-        for (i = 1; NOT_END(key); i++, key++, var++) {
+        for (i = 1; NOT_END(key); i++, key++, pseudo_var++) {
+            //
+            // The "var" might have come from a LIT-WORD!, which means it
+            // wants us to write into an existing variable.  Note that since
+            // these variables are fetched across running arbitrary user
+            // code, the address cannot be cached...e.g. the object it lives
+            // in might expand and invalidate the location.  (The `context`
+            // for fabricated variables is locked at fixed size.)
+            //
+            REBVAL *var;
+            if (GET_VAL_FLAG(pseudo_var, NODE_FLAG_MARKED)) {
+                assert(IS_LIT_WORD(pseudo_var));
+                var = Get_Mutable_Var_May_Fail(pseudo_var, SPECIFIED);
+            } else
+                var = pseudo_var;
 
             if (index >= tail) {
-                Init_Blank(var);
+                Init_Void(var);
                 continue;
             }
 
@@ -582,21 +495,15 @@ static REB_R Loop_Each(REBFRM *frame_, LOOP_MODE mode)
                 Set_Tuple_Pixel(BIN_AT(series, index), var);
             }
             else {
-                assert(IS_STRING(data));
-                VAL_RESET_HEADER(var, REB_CHAR);
-                VAL_CHAR(var) = GET_ANY_CHAR(series, index);
+                assert(ANY_STRING(data));
+                Init_Char(var, GET_ANY_CHAR(series, index));
             }
             index++;
         }
 
-        assert(IS_END(key) && IS_END(var));
+        assert(IS_END(key) && IS_END(pseudo_var));
 
-        if (index == read_index) {
-            // the word block has only set-words: for-each [a:] [1 2 3][]
-            index++;
-        }
-
-        if (Do_At_Throws(D_OUT, body_copy, 0, SPECIFIED)) { // copy, specified
+        if (Do_Any_Array_At_Throws(D_OUT, ARG(body))) { // may be a copy
             if (!Catching_Break_Or_Continue(D_OUT, &stop)) {
                 // A non-loop throw, we should be bubbling up
                 threw = TRUE;
@@ -612,30 +519,6 @@ static REB_R Loop_Each(REBFRM *frame_, LOOP_MODE mode)
             // no action needed after body is run
             break;
 
-        case LOOP_REMOVE_EACH:
-            //
-            // If body evaluates to FALSE, preserve the slot.  Do the same
-            // for a void body, since that should have the same behavior as
-            // a CONTINUE with no /WITH (which most sensibly does not do
-            // a removal.)
-            //
-            if (IS_VOID(D_OUT) || IS_CONDITIONAL_FALSE(D_OUT)) {
-                //
-                // memory areas may overlap, so use memmove and not memcpy!
-                //
-                // !!! This seems a slow way to do it, but there's probably
-                // not a lot that can be done as the series is expected to
-                // be in a good state for the next iteration of the body. :-/
-                //
-                memmove(
-                    SER_AT_RAW(SER_WIDE(series), series, write_index),
-                    SER_AT_RAW(SER_WIDE(series), series, read_index),
-                    (index - read_index) * SER_WIDE(series)
-                );
-                write_index += index - read_index;
-            }
-            break;
-
         case LOOP_MAP_EACH:
             // anything that's not void will be added to the result
             if (!IS_VOID(D_OUT))
@@ -646,13 +529,11 @@ static REB_R Loop_Each(REBFRM *frame_, LOOP_MODE mode)
             if (IS_VOID(D_OUT)) {
                 // Unsets "opt out" of the vote, as with ANY and ALL
             }
-            else if (IS_CONDITIONAL_FALSE(D_OUT))
+            else if (IS_FALSEY(D_OUT))
                 Init_Blank(D_CELL); // at least one false means blank result
             else if (IS_END(D_CELL) || !IS_BLANK(D_CELL))
                 Move_Value(D_CELL, D_OUT);
             break;
-        default:
-            assert(FALSE);
         }
 
         if (stop) {
@@ -710,13 +591,6 @@ skip_hidden: ;
     case LOOP_FOR_EACH:
         return R_OUT_VOID_IF_UNWRITTEN_TRUTHIFY;
 
-    case LOOP_REMOVE_EACH:
-        // Remove hole (updates tail):
-        if (write_index < index)
-            Remove_Series(series, write_index, index - write_index);
-        Init_Integer(D_OUT, index - write_index);
-        return R_OUT;
-
     case LOOP_MAP_EACH:
         Init_Block(D_OUT, Pop_Stack_Values(dsp_orig));
         return R_OUT;
@@ -730,12 +604,9 @@ skip_hidden: ;
 
         Move_Value(D_OUT, D_CELL);
         return R_OUT; // should it be like R_OUT_VOID_IF_UNWRITTEN_TRUTHIFY?
-
-    default:
-        assert(FALSE);
     }
 
-    DEAD_END;
+    DEAD_END; // all branches handled in enum switch
 }
 
 
@@ -762,13 +633,12 @@ REBNATIVE(for)
     INCLUDE_PARAMS_OF_FOR;
 
     REBCTX *context;
-    REBARR *body_copy = Copy_Body_Deep_Bound_To_New_Context(
+    Virtual_Bind_Deep_To_New_Context(
+        ARG(body), // may be updated, will still be GC safe
         &context,
-        ARG(word),
-        ARG(body)
+        ARG(word)
     );
     Init_Object(ARG(word), context); // keep GC safe
-    Init_Block(ARG(body), body_copy); // keep GC safe
 
     REBVAL *var = CTX_VAR(context, 1);
 
@@ -780,7 +650,7 @@ REBNATIVE(for)
         return Loop_Integer_Common(
             D_OUT,
             var,
-            body_copy,
+            ARG(body),
             VAL_INT64(ARG(start)),
             IS_DECIMAL(ARG(end))
                 ? (REBI64)VAL_DECIMAL(ARG(end))
@@ -793,7 +663,7 @@ REBNATIVE(for)
             return Loop_Series_Common(
                 D_OUT,
                 var,
-                body_copy,
+                ARG(body),
                 ARG(start),
                 VAL_INDEX(ARG(end)),
                 Int32(ARG(bump))
@@ -803,7 +673,7 @@ REBNATIVE(for)
             return Loop_Series_Common(
                 D_OUT,
                 var,
-                body_copy,
+                ARG(body),
                 ARG(start),
                 Int32s(ARG(end), 1) - 1,
                 Int32(ARG(bump))
@@ -812,7 +682,7 @@ REBNATIVE(for)
     }
 
     return Loop_Number_Common(
-        D_OUT, var, body_copy, ARG(start), ARG(end), ARG(bump)
+        D_OUT, var, ARG(body), ARG(start), ARG(end), ARG(bump)
     );
 
 }
@@ -927,7 +797,7 @@ REBNATIVE(forever)
 
     do {
         const REBOOL only = FALSE;
-        if (Run_Branch_Throws(D_OUT, ARG(body), only)) {
+        if (Run_Branch_Throws(D_OUT, END, ARG(body), only)) {
             REBOOL stop;
             if (Catching_Break_Or_Continue(D_OUT, &stop)) {
                 if (stop)
@@ -949,8 +819,8 @@ REBNATIVE(forever)
 //
 //      return: [<opt> any-value!]
 //          {Last body result or BREAK value, will also be void if never run}
-//      'vars [word! block!]
-//          "Word or block of words to set each time (local)"
+//      'vars [word! lit-word! block!]
+//          "Word or block of words to set each time, no new var if LIT-WORD!"
 //      data [any-series! any-context! map! blank! datatype!]
 //          "The series to traverse"
 //      body [block!]
@@ -963,22 +833,374 @@ REBNATIVE(for_each)
 }
 
 
+struct Remove_Each_State {
+    REBVAL *data;
+    REBSER *series;
+    const REBVAL *body;
+    REBCTX *context;
+    REBCNT start;
+    REB_MOLD *mo;
+};
+
+// For important reasons of semantics and performance, the REMOVE-EACH native
+// does not actually perform removals "as it goes".  It could run afoul of
+// any number of problems, including the mutable series becoming locked during
+// the iteration.  Hence the iterated series is locked, and the removals are
+// applied all at once atomically.
+//
+// However, this means that there's state which must be finalized on every
+// possible exit path...be that BREAK, THROW, FAIL, or just ordinary finishing
+// of the loop.  That finalization is done by this routine, which will clean
+// up the state and remove any indicated items.  (It is assumed that all
+// forms of exit, including raising an error, would like to apply any
+// removals indicated thus far.)
+//
+static inline REBCNT Finalize_Remove_Each(struct Remove_Each_State *res)
+{
+    assert(GET_SER_INFO(res->series, SERIES_INFO_HOLD));
+    CLEAR_SER_INFO(res->series, SERIES_INFO_HOLD);
+
+    REBCNT count = 0;
+    if (ANY_ARRAY(res->data)) {
+        REBCNT len = VAL_LEN_HEAD(res->data);
+
+        RELVAL *dest = VAL_ARRAY_AT(res->data);
+        RELVAL *src = dest;
+
+        // avoid blitting cells onto themselves by making the first thing we do
+        // to pass up all the unmarked (kept) cells.
+        //
+        while (NOT_END(src) && NOT(src->header.bits & NODE_FLAG_MARKED)) {
+            ++src;
+            ++dest;
+        }
+
+        // If we get here, then we're either at the end or all the cells from here
+        // on are going to be moving to somewhere besides the original spot
+        //
+        for (; NOT_END(dest); ++dest, ++src) {
+            while (NOT_END(src) && (src->header.bits & NODE_FLAG_MARKED)) {
+                ++src;
+                --len;
+                ++count;
+            }
+            if (IS_END(src)) {
+                TERM_ARRAY_LEN(VAL_ARRAY(res->data), len);
+                return count;
+            }
+            Blit_Cell(dest, src); // same array--rare place we can do this
+        }
+
+        // If we get here, there were no removals, and length is unchanged.
+        //
+        assert(count == 0);
+        assert(len == VAL_LEN_HEAD(res->data));
+    }
+    else if (IS_BINARY(res->data)) {
+        //
+        // If there was a BREAK, THROW, or fail() we need the remaining data
+        //
+        REBCNT orig_len = VAL_LEN_HEAD(res->data);
+        assert(res->start <= orig_len);
+        for (; res->start != orig_len; ++res->start) {
+            Append_Codepoint(
+                res->mo->series,
+                cast(REBUNI, BIN_HEAD(res->series)[res->start])
+            );
+        }
+
+        // We should have only added codepoints between 0x00 and 0xFF
+        // (This checks that.)
+        //
+        REBSER *popped = Pop_Molded_Binary(res->mo);
+
+        assert(SER_LEN(popped) <= VAL_LEN_HEAD(res->data));
+        count = VAL_LEN_HEAD(res->data) - SER_LEN(popped);
+
+        // We want to swap out the data properties of the series, so the
+        // identity of the incoming series is kept but now with different
+        // underlying data.
+        //
+        Swap_Series_Content(popped, VAL_SERIES(res->data));
+
+        Free_Series(popped); // now frees the incoming series underlying data
+    }
+    else {
+        assert(ANY_STRING(res->data));
+
+        // If there was a BREAK, THROW, or fail() we need the remaining data
+        //
+        REBCNT orig_len = VAL_LEN_HEAD(res->data);
+        assert(res->start <= orig_len);
+
+        for (; res->start != orig_len; ++res->start) {
+            Append_Codepoint(
+                res->mo->series,
+                GET_ANY_CHAR(res->series, res->start)
+            );
+        }
+
+        REBSER *popped = Pop_Molded_String(res->mo);
+
+        assert(SER_LEN(popped) <= VAL_LEN_HEAD(res->data));
+        count = VAL_LEN_HEAD(res->data) - SER_LEN(popped);
+
+        // We want to swap out the data properties of the series, so the
+        // identity of the incoming series is kept but now with different
+        // underlying data.
+        //
+        Swap_Series_Content(popped, VAL_SERIES(res->data));
+
+        Free_Series(popped); // now frees the incoming series underlying data
+    }
+
+    return count;
+}
+
+
+// For unfortunate reasons, any automatic (local) variables which change
+// state after a setjmp may be clobbered by a longjmp.  This is because they
+// might get stored in registers, and that applies to struct fields too.
+// The general way to get around this is to wrap your setjmp code in a
+// function which takes the mutated variables as a parameter set up in the
+// calling function's address space.
+//
+static REB_R Remove_Each_Core(REBFRM *frame_, struct Remove_Each_State *res)
+{
+    struct Reb_State state;
+    REBCTX *error;
+
+    PUSH_TRAP(&error, &state);
+
+    // The first time through the following code 'error' will be NULL, but...
+    // `fail` can longjmp here, so 'error' won't be NULL *if* that happens!
+
+    if (error != NULL) {
+        //
+        // Currently, if a fail() happens during the iteration, any removals
+        // which were indicated will be enacted before propagating failure.
+        //
+        Finalize_Remove_Each(res);
+
+        fail (error); // Trap happened, so no trap in effect; this propagates
+    }
+
+    // Set a bit saying we are iterating the series, which will disallow
+    // mutations (including a nested REMOVE-EACH) until completion or failure.
+    // This flag will be cleaned up by Finalize_Remove_Each(), which is run
+    // even if there is a fail().
+    //
+    SET_SER_INFO(res->series, SERIES_INFO_HOLD);
+
+    REBOOL stop = FALSE;
+    REBCNT index = res->start; // declare here, avoid longjmp clobber warnings
+
+    REBCNT len = SER_LEN(res->series); // temp read-only, this won't change
+    while (index < len && NOT(stop)) {
+        assert(res->start == index);
+
+        REBVAL *var = CTX_VAR(res->context, 1);
+        for (; NOT_END(var); ++var) {
+            if (index == len) {
+                //
+                // The second iteration here needs x = #"c" and y as void.
+                //
+                //     data: copy "abc"
+                //     remove-each [x y] data [...]
+                //
+                Init_Void(var);
+                continue; // the `for` loop setting variables
+            }
+
+            if (ANY_ARRAY(res->data))
+                Derelativize(
+                    var,
+                    VAL_ARRAY_AT_HEAD(res->data, index),
+                    VAL_SPECIFIER(res->data)
+                );
+            else if (IS_BINARY(res->data))
+                Init_Integer(var, cast(REBI64, BIN_HEAD(res->series)[index]));
+            else {
+                assert(ANY_STRING(res->data));
+                Init_Char(var, GET_ANY_CHAR(res->series, index));
+            }
+            ++index;
+        }
+
+        if (Do_Any_Array_At_Throws(D_CELL, res->body)) {
+            if (!Catching_Break_Or_Continue(D_CELL, &stop)) {
+                //
+                // A non-loop throw, we should be bubbling up.
+                //
+                DROP_TRAP_SAME_STACKLEVEL_AS_PUSH(&state);
+                Finalize_Remove_Each(res);
+                Move_Value(D_OUT, D_CELL);
+                return R_OUT_IS_THROWN;
+            }
+
+            if (stop) {
+                //
+                // BREAK - D_CELL may not be void if /WITH refinement used
+            }
+            else {
+                // CONTINUE - D_CELL may not be void if /WITH refinement used
+            }
+        }
+
+        if (ANY_ARRAY(res->data)) {
+            if (IS_VOID(D_CELL) || IS_FALSEY(D_CELL)) {
+                res->start = index;
+                continue; // keep requested, don't mark for culling
+            }
+
+            do {
+                assert(res->start <= len);
+                VAL_ARRAY_AT_HEAD(res->data, res->start)->header.bits
+                    |= NODE_FLAG_MARKED;
+                ++res->start;
+            } while (res->start != index);
+        }
+        else {
+            if (NOT(IS_VOID(D_CELL)) && IS_TRUTHY(D_CELL)) {
+                res->start = index;
+                continue; // remove requested, don't save to buffer
+            }
+
+            do {
+                assert(res->start <= len);
+                Append_Codepoint(
+                   res->mo->series,
+                   IS_BINARY(res->data)
+                       ? cast(REBUNI, BIN_HEAD(res->series)[res->start])
+                       : GET_ANY_CHAR(res->series, res->start)
+                );
+                ++res->start;
+            } while (res->start != index);
+        }
+    }
+
+    // We get here on normal completion or a BREAK
+    // THROW will return above, fail() takes the `error != NULL` branch
+
+    DROP_TRAP_SAME_STACKLEVEL_AS_PUSH(&state);
+
+    // Finalize may need to process residual data in the case of BREAK
+    // It knows this based on res.start < len
+    //
+    assert((stop && res->start <= len) || (!stop && res->start == len));
+    REBCNT removals = Finalize_Remove_Each(res);
+
+    if (stop) {
+        //
+        // !!! Should the return conventions of REMOVE-EACH honor the
+        // "loop protocol" where a broken loop returns BLANK!?
+    }
+
+    Init_Integer(D_OUT, removals);
+    return R_OUT;
+}
+
+
 //
 //  remove-each: native [
 //
-//  {Removes values for each block that returns true; returns removal count.}
+//  {Removes values for each block that returns true.}
 //
+//      return: [integer!]
+//          {Number of removed series items}
 //      'vars [word! block!]
 //          "Word or block of words to set each time (local)"
 //      data [any-series!]
-//          "The series to traverse (modified)"
+//          "The series to traverse (modified)" ; should BLANK! opt-out?
 //      body [block!]
 //          "Block to evaluate (return TRUE to remove)"
 //  ]
 //
 REBNATIVE(remove_each)
 {
-    return Loop_Each(frame_, LOOP_REMOVE_EACH);
+    INCLUDE_PARAMS_OF_REMOVE_EACH;
+
+    struct Remove_Each_State res;
+    res.data = ARG(data);
+
+    // !!! Currently there is no support for VECTOR!, or IMAGE! (what would
+    // that even *mean*?) yet these are in the ANY-SERIES! typeset.
+    //
+    if (NOT(
+        ANY_ARRAY(res.data) || ANY_STRING(res.data) || IS_BINARY(res.data)
+    )){
+        fail (res.data); // invalid arg
+    }
+
+    // Check the series for whether it is read only, in which case we should
+    // not be running a REMOVE-EACH on it.  This check for permissions applies
+    // even if the REMOVE-EACH turns out to be a no-op.
+    //
+    res.series = VAL_SERIES(res.data);
+    FAIL_IF_READ_ONLY_SERIES(res.series);
+
+    if (VAL_INDEX(res.data) >= SER_LEN(res.series)) {
+        //
+        // If index is past the series end, then there's nothing removable.
+        //
+        // !!! Should REMOVE-EACH follow the "loop conventions" where if the
+        // body never gets a chance to run, the return value is void?
+        //
+        Init_Integer(D_OUT, 0);
+        return R_OUT;
+    }
+
+    // Create a context for the loop variables, and bind the body to it.
+    // Do this before PUSH_TRAP, so that if there is any failure related to
+    // memory or a poorly formed ARG(vars) that it doesn't try to finalize
+    // the REMOVE-EACH, as `res` is not ready yet.
+    //
+    Virtual_Bind_Deep_To_New_Context(
+        ARG(body), // may be updated, will still be GC safe
+        &res.context,
+        ARG(vars)
+    );
+    Init_Object(ARG(vars), res.context); // keep GC safe
+    res.body = ARG(body);
+
+    res.start = VAL_INDEX(res.data);
+
+    REB_MOLD mold_struct;
+    if (ANY_ARRAY(res.data)) {
+        //
+        // We're going to use NODE_FLAG_MARKED on the elements of data's
+        // array for those items we wish to remove later.
+        //
+        // !!! This may not be better than pushing kept values to the data
+        // stack and then creating a precisely-sized output blob to swap as
+        // the underlying memory for the array.  (Imagine a large array from
+        // which there are many removals, and the ensuing wasted space being
+        // left behind).  But worth testing the technique of marking in case
+        // it's ever required for other scenarios.
+        //
+        TRASH_POINTER_IF_DEBUG(res.mo);
+    }
+    else {
+        // We're going to generate a new data allocation, but then swap its
+        // underlying content to back the series we were given.  (See notes
+        // above on how this might be the better way to deal with arrays too.)
+        //
+        // !!! Uses the mold buffer even for binaries, and since we know
+        // we're never going to be pushing a value bigger than 0xFF it will
+        // not require a wide string.  So the series we pull off should be
+        // byte-sized.  In a sense this is wasteful and there should be a
+        // byte-buffer-backed parallel to mold, but the logic for nesting mold
+        // stacks already exists and the mold buffer is "hot", so it's not
+        // necessarily *that* wasteful in the scheme of things.
+        //
+        CLEARS(&mold_struct);
+        res.mo = &mold_struct;
+        Push_Mold(res.mo);
+    }
+
+    // See remarks on longjmp clobbering for why another function is needed.
+    //
+    return Remove_Each_Core(frame_, &res);
 }
 
 
@@ -1034,7 +1256,7 @@ REBNATIVE(every)
 //      count [any-number! logic! blank!]
 //          "Repetitions (true loops infinitely, FALSE? doesn't run)"
 //      body [block! function!]
-//          "Block to evaluate or function to run (may be a BRANCHER)."
+//          "Block to evaluate or function to run."
 //  ]
 //
 REBNATIVE(loop)
@@ -1043,7 +1265,7 @@ REBNATIVE(loop)
 
     REBI64 count;
 
-    if (IS_CONDITIONAL_FALSE(ARG(count))) {
+    if (IS_FALSEY(ARG(count))) {
         //
         // A NONE! or LOGIC! FALSE means don't run the loop at all.
         //
@@ -1065,7 +1287,7 @@ REBNATIVE(loop)
 
     for (; count > 0; count--) {
         const REBOOL only = FALSE;
-        if (Run_Branch_Throws(D_OUT, ARG(body), only)) {
+        if (Run_Branch_Throws(D_OUT, END, ARG(body), only)) {
             REBOOL stop;
             if (Catching_Break_Or_Continue(D_OUT, &stop)) {
                 if (stop)
@@ -1115,26 +1337,25 @@ REBNATIVE(repeat)
         Init_Integer(value, Int64(value));
 
     REBCTX *context;
-    REBARR *copy = Copy_Body_Deep_Bound_To_New_Context(
+    Virtual_Bind_Deep_To_New_Context(
+        ARG(body),
         &context,
-        ARG(word),
-        ARG(body)
+        ARG(word)
     );
+    Init_Object(ARG(word), context); // keep GC safe
+
+    assert(CTX_LEN(context) == 1);
 
     REBVAL *var = CTX_VAR(context, 1);
-
-    Init_Object(ARG(word), context); // keep GC safe
-    Init_Block(ARG(body), copy); // keep GC safe
-
     if (ANY_SERIES(value)) {
         return Loop_Series_Common(
-            D_OUT, var, copy, value, VAL_LEN_HEAD(value) - 1, 1
+            D_OUT, var, ARG(body), value, VAL_LEN_HEAD(value) - 1, 1
         );
     }
 
     assert(IS_INTEGER(value));
 
-    return Loop_Integer_Common(D_OUT, var, copy, 1, VAL_INT64(value), 1);
+    return Loop_Integer_Common(D_OUT, var, ARG(body), 1, VAL_INT64(value), 1);
 }
 
 
@@ -1148,7 +1369,7 @@ inline static REB_R Loop_While_Until_Core(REBFRM *frame_, REBOOL trigger)
     skip_check:;
 
         const REBOOL only = FALSE;
-        if (Run_Branch_Throws(D_OUT, ARG(body), only)) {
+        if (Run_Branch_Throws(D_OUT, END, ARG(body), only)) {
             REBOOL stop;
             if (Catching_Break_Or_Continue(D_OUT, &stop)) {
                 if (stop)
@@ -1182,7 +1403,7 @@ inline static REB_R Loop_While_Until_Core(REBFRM *frame_, REBOOL trigger)
             goto skip_check;
 
     perform_check:;
-    } while (IS_CONDITIONAL_TRUE(D_OUT) == trigger);
+    } while (IS_TRUTHY(D_OUT) == trigger);
 
     // Though LOOP-UNTIL will always have a truthy result, LOOP-WHILE never
     // will, and needs to have the result overwritten with something TRUE?
@@ -1191,7 +1412,7 @@ inline static REB_R Loop_While_Until_Core(REBFRM *frame_, REBOOL trigger)
     if (trigger == TRUE)
         return R_BAR;
 
-    assert(IS_CONDITIONAL_TRUE(D_OUT));
+    assert(IS_TRUTHY(D_OUT));
     return R_OUT;
 }
 
@@ -1242,7 +1463,7 @@ inline static REB_R While_Until_Core(REBFRM *frame_, REBOOL trigger)
     assert(IS_END(D_OUT)); // guaranteed by the evaluator
 
     do {
-        if (Run_Branch_Throws(D_CELL, ARG(condition), only)) {
+        if (Run_Branch_Throws(D_CELL, END, ARG(condition), only)) {
             //
             // A while loop should only look for breaks and continues in its
             // body, not in its condition.  So `while [break] []` is a
@@ -1256,7 +1477,7 @@ inline static REB_R While_Until_Core(REBFRM *frame_, REBOOL trigger)
         if (IS_VOID(D_CELL))
             fail (Error_No_Return_Raw());
 
-        if (IS_CONDITIONAL_TRUE(D_CELL) != trigger) {
+        if (IS_TRUTHY(D_CELL) != trigger) {
             //
             // Successfully completed loops aren't allowed to return a
             // FALSE? value, so they get BAR! as a truthy-result if the
@@ -1265,7 +1486,7 @@ inline static REB_R While_Until_Core(REBFRM *frame_, REBOOL trigger)
             return R_OUT_VOID_IF_UNWRITTEN_TRUTHIFY;
         }
 
-        if (Run_Branch_Throws(D_OUT, ARG(body), only)) {
+        if (Run_Branch_Throws(D_OUT, D_CELL, ARG(body), only)) {
             REBOOL stop;
             if (Catching_Break_Or_Continue(D_OUT, &stop)) {
                 if (stop)
@@ -1277,6 +1498,8 @@ inline static REB_R While_Until_Core(REBFRM *frame_, REBOOL trigger)
         }
 
     } while (TRUE);
+
+    DEAD_END;
 }
 
 

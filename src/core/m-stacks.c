@@ -159,8 +159,8 @@ void Expand_Data_Stack_May_Fail(REBCNT amount)
     //
     REBVAL *end_top = DS_Movable_Base + DSP;
     assert(IS_END(end_top));
-    assert(end_top == KNOWN(ARR_TAIL(DS_Array))); // can't push RELVALs
-    assert(end_top - KNOWN(ARR_HEAD(DS_Array)) == cast(int, len_old));
+    assert(cast(RELVAL*, end_top) == ARR_TAIL(DS_Array)); // can't push RELVALs
+    assert(cast(RELVAL*, end_top) - ARR_HEAD(DS_Array) == cast(int, len_old));
 #endif
 
     // If adding in the requested amount would overflow the stack limit, then
@@ -177,7 +177,7 @@ void Expand_Data_Stack_May_Fail(REBCNT amount)
     // dereference into a single dereference in the common case, and it was
     // how R3-Alpha did it).
     //
-    DS_Movable_Base = KNOWN(ARR_HEAD(DS_Array)); // must do before using DS_TOP
+    DS_Movable_Base = cast(REBVAL*, ARR_HEAD(DS_Array)); // before using DS_TOP
 
     // We fill in the data stack with "GC safe trash" (which is void in the
     // release build, but will raise an alarm if VAL_TYPE() called on it in
@@ -268,7 +268,7 @@ void Pop_Stack_Values_Into(REBVAL *into, REBDSP dsp_start) {
 
 
 //
-//  Reify_Frame_Context_Maybe_Fulfilling: C
+//  Context_For_Frame_May_Reify_Managed: C
 //
 // A Reb_Frame does not allocate a REBSER for its frame to be used in the
 // context by default.  But one can be allocated on demand, even for a NATIVE!
@@ -278,36 +278,21 @@ void Pop_Stack_Values_Into(REBVAL *into, REBDSP dsp_start) {
 //
 // If there's already a frame this will return it, otherwise create it.
 //
-void Reify_Frame_Context_Maybe_Fulfilling(REBFRM *f) {
-    assert(Is_Any_Function_Frame(f)); // varargs reifies while still pending
+REBCTX *Context_For_Frame_May_Reify_Managed(REBFRM *f)
+{
+    assert(Is_Function_Frame(f));
+    assert(NOT(Is_Function_Frame_Fulfilling(f)));
 
     if (f->varlist != NULL) {
-        //
-        // We have our function call's args in an array, but it is not yet
-        // a context.  !!! Really this cannot reify if we're in arg gathering
-        // mode, calling MANAGE_ARRAY is illegal -- need test for that !!!
-        //
-        assert(NOT_SER_FLAG(f->varlist, ARRAY_FLAG_VARLIST));
-        SET_SER_FLAG(f->varlist, ARRAY_FLAG_VARLIST);
-
-        assert(IS_TRASH_DEBUG(ARR_AT(f->varlist, 0))); // we fill this in
-        assert(GET_SER_INFO(f->varlist, SERIES_INFO_HAS_DYNAMIC));
-    }
-    else {
-        f->varlist = Alloc_Singular_Array_Core(ARRAY_FLAG_VARLIST);
-        SET_SER_INFO(f->varlist, CONTEXT_INFO_STACK);
+        assert(GET_SER_FLAG(f->varlist, ARRAY_FLAG_VARLIST));
+        return CTX(f->varlist);
     }
 
-    REBCTX *c = CTX(f->varlist);
+    f->varlist = Alloc_Singular_Array_Core(ARRAY_FLAG_VARLIST);
+    SET_SER_INFO(f->varlist, CONTEXT_INFO_STACK); // NOT a SER_FLAG!
+    MISC(f->varlist).meta = NULL; // seen by GC, must initialize
 
-    // We do not Manage_Context, because we are reusing a word series here
-    // that has already been managed.  The arglist array was managed when
-    // created and kept alive by Mark_Call_Frames
-    //
-    INIT_CTX_KEYLIST_SHARED(c, FUNC_PARAMLIST(FRM_UNDERLYING(f)));
-    ASSERT_ARRAY_MANAGED(CTX_KEYLIST(c));
-
-    // When in ET_FUNCTION or ET_LOOKBACK, the arglist will be marked safe from
+    // When running a function frame, the arglist will be marked safe from
     // GC. It is managed because the pointer makes its way into bindings that
     // ANY-WORD! values may have, and they need to not crash.
     //
@@ -320,9 +305,7 @@ void Reify_Frame_Context_Maybe_Fulfilling(REBFRM *f) {
     VAL_RESET_HEADER(rootvar, REB_FRAME);
     rootvar->payload.any_context.varlist = f->varlist;
     rootvar->payload.any_context.phase = f->phase;
-    rootvar->extra.binding = f->binding;
-
-    SER(f->varlist)->misc.f = f;
+    INIT_BINDING(rootvar, f->binding);
 
     // A reification of a frame for native code should not allow changing
     // the values out from under it, because that could cause it to crash
@@ -331,19 +314,15 @@ void Reify_Frame_Context_Maybe_Fulfilling(REBFRM *f) {
     // running...which should not stop FRM_ARG from working in the native
     // itself, but should stop modifications from user code.
     //
+    LINK(f->varlist).keysource = NOD(f);
     if (f->flags.bits & DO_FLAG_NATIVE_HOLD)
-        SET_SER_INFO(f->varlist, SERIES_INFO_RUNNING);
+        SET_SER_INFO(f->varlist, SERIES_INFO_HOLD);
 
+    REBCTX *c = CTX(f->varlist);
+    ASSERT_ARRAY_MANAGED(CTX_KEYLIST(c));
     MANAGE_ARRAY(f->varlist);
 
-#if !defined(NDEBUG)
-    //
-    // Variadics will reify the varlist even when the data is not quite
-    // ready; these need special handling in the GC code for marking frames.
-    // By the time the function actually runs, the data should be good.
-    //
-    if (NOT(Is_Function_Frame_Fulfilling(f)))
-        ASSERT_CONTEXT(c);
+    ASSERT_CONTEXT(c);
     assert(NOT(CTX_VARS_UNAVAILABLE(c)));
-#endif
+    return c;
 }

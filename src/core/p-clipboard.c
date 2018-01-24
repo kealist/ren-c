@@ -36,26 +36,41 @@
 //
 static REB_R Clipboard_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
 {
-    REBINT result;
-    REBVAL *arg;
-    REBINT len;
-    REBSER *ser;
-
-    arg = D_ARGC > 1 ? D_ARG(2) : NULL;
+    REBVAL *arg = D_ARGC > 1 ? D_ARG(2) : NULL;
 
     REBREQ *req = Ensure_Port_State(port, RDI_CLIPBOARD);
 
     switch (action) {
-    case SYM_UPDATE:
+
+    case SYM_REFLECT: {
+        INCLUDE_PARAMS_OF_REFLECT;
+
+        UNUSED(ARG(value)); // implied by `port`
+        REBSYM property = VAL_WORD_SYM(ARG(property));
+        assert(property != 0);
+
+        switch (property) {
+        case SYM_OPEN_Q:
+            return R_FROM_BOOL(LOGICAL(req->flags & RRF_OPEN));
+
+        default:
+            break;
+        }
+
+        break; }
+
+    case SYM_ON_WAKE_UP:
         // Update the port object after a READ or WRITE operation.
         // This is normally called by the WAKE-UP function.
         arg = CTX_VAR(port, STD_PORT_DATA);
         if (req->command == RDC_READ) {
             // this could be executed twice:
             // once for an event READ, once for the CLOSE following the READ
-            if (!req->common.data) return R_BLANK;
-            len = req->actual;
-            if (GET_FLAG(req->flags, RRF_WIDE)) {
+            if (req->common.data == NULL)
+                return R_BLANK;
+
+            REBINT len = req->actual;
+            if (req->flags & RRF_WIDE) {
                 // convert to UTF8, so that it can be converted back to string!
                 Init_Binary(arg, Make_UTF8_Binary(
                     req->common.data,
@@ -94,21 +109,24 @@ static REB_R Clipboard_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         UNUSED(PAR(lines)); // handled in dispatcher
 
         // This device is opened on the READ:
-        if (!IS_OPEN(req)) {
+        if (NOT(req->flags & RRF_OPEN)) {
             if (OS_DO_DEVICE(req, RDC_OPEN))
                 fail (Error_On_Port(RE_CANNOT_OPEN, port, req->error));
         }
         // Issue the read request:
-        CLR_FLAG(req->flags, RRF_WIDE); // allow byte or wide chars
-        result = OS_DO_DEVICE(req, RDC_READ);
-        if (result < 0) fail (Error_On_Port(RE_READ_ERROR, port, req->error));
-        if (result > 0) return R_BLANK; /* pending */
+        req->flags &= ~RRF_WIDE; // allow byte or wide chars
+
+        REBINT result = OS_DO_DEVICE(req, RDC_READ);
+        if (result < 0)
+            fail (Error_On_Port(RE_READ_ERROR, port, req->error));
+        if (result > 0)
+            return R_BLANK; // pending
 
         // Copy and set the string result:
         arg = CTX_VAR(port, STD_PORT_DATA);
 
-        len = req->actual;
-        if (GET_FLAG(req->flags, RRF_WIDE)) {
+        REBINT len = req->actual;
+        if (req->flags & RRF_WIDE) {
             // convert to UTF8, so that it can be converted back to string!
             Init_Binary(arg, Make_UTF8_Binary(
                 req->common.data,
@@ -150,28 +168,28 @@ static REB_R Clipboard_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
             fail (Error_Invalid_Port_Arg_Raw(arg));
 
         // This device is opened on the WRITE:
-        if (!IS_OPEN(req)) {
+        if (NOT(req->flags & RRF_OPEN)) {
             if (OS_DO_DEVICE(req, RDC_OPEN))
                 fail (Error_On_Port(RE_CANNOT_OPEN, port, req->error));
         }
 
         // Handle /part refinement:
-        len = VAL_LEN_AT(arg);
+        REBINT len = VAL_LEN_AT(arg);
         if (REF(part) && VAL_INT32(ARG(limit)) < len)
             len = VAL_INT32(ARG(limit));
 
         // If bytes, see if we can fit it:
         if (SER_WIDE(VAL_SERIES(arg)) == 1) {
-#ifdef ARG_STRINGS_ALLOWED
+        #ifdef ARG_STRINGS_ALLOWED
             if (!All_Bytes_ASCII(VAL_BIN_AT(arg), len)) {
                 REBSER *copy = Copy_Bytes_To_Unicode(VAL_BIN_AT(arg), len);
                 Init_String(arg, copy);
             } else
                 req->common.data = VAL_BIN_AT(arg);
-#endif
+            #endif
 
             // Temp conversion:!!!
-            ser = Make_Unicode(len);
+            REBSER *ser = Make_Unicode(len);
             len = Decode_UTF8_Negative_If_Latin1(
                 UNI_HEAD(ser), VAL_BIN_AT(arg), len, FALSE
             );
@@ -179,13 +197,13 @@ static REB_R Clipboard_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
             TERM_UNI_LEN(ser, len);
             Init_String(arg, ser);
             req->common.data = cast(REBYTE*, UNI_HEAD(ser));
-            SET_FLAG(req->flags, RRF_WIDE);
+            req->flags |= RRF_WIDE;
         }
         else
         // If unicode (may be from above conversion), handle it:
         if (SER_WIDE(VAL_SERIES(arg)) == sizeof(REBUNI)) {
             req->common.data = cast(REBYTE *, VAL_UNI_AT(arg));
-            SET_FLAG(req->flags, RRF_WIDE);
+            req->flags |= RRF_WIDE;
         }
 
         // Temp!!!
@@ -195,12 +213,12 @@ static REB_R Clipboard_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
         Move_Value(CTX_VAR(port, STD_PORT_DATA), arg); // keep it GC safe
         req->actual = 0;
 
-        result = OS_DO_DEVICE(req, RDC_WRITE);
+        REBINT result = OS_DO_DEVICE(req, RDC_WRITE);
         Init_Blank(CTX_VAR(port, STD_PORT_DATA)); // GC can collect it
 
-        if (result < 0) fail (Error_On_Port(RE_WRITE_ERROR, port, req->error));
-        //if (result == DR_DONE) Init_Blank(CTX_VAR(port, STD_PORT_DATA));
-        break; }
+        if (result < 0)
+            fail (Error_On_Port(RE_WRITE_ERROR, port, req->error));
+        goto return_port; }
 
     case SYM_OPEN: {
         INCLUDE_PARAMS_OF_OPEN;
@@ -221,21 +239,20 @@ static REB_R Clipboard_Actor(REBFRM *frame_, REBCTX *port, REBSYM action)
 
         if (OS_DO_DEVICE(req, RDC_OPEN))
             fail (Error_On_Port(RE_CANNOT_OPEN, port, req->error));
-        break; }
+        goto return_port; }
 
     case SYM_CLOSE:
         OS_DO_DEVICE(req, RDC_CLOSE);
-        break;
-
-    case SYM_OPEN_Q:
-        if (IS_OPEN(req)) return R_TRUE;
-        return R_FALSE;
+        goto return_port;
 
     default:
-        fail (Error_Illegal_Action(REB_PORT, action));
+        break;
     }
 
-    Move_Value(D_OUT, D_ARG(1)); // port
+    fail (Error_Illegal_Action(REB_PORT, action));
+
+return_port:
+    Move_Value(D_OUT, D_ARG(1));
     return R_OUT;
 }
 

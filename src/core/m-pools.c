@@ -354,9 +354,9 @@ void Shutdown_Pools(void)
     GC_Kill_Series(GC_Manuals);
 
 #if !defined(NDEBUG)
-    REBSEG *seg = Mem_Pools[SER_POOL].segs;
-    for(; seg != NULL; seg = seg->next) {
-        REBSER *series = cast(REBSER*, seg + 1);
+    REBSEG *debug_seg = Mem_Pools[SER_POOL].segs;
+    for(; debug_seg != NULL; debug_seg = debug_seg->next) {
+        REBSER *series = cast(REBSER*, debug_seg + 1);
         REBCNT n;
         for (n = Mem_Pools[SER_POOL].units; n > 0; n--, series++) {
             if (IS_FREE_NODE(series))
@@ -689,7 +689,7 @@ static REBOOL Series_Data_Alloc(REBSER *s, REBCNT length) {
         // caller to manage...they do not know about the ->rest
         //
         for (n = 0; n < length; n++)
-            INIT_CELL(ARR_AT(ARR(s), n));
+            Prep_Non_Stack_Cell(ARR_AT(ARR(s), n));
 
         // !!! We should intentionally mark the overage range as not having
         // NODE_FLAG_CELL in the debug build.  Then have the series go through
@@ -705,7 +705,7 @@ static REBOOL Series_Data_Alloc(REBSER *s, REBCNT length) {
         // up front, or only on expansions?
         //
         for(; n < s->content.dynamic.rest - 1; n++) {
-            INIT_CELL(ARR_AT(ARR(s), n));
+            Prep_Non_Stack_Cell(ARR_AT(ARR(s), n));
         }
 
         // The convention is that the *last* cell in the allocated capacity
@@ -737,13 +737,13 @@ static REBOOL Series_Data_Alloc(REBSER *s, REBCNT length) {
 #if !defined(NDEBUG)
 
 //
-//  Try_Find_Containing_Series_Debug: C
+//  Try_Find_Containing_Node_Debug: C
 //
 // This debug-build-only routine will look to see if it can find what series
 // a data pointer lives in.  It returns NULL if it can't find one.  It's very
 // slow, because it has to look at all the series.  Use sparingly!
 //
-REBSER *Try_Find_Containing_Series_Debug(const void *p)
+REBNOD *Try_Find_Containing_Node_Debug(const void *p)
 {
     REBSEG *seg;
 
@@ -754,21 +754,18 @@ REBSER *Try_Find_Containing_Series_Debug(const void *p)
             if (IS_FREE_NODE(s))
                 continue;
 
-            if (s->header.bits & NODE_FLAG_CELL) { // a pairing, REBSER is REBVAL[2]
-                if ((p >= cast(void*, s)) && (p < cast(void*, s + 1))) {
-                    printf("pointer found in 'pairing' series");
-                    printf("not a real REBSER, no information available");
-                    assert(FALSE);
-                }
+            if (s->header.bits & NODE_FLAG_CELL) { // a "pairing"
+                if ((p >= cast(void*, s)) && (p < cast(void*, s + 1)))
+                    return NOD(s); // REBSER is REBVAL[2]
                 continue;
             }
 
-            if (NOT(GET_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC))) {
+            if (NOT_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC)) {
                 if (
                     p >= cast(void*, &s->content)
                     && p < cast(void*, &s->content + 1)
                 ){
-                    return s;
+                    return NOD(s);
                 }
                 continue;
             }
@@ -799,7 +796,7 @@ REBSER *Try_Find_Containing_Series_Debug(const void *p)
             if (p < cast(void*, s->content.dynamic.data)) {
                 printf("Pointer found in freed head capacity of series\n");
                 fflush(stdout);
-                return s;
+                return NOD(s);
             }
 
             if (p >= cast(void*,
@@ -808,10 +805,10 @@ REBSER *Try_Find_Containing_Series_Debug(const void *p)
             )) {
                 printf("Pointer found in freed tail capacity of series\n");
                 fflush(stdout);
-                return s;
+                return NOD(s);
             }
 
-            return s;
+            return NOD(s);
         }
     }
 
@@ -893,14 +890,14 @@ REBSER *Make_Series_Core(REBCNT capacity, REBYTE wide, REBUPT flags)
     s->guard = cast(int*, malloc(sizeof(*s->guard)));
     free(s->guard);
 
-    TRASH_POINTER_IF_DEBUG(s->link.keylist);
-    TRASH_POINTER_IF_DEBUG(s->misc.canon);
+    TRASH_POINTER_IF_DEBUG(LINK(s).trash);
+    TRASH_POINTER_IF_DEBUG(MISC(s).trash);
 
     // It's necessary to have another value in order to round out the size of
     // the pool node so pointer-aligned entries are given out, so might as well
     // make that hold a useful value--the tick count when the series was made
     //
-    s->do_count = TG_Do_Count;
+    s->tick = TG_Tick;
 #endif
 
     // The info bits must be able to implicitly terminate the `content`,
@@ -908,7 +905,7 @@ REBSER *Make_Series_Core(REBCNT capacity, REBYTE wide, REBUPT flags)
     // if the [1] slot was read.
     //
     Init_Endlike_Header(&s->info, 0); // acts as unwritable END marker
-    assert(IS_END(&s->content.values[1])); // test by using Reb_Value pointer
+    assert(IS_END(cast(RELVAL*, &s->content.values[1]))); // ^-- test that
 
     s->content.dynamic.data = NULL;
 
@@ -924,7 +921,7 @@ REBSER *Make_Series_Core(REBCNT capacity, REBYTE wide, REBUPT flags)
         // be less than a full cell's size.
         //
         assert(NOT_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC));
-        INIT_CELL(&s->content.values[0]);
+        Prep_Non_Stack_Cell(&s->content.values[0]);
     }
     else if (capacity * wide <= sizeof(s->content)) {
         assert(NOT_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC));
@@ -973,14 +970,12 @@ REBSER *Make_Series_Core(REBCNT capacity, REBYTE wide, REBUPT flags)
     // know about from the source it's running onto this series.
     //
     if (flags & SERIES_FLAG_FILE_LINE) {
-        //
-        // !!! Feature TBD.  Until then take off the flag since leaving it on
-        // and not setting the fields would crash the GC.
-        //
-        // s->link.filename = ???
-        // s->misc.line = ???;
-        //
-        CLEAR_SER_FLAG(s, SERIES_FLAG_FILE_LINE);
+        if (FS_TOP != NULL) {
+            LINK(s).file = FRM_FILE(FS_TOP);
+            MISC(s).line = FRM_LINE(FS_TOP);
+        }
+        else
+            CLEAR_SER_FLAG(s, SERIES_FLAG_FILE_LINE);
     }
 
     assert(s->info.bits & NODE_FLAG_END);
@@ -1007,15 +1002,26 @@ REBSER *Make_Series_Core(REBCNT capacity, REBYTE wide, REBUPT flags)
 // This provides an alternate mechanism for plain C code to do cleanup besides
 // handlers based on PUSH_TRAP().
 //
-REBVAL *Alloc_Pairing(REBCTX *opt_owning_frame) {
+REBVAL *Alloc_Pairing(REBFRM *opt_owning_frame) {
     REBSER *s = cast(REBSER*, Make_Node(SER_POOL)); // 2x REBVAL size
 
     REBVAL *key = cast(REBVAL*, s);
     REBVAL *paired = key + 1;
 
-    INIT_CELL(key);
-    if (opt_owning_frame) {
-        Init_Any_Context(key, REB_FRAME, opt_owning_frame);
+    Prep_Non_Stack_Cell(key);
+    if (opt_owning_frame != NULL) {
+        //
+        // !!! Currently this reifies the frame... but it would not have to do
+        // so if FRAME! could hold a non-reified REBFRM* and if Move_Value()
+        // and Derelativize() were sensitive to reifying those frames on
+        // demand.  This general concept could be used for transient contexts
+        // as well--consider it
+        //
+        Init_Any_Context(
+            key,
+            REB_FRAME,
+            Context_For_Frame_May_Reify_Managed(opt_owning_frame)
+        );
         SET_VAL_FLAGS(
             key, ANY_CONTEXT_FLAG_OWNS_PAIRED | NODE_FLAG_ROOT
         );
@@ -1029,14 +1035,14 @@ REBVAL *Alloc_Pairing(REBCTX *opt_owning_frame) {
         TRASH_CELL_IF_DEBUG(key);
     }
 
-    INIT_CELL(paired);
+    Prep_Non_Stack_Cell(paired);
     TRASH_CELL_IF_DEBUG(paired);
 
 #if !defined(NDEBUG)
     s->guard = cast(int*, malloc(sizeof(*s->guard)));
     free(s->guard);
 
-    s->do_count = TG_Do_Count;
+    s->tick = TG_Tick;
 #endif
 
     return paired;
@@ -1046,17 +1052,28 @@ REBVAL *Alloc_Pairing(REBCTX *opt_owning_frame) {
 //
 //  Manage_Pairing: C
 //
-// GC management is a one-way street in Ren-C, and the paired management
-// status is handled by bits directly in the first (or key's) REBVAL header.
-// Switching to managed mode means the key can no longer be changed--only
-// the value.
-//
-// !!! a const_Pairing_Key() accessor should help enforce the rule, only
-// allowing const access if managed.
+// The paired management status is handled by bits directly in the first (or
+// key's) REBVAL header.
 //
 void Manage_Pairing(REBVAL *paired) {
     REBVAL *key = PAIRING_KEY(paired);
     SET_VAL_FLAG(key, NODE_FLAG_MANAGED);
+}
+
+
+//
+//  Unmanage_Pairing: C
+//
+// A pairing may become unmanaged.  This is not a good idea for things like
+// the pairing used by a PAIR! value.  But pairings are used for API handles
+// which default to tying their lifetime to the currently executing frame.
+// It may be desirable to extend, shorten, or otherwise explicitly control
+// their lifetime.
+//
+void Unmanage_Pairing(REBVAL *paired) {
+    REBVAL *key = PAIRING_KEY(paired);
+    assert(GET_VAL_FLAG(key, NODE_FLAG_MANAGED));
+    CLEAR_VAL_FLAG(key, NODE_FLAG_MANAGED);
 }
 
 
@@ -1071,25 +1088,8 @@ void Free_Pairing(REBVAL *paired) {
     Free_Node(SER_POOL, series);
 
 #if !defined(NDEBUG)
-    series->do_count = TG_Do_Count;
+    series->tick = TG_Tick; // update to be tick on which node was freed
 #endif
-}
-
-
-//
-//  Swap_Underlying_Series_Data: C
-//
-void Swap_Underlying_Series_Data(REBSER *s1, REBSER *s2)
-{
-    assert(SER_WIDE(s1) == SER_WIDE(s2));
-    assert(
-        GET_SER_FLAG(s1, SERIES_FLAG_ARRAY)
-        == GET_SER_FLAG(s2, SERIES_FLAG_ARRAY)
-    );
-
-    REBSER temp = *s1;
-    *s1 = *s2;
-    *s2 = temp;
 }
 
 
@@ -1214,7 +1214,7 @@ void Expand_Series(REBSER *s, REBCNT index, REBCNT delta)
             // but when it is this will be useful.
             //
             for (index = 0; index < delta; index++)
-                INIT_CELL(ARR_AT(ARR(s), index));
+                Prep_Non_Stack_Cell(ARR_AT(ARR(s), index));
         }
     #endif
         return;
@@ -1265,7 +1265,7 @@ void Expand_Series(REBSER *s, REBCNT index, REBCNT delta)
             //
             while (delta != 0) {
                 --delta;
-                INIT_CELL(ARR_AT(ARR(s), index + delta));
+                Prep_Non_Stack_Cell(ARR_AT(ARR(s), index + delta));
             }
         }
     #endif
@@ -1375,6 +1375,54 @@ void Expand_Series(REBSER *s, REBCNT index, REBCNT delta)
 #endif
 
     assert(NOT_SER_FLAG(s, NODE_FLAG_MARKED));
+}
+
+
+//
+//  Swap_Series_Content: C
+//
+// Retain the identity of the two series but do a low-level swap of their
+// content with each other.
+//
+void Swap_Series_Content(REBSER* a, REBSER* b)
+{
+    // While the data series underlying a string may change widths over the
+    // lifetime of that string node, there's not really any reasonable case
+    // for mutating an array node into a non-array or vice versa.
+    //
+    assert(
+        GET_SER_FLAG(a, SERIES_FLAG_ARRAY)
+        == GET_SER_FLAG(b, SERIES_FLAG_ARRAY)
+    );
+
+    // There are bits in the ->info and ->header which pertain to the content,
+    // which includes whether the series is dynamic or if the data lives in
+    // the node itself, the width (right 8 bits), etc.  Note that the length
+    // of non-dynamic series lives in the header.
+
+    REBYTE a_wide = SER_WIDE(a);
+    SER_SET_WIDE(a, SER_WIDE(b));
+    SER_SET_WIDE(b, a_wide);
+
+    REBOOL a_has_dynamic = GET_SER_INFO(a, SERIES_INFO_HAS_DYNAMIC);
+    if (GET_SER_INFO(b, SERIES_INFO_HAS_DYNAMIC))
+        SET_SER_INFO(a, SERIES_INFO_HAS_DYNAMIC);
+    else
+        CLEAR_SER_INFO(a, SERIES_INFO_HAS_DYNAMIC);
+    if (a_has_dynamic)
+        SET_SER_INFO(b, SERIES_INFO_HAS_DYNAMIC);
+    else
+        CLEAR_SER_INFO(b, SERIES_INFO_HAS_DYNAMIC);
+
+    REBCNT a_len = SER_LEN(a);
+    REBCNT b_len = SER_LEN(b);
+
+    union Reb_Series_Content a_content = a->content;
+    a->content = b->content;
+    b->content = a_content;
+
+    SET_SERIES_LEN(a, b_len);
+    SET_SERIES_LEN(b, a_len);
 }
 
 
@@ -1527,7 +1575,7 @@ void GC_Kill_Series(REBSER *s)
             RELVAL *v = ARR_HEAD(ARR(s));
             if (NOT_END(v) && IS_HANDLE(v)) {
                 if (v->extra.singular == ARR(s)) {
-                    (s->misc.cleaner)(KNOWN(v));
+                    (MISC(s).cleaner)(KNOWN(v));
                 }
             }
         }
@@ -1537,7 +1585,8 @@ void GC_Kill_Series(REBSER *s)
     s->info.bits = 0; // makes it look like width is 0
 #endif
 
-    TRASH_POINTER_IF_DEBUG(s->link.keylist);
+    TRASH_POINTER_IF_DEBUG(MISC(s).trash);
+    TRASH_POINTER_IF_DEBUG(LINK(s).trash);
 
     Free_Node(SER_POOL, s);
 
@@ -1546,10 +1595,7 @@ void GC_Kill_Series(REBSER *s)
 
 #if !defined(NDEBUG)
     PG_Reb_Stats->Series_Freed++;
-
-    // Update the do count to be the count on which the series was freed
-    //
-    s->do_count = TG_Do_Count;
+    s->tick = TG_Tick; // update to be tick on which series was freed
 #endif
 }
 
@@ -1735,22 +1781,30 @@ void Manage_Series(REBSER *s)
 // with either managed or unmanaged value states for variables w/o needing
 // this test to know which it has.)
 //
-REBOOL Is_Value_Managed(const RELVAL *value)
+REBOOL Is_Value_Managed(const RELVAL *v)
 {
-    assert(!THROWN(value));
+    assert(!THROWN(v));
 
-    if (ANY_CONTEXT(value)) {
-        REBCTX *context = VAL_CONTEXT(value);
-        if (IS_ARRAY_MANAGED(CTX_VARLIST(context))) {
-            ASSERT_ARRAY_MANAGED(CTX_KEYLIST(context));
+    // Generally this is called by GC code, and that code is supposed to be
+    // tolerant of unreadable blanks in the debug build.  If a non-GC client
+    // happens to not catch the alarm in this routine, they'll catch it as
+    // soon as they try to do pretty much anything else with the value.
+    //
+    if (IS_UNREADABLE_IF_DEBUG(v))
+        return TRUE;
+
+    if (ANY_CONTEXT(v)) {
+        REBCTX *c = VAL_CONTEXT(v);
+        if (IS_ARRAY_MANAGED(CTX_VARLIST(c))) {
+            ASSERT_ARRAY_MANAGED(CTX_KEYLIST(c));
             return TRUE;
         }
-        assert(NOT(IS_ARRAY_MANAGED(CTX_KEYLIST(context)))); // !!! untrue?
+        assert(NOT(IS_ARRAY_MANAGED(CTX_KEYLIST(c)))); // !!! untrue?
         return FALSE;
     }
 
-    if (ANY_SERIES(value))
-        return IS_SERIES_MANAGED(VAL_SERIES(value));
+    if (ANY_SERIES(v))
+        return IS_SERIES_MANAGED(VAL_SERIES(v));
 
     return TRUE;
 }
@@ -1763,18 +1817,15 @@ REBOOL Is_Value_Managed(const RELVAL *value)
 // trustworthy method for "sniffing" pointers and discerning whether it is a
 // REBSER*, a REBVAL*, or a UTF-8 character string.
 //
+// During startup, Assert_Pointer_Detection_Working() checks that:
+//
+//     LEFT_8_BITS(NODE_FLAG_CELL) == 0x1
+//     LEFT_8_BITS(NODE_FLAG_END) == 0x8
+//
 enum Reb_Pointer_Detect Detect_Rebol_Pointer(const void *p) {
-    const REBYTE *bp = cast(const REBYTE*, p);
-    REBYTE left_4_bits = *bp >> 4;
+    REBYTE bp = *cast(const REBYTE*, p);
 
-#if !defined(NDEBUG)
-    REBUPT cell_flag = NODE_FLAG_CELL;
-    assert(LEFT_8_BITS(cell_flag) == 0x1);
-    REBUPT end_flag = NODE_FLAG_END;
-    assert(LEFT_8_BITS(end_flag) == 0x8);
-#endif
-
-    switch (left_4_bits) {
+    switch (bp >> 4) { // switch on the left 4 bits of the byte
     case 0:
     case 1:
     case 2:
@@ -1789,34 +1840,34 @@ enum Reb_Pointer_Detect Detect_Rebol_Pointer(const void *p) {
     // valid starting points for a UTF-8 string)
 
     case 8: // 0xb1000
-        if (*bp & 0x8)
+        if (bp & 0x8)
             return DETECTED_AS_END; // may be end cell or "endlike" header
-        if (*bp & 0x1)
+        if (bp & 0x1)
             return DETECTED_AS_VALUE; // unmanaged
         return DETECTED_AS_SERIES; // unmanaged
 
     case 9: // 0xb1001
-        if (*bp & 0x8)
+        if (bp & 0x8)
             return DETECTED_AS_END; // has to be an "endlike" header
         panic (p); // would be "marked and unmanaged", not legal
 
     case 10: // 0b1010
     case 11: // 0b1011
-        if (*bp & 0x8)
+        if (bp & 0x8)
             return DETECTED_AS_END;
-        if (*bp & 0x1)
+        if (bp & 0x1)
             return DETECTED_AS_VALUE; // managed, marked if `case 11`
         return DETECTED_AS_SERIES; // managed, marked if `case 11`
 
-    // v-- bit sequences starting with `11` are usually legal multi-byte
+    // v-- bit sequences starting with `11` are *usually* legal multi-byte
     // valid starting points for UTF-8, with only the exceptions made for
     // the illegal 192 and 193 bytes which represent freed series and trash.
 
     case 12: // 0b1100
-        if (*bp == FREED_SERIES_BYTE)
+        if (bp == FREED_SERIES_BYTE)
             return DETECTED_AS_FREED_SERIES;
 
-        if (*bp == TRASH_CELL_BYTE)
+        if (bp == TRASH_CELL_BYTE)
             return DETECTED_AS_TRASH_CELL;
 
         return DETECTED_AS_UTF8;
@@ -1831,13 +1882,169 @@ enum Reb_Pointer_Detect Detect_Rebol_Pointer(const void *p) {
 }
 
 
+//
+//  Rebol_Malloc: C
+//
+// This routine is a malloc replacement which uses REBSER data as a backing
+// store.  It returns a void* but can find a pointer to the REBSER itself,
+// and can be "Rebserized" and converted into an ordinary REBSER.
+//
+// Currently all Rebserize()'d series are byte-sized.  It would be technically
+// involved to allow other element widths, because the length/rest/bias must
+// be processed in terms of the element widths, and the underlying memory
+// must be allocated at an even multiple of that width.  Hence, Rebol_Malloc()
+// would have to be parameterized with the width and keep it in sync, -or-
+// the Rebserize() would need to undergo a reallocation and copy to a new
+// buffer to round it.  The former is undesirable and complex--with a lot
+// of continuous rounding and management of large series terminators.  The
+// latter undermines the point of Rebserize() in the first place.
+//
+// Since Rebol images currently use element widths of a 32-bit unsigned int,
+// this makes it not useful for that.  It is probably better to switch
+// images to use BINARY! series than to complicate these routines, but that
+// can be the call of whoever thinks PNG decoding is too inefficient.
+//
+void *Rebol_Malloc(size_t size)
+{
+    // The +1 is for series termination, which all series have, including
+    // binary series have (even though it might be superfluous).
+    //
+    REBSER *s = Make_Series(sizeof(REBSER*) + size + 1, sizeof(REBYTE));
+    *cast(REBSER**, BIN_HEAD(s)) = s;
+    TERM_BIN_LEN(s, sizeof(REBSER*) + size); // uninitialized data
+
+    POISON_MEMORY(BIN_HEAD(s), sizeof(REBSER*));
+
+    return BIN_HEAD(s) + sizeof(REBSER*);
+}
+
+
+//
+//  Rebol_Realloc: C
+//
+// Realloc implementation to accompany Rebol_Malloc() and Rebol_Free().
+//
+void *Rebol_Realloc(void *ptr, size_t new_size)
+{
+    if (ptr == NULL) // NULL is legal, LodePNG uses this
+        return Rebol_Malloc(new_size);
+
+    UNPOISON_MEMORY(cast(REBSER**, ptr) - 1, sizeof(REBSER*));
+
+    REBSER *s = SER(cast(void*, *(cast(REBSER**, ptr) - 1)));
+    assert(BYTE_SIZE(s));
+    assert(NOT(IS_SERIES_MANAGED(s))); // holds REBSER pointer
+
+    // Binary expansion must still account for terminator (hence the 1)
+    //
+    if (new_size > SER_REST(s) - sizeof(REBSER*) - 1)
+        Expand_Series(
+            s,
+            SER_LEN(s),
+            new_size - (SER_LEN(s) - sizeof(REBSER*) - 1)
+        );
+    TERM_BIN_LEN(s, sizeof(REBSER*) + new_size);
+
+    POISON_MEMORY(BIN_HEAD(s), sizeof(REBSER*));
+
+    return BIN_HEAD(s) + sizeof(REBSER*);
+}
+
+
+//
+//  Rebol_Free: C
+//
+// Free implementation to accompany Rebol_Malloc() and Rebol_Realloc().  An
+// alternative operation is to turn the buffer into a REBSER with Rebserize.
+//
+void Rebol_Free(void *ptr)
+{
+    if (ptr == NULL) // NULL is legal, LodePNG uses this
+        return;
+
+    UNPOISON_MEMORY(cast(REBSER**, ptr) - 1, sizeof(REBSER*));
+
+    REBSER *s = SER(cast(void*, *(cast(REBSER**, ptr) - 1)));
+    assert(BYTE_SIZE(s));
+    assert(NOT(IS_SERIES_MANAGED(s))); // holds REBSER pointer
+    Free_Series(s);
+}
+
+
+//
+//  Rebserize: C
+//
+// If a void* was allocated via Rebol_Malloc or Rebol_Realloc, then it can
+// be cheaply transitioned to being a series.  This is done by bumping the
+// "bias" to treat the embedded REBSER* at the head of the series data as
+// if it were unused capacity at the beginning of the series.
+//
+// See notes in Rebol_Malloc about why the series is byte-sized, and that
+// it would be difficult or undermine efficiencty to do otherwise.
+//
+REBSER *Rebserize(void *ptr)
+{
+    UNPOISON_MEMORY(cast(REBSER**, ptr) - 1, sizeof(REBSER*));
+
+    REBSER *s = SER(cast(void*, *(cast(REBSER**, ptr) - 1)));
+    assert(BYTE_SIZE(s));
+    assert(NOT(IS_SERIES_MANAGED(s))); // holds REBSER pointer
+
+    // Don't allow Rebol_Realloc() or Rebol_Free() of ptr after Rebserize has
+    // run; overwrite the self-referential handle that permits it.
+    //
+    TRASH_POINTER_IF_DEBUG(*cast(REBSER**, BIN_HEAD(s)));
+
+    if (GET_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC)) {
+        SER_SET_BIAS(s, sizeof(REBSER*));
+        s->content.dynamic.data += sizeof(REBSER*);
+        s->content.dynamic.rest -= sizeof(REBSER*);
+    }
+    else {
+        // Not a big series, it fits in the REBSER node itself, so just slide
+        // the data down.
+        //
+        memmove( // overlaps, can't use memcpy()
+            BIN_HEAD(s),
+            BIN_HEAD(s) + sizeof(REBSER*),
+            SER_LEN(s) - sizeof(REBSER*)
+        );
+    }
+
+    TERM_BIN_LEN(s, SER_LEN(s) - sizeof(REBSER*));
+    return s;
+}
+
+
 #if !defined(NDEBUG)
 
 //
 //  Assert_Pointer_Detection_Working: C
 //
+// Check the conditions that are required for Detect_Rebol_Pointer() and
+// Init_Endlike_Header() to work, and throw some sample cases at it to make
+// sure they give the right answer.
+//
 void Assert_Pointer_Detection_Working(void)
 {
+    REBUPT cell_flag = NODE_FLAG_CELL;
+    assert(LEFT_8_BITS(cell_flag) == 0x1);
+    REBUPT end_flag = NODE_FLAG_END;
+    assert(LEFT_8_BITS(end_flag) == 0x8);
+
+    assert(
+        SERIES_INFO_0_IS_TRUE == NODE_FLAG_NODE
+        && SERIES_INFO_1_IS_FALSE == NODE_FLAG_FREE
+        && SERIES_INFO_4_IS_TRUE == NODE_FLAG_END
+        && SERIES_INFO_7_IS_FALSE == NODE_FLAG_CELL
+    );
+    assert(
+        DO_FLAG_0_IS_TRUE == NODE_FLAG_NODE
+        && DO_FLAG_1_IS_FALSE == NODE_FLAG_FREE
+        && DO_FLAG_4_IS_TRUE == NODE_FLAG_END
+        && DO_FLAG_7_IS_FALSE == NODE_FLAG_CELL
+    );
+
     assert(Detect_Rebol_Pointer("") == DETECTED_AS_UTF8);
     assert(Detect_Rebol_Pointer("asdf") == DETECTED_AS_UTF8);
 
@@ -1845,6 +2052,7 @@ void Assert_Pointer_Detection_Working(void)
     assert(Detect_Rebol_Pointer(BLANK_VALUE) == DETECTED_AS_VALUE);
 
     DECLARE_LOCAL (trash_cell);
+    assert(IS_TRASH_DEBUG(trash_cell));
     assert(Detect_Rebol_Pointer(trash_cell) == DETECTED_AS_TRASH_CELL);
 
     DECLARE_LOCAL (end_cell);
@@ -1863,21 +2071,6 @@ void Assert_Pointer_Detection_Working(void)
     assert(Detect_Rebol_Pointer(series) == DETECTED_AS_SERIES);
     Free_Series(series);
     assert(Detect_Rebol_Pointer(series) == DETECTED_AS_FREED_SERIES);
-
-    // Sanity check the flags used for the Init_Endlike_Header trick
-    //
-    assert(
-        SERIES_INFO_0_IS_TRUE == NODE_FLAG_NODE
-        && SERIES_INFO_1_IS_FALSE == NODE_FLAG_FREE
-        && SERIES_INFO_4_IS_TRUE == NODE_FLAG_END
-        && SERIES_INFO_7_IS_FALSE == NODE_FLAG_CELL
-    );
-    assert(
-        DO_FLAG_0_IS_TRUE == NODE_FLAG_NODE
-        && DO_FLAG_1_IS_FALSE == NODE_FLAG_FREE
-        && DO_FLAG_4_IS_TRUE == NODE_FLAG_END
-        && DO_FLAG_7_IS_FALSE == NODE_FLAG_CELL
-    );
 }
 
 
@@ -1909,7 +2102,7 @@ REBCNT Check_Memory_Debug(void)
             if (GET_SER_FLAG(s, NODE_FLAG_CELL))
                 continue; // a pairing
 
-            if (NOT(GET_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC)))
+            if (NOT_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC))
                 continue; // data lives in the series node itself
 
             if (SER_REST(s) == 0)

@@ -82,7 +82,11 @@ REBSER *To_REBOL_Path(const void *p, REBCNT len, REBFLGS flags)
             ? LOGICAL(flags & PATH_OPT_UNI_SRC)
             : TRUE
     );
-    dst = ((flags & PATH_OPT_FORCE_UNI_DEST) || (unicode && Is_Wide(up, len)))
+
+    dst = (
+            (flags & PATH_OPT_FORCE_UNI_DEST)
+            || (unicode && All_Codepoints_Latin1(up, len))
+        )
         ? Make_Unicode(len + FN_PAD)
         : Make_Binary(len + FN_PAD);
 
@@ -129,7 +133,7 @@ REBSER *To_REBOL_Path(const void *p, REBCNT len, REBFLGS flags)
 //
 // Helper to above function.
 //
-REBSER *Value_To_REBOL_Path(REBVAL *val, REBOOL is_dir)
+REBSER *Value_To_REBOL_Path(const REBVAL *val, REBOOL is_dir)
 {
     assert(ANY_BINSTR(val));
     return To_REBOL_Path(
@@ -158,11 +162,7 @@ REBSER *Value_To_REBOL_Path(REBVAL *val, REBOOL is_dir)
 //
 REBSER *To_Local_Path(const void *p, REBCNT len, REBOOL unicode, REBOOL full)
 {
-    REBUNI c;
-    REBSER *dst;
-    REBCNT i = 0;
     REBCNT n = 0;
-    REBUNI *out;
     REBCHR *lpath;
     REBCNT l = 0;
     const REBYTE *bp = unicode ? NULL : cast(const REBYTE *, p);
@@ -172,11 +172,16 @@ REBSER *To_Local_Path(const void *p, REBCNT len, REBOOL unicode, REBOOL full)
         len = unicode ? Strlen_Uni(up) : LEN_BYTES(bp);
 
     // Prescan for: /c/dir = c:/dir, /vol/dir = //vol/dir, //dir = ??
-    c = unicode ? up[i] : bp[i];
+    //
+    REBCNT i = 0;
+    REBUNI c = unicode ? up[i] : bp[i];
+
+    REBSER *dst;
+    REBUNI *out;
     if (c == '/') {         // %/
         dst = Make_Unicode(len+FN_PAD);
         out = UNI_HEAD(dst);
-#ifdef TO_WINDOWS
+    #ifdef TO_WINDOWS
         i++;
         if (i < len) {
             c = unicode ? up[i] : bp[i];
@@ -197,34 +202,42 @@ REBSER *To_Local_Path(const void *p, REBCNT len, REBOOL unicode, REBOOL full)
                 i--;
             }
         }
-#endif
+    #endif
         out[n++] = OS_DIR_SEP;
     }
     else {
-        if (full) l = OS_GET_CURRENT_DIR(&lpath);
-        dst = Make_Unicode(l + len + FN_PAD); // may be longer (if lpath is encoded)
         if (full) {
-#ifdef TO_WINDOWS
+            l = OS_GET_CURRENT_DIR(&lpath);
+
+            // may be longer (if lpath is encoded)
+            //
+            dst = Make_Unicode(l + len + FN_PAD);
+
+        #ifdef TO_WINDOWS
             assert(sizeof(REBCHR) == sizeof(REBUNI));
             Append_Uni_Uni(dst, cast(const REBUNI*, lpath), l);
-#else
+        #else
             REBINT clen = Decode_UTF8_Negative_If_Latin1(
                 UNI_HEAD(dst), cast(const REBYTE*, lpath), l, FALSE
             );
             SET_SERIES_LEN(dst, abs(clen));
             //Append_Unencoded(dst, lpath);
-#endif
-            Append_Codepoint_Raw(dst, OS_DIR_SEP);
+        #endif
+            Append_Codepoint(dst, OS_DIR_SEP);
             OS_FREE(lpath);
         }
+        else
+            dst = Make_Unicode(l + len + FN_PAD);
+
         out = UNI_HEAD(dst);
         n = SER_LEN(dst);
     }
 
-    // Prescan each file segment for: . .. directory names:
-    // (Note the top of this loop always follows / or start)
+    // Prescan each file segment for: . .. directory names.  (Note the top of
+    // this loop always follows / or start).  Each iteration takes care of one
+    // segment of the path, i.e. stops after OS_DIR_SEP
+    //
     while (i < len) {
-        // each iteration takes care of one segment of the path, i.e. stops after OS_DIR_SEP
         if (full) {
             // Peek for: . ..
             c = unicode ? up[i] : bp[i];
@@ -274,7 +287,7 @@ REBSER *To_Local_Path(const void *p, REBCNT len, REBOOL unicode, REBOOL full)
 //
 // Helper to above function.
 //
-REBSER *Value_To_Local_Path(REBVAL *val, REBOOL full)
+REBSER *Value_To_Local_Path(const REBVAL *val, REBOOL full)
 {
     assert(ANY_BINSTR(val));
     return To_Local_Path(

@@ -59,7 +59,7 @@ struct Reb_Array {
 // them type incompatible for most purposes, some operations require treating
 // one kind of pointer as the other (and they are both Reb_Series)
 //
-#if defined(__cplusplus) && __cplusplus >= 201103L
+#if !defined(NDEBUG) && defined(CPLUSPLUS_11)
     template <class T>
     inline REBARR *ARR(T *p) {
         static_assert(
@@ -68,10 +68,19 @@ struct Reb_Array {
             || std::is_same<T, REBSER>::value,
             "ARR works on: void*, REBNOD*, REBSER*"
         );
-        REBSER *s = cast(REBSER*, p);
-        assert(NOT_SER_FLAG(s, NODE_FLAG_FREE));
-        assert(ALL_SER_FLAGS(s, NODE_FLAG_NODE | SERIES_FLAG_ARRAY));
-        return cast(REBARR*, s);
+
+        // This is only in unoptimized builds, so code it as carefully as
+        // possible...no local variables, use reinterpret_cast and not cast(),
+        // and test bit flags all at once.
+        // 
+        assert(
+            (NODE_FLAG_NODE | SERIES_FLAG_ARRAY)
+            == (reinterpret_cast<REBSER*>(p)->header.bits & (
+                NODE_FLAG_NODE | SERIES_FLAG_ARRAY // good!
+                | NODE_FLAG_FREE | NODE_FLAG_CELL | NODE_FLAG_END // bad!
+            ))
+        );
+        return reinterpret_cast<REBARR*>(p);
     }
 #else
     #define ARR(p) \
@@ -87,16 +96,16 @@ struct Reb_Array {
 // valid for writing a full REBVAL.
 
 inline static RELVAL *ARR_AT(REBARR *a, REBCNT n)
-    { return SER_AT(RELVAL, SER(a), (n)); }
+    { return SER_AT(RELVAL, cast(REBSER*, a), n); }
 
 inline static RELVAL *ARR_HEAD(REBARR *a)
-    { return SER_HEAD(RELVAL, SER(a)); }
+    { return SER_HEAD(RELVAL, cast(REBSER*, a)); }
 
 inline static RELVAL *ARR_TAIL(REBARR *a)
-    { return SER_TAIL(RELVAL, SER(a)); }
+    { return SER_TAIL(RELVAL, cast(REBSER*, a)); }
 
 inline static RELVAL *ARR_LAST(REBARR *a)
-    { return SER_LAST(RELVAL, SER(a)); }
+    { return SER_LAST(RELVAL, cast(REBSER*, a)); }
 
 // As with an ordinary REBSER, a REBARR has separate management of its length
 // and its terminator.  Many routines seek to choose the precise moment to
@@ -189,7 +198,7 @@ inline static void Deep_Freeze_Array(REBARR *a) {
     Protect_Series(
         SER(a),
         0, // start protection at index 0
-        FLAGIT(PROT_DEEP) | FLAGIT(PROT_SET) | FLAGIT(PROT_FREEZE)
+        PROT_DEEP | PROT_SET | PROT_FREEZE
     );
     Uncolor_Array(a);
 }
@@ -215,7 +224,7 @@ inline static REBARR *Make_Array_Core(REBCNT capacity, REBUPT flags)
 
     assert(
         capacity <= 1
-            ? NOT(GET_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC))
+            ? NOT_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC)
             : GET_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC)
     );
 
@@ -226,6 +235,33 @@ inline static REBARR *Make_Array_Core(REBCNT capacity, REBUPT flags)
 
 #define Make_Array(capacity) \
     Make_Array_Core((capacity), SERIES_FLAG_FILE_LINE)
+
+// !!! Currently, many bits of code that make copies don't specify if they are
+// copying an array to turn it into a paramlist or varlist, or to use as the
+// kind of array the use might see.  If we used plain Make_Array() then it
+// would add a flag saying there were line numbers available, which may
+// compete with the usage of the ->misc and ->link fields of the series node
+// for internal arrays.
+//
+inline static REBARR *Make_Array_For_Copy(
+    REBCNT capacity,
+    REBFLGS flags,
+    REBARR *original
+){
+    if (
+        (flags & SERIES_FLAG_FILE_LINE)
+        && original != NULL
+        && GET_SER_FLAG(original, SERIES_FLAG_FILE_LINE)
+    ){
+        REBARR *a = Make_Array_Core(capacity, 0);
+        LINK(a).file = LINK(original).file;
+        MISC(a).line = MISC(original).line;
+        SET_SER_FLAG(a, SERIES_FLAG_FILE_LINE);
+        return a;
+    }
+
+    return Make_Array_Core(capacity, flags);
+}
 
 
 // A singular array is specifically optimized to hold *one* value in a REBSER
@@ -293,11 +329,29 @@ inline static REBARR *Alloc_Singular_Array_Core(REBUPT flags) {
         VAL_ARRAY(v), VAL_INDEX(v), VAL_SPECIFIER(v), 0)
 
 #define Copy_Array_At_Shallow(a,i,s) \
-    Copy_Array_At_Extra_Shallow((a), (i), (s), 0)
+    Copy_Array_At_Extra_Shallow((a), (i), (s), 0, SERIES_MASK_NONE)
 
 #define Copy_Array_Extra_Shallow(a,s,e) \
-    Copy_Array_At_Extra_Shallow((a), 0, (s), (e))
+    Copy_Array_At_Extra_Shallow((a), 0, (s), (e), SERIES_MASK_NONE)
 
+// See TS_NOT_COPIED for the default types excluded from being deep copied
+//
+inline static REBARR* Copy_Array_At_Extra_Deep_Managed(
+    REBARR *original,
+    REBCNT index,
+    REBSPC *specifier,
+    REBCNT extra
+){
+    return Copy_Array_Core_Managed(
+        original,
+        index, // at
+        specifier,
+        ARR_LEN(original), // tail
+        extra, // extra
+        SERIES_MASK_NONE, // no SERIES_FLAG_FILE_LINE by default
+        TS_SERIES & ~TS_NOT_COPIED // types
+    );
+}
 
 #define Free_Array(a) \
     Free_Series(SER(a))
@@ -310,29 +364,42 @@ inline static REBARR *Alloc_Singular_Array_Core(REBUPT flags) {
 //
 //=////////////////////////////////////////////////////////////////////////=//
 //
-// See INIT_SPECIFIC and INIT_RELATIVE in %sys-bind.h
+// See %sys-bind.h
 //
 
 #define EMPTY_BLOCK \
     ROOT_EMPTY_BLOCK
 
 #define EMPTY_ARRAY \
-    VAL_ARRAY(ROOT_EMPTY_BLOCK)
+    PG_Empty_Array // Note: initialized from VAL_ARRAY(ROOT_EMPTY_BLOCK)
 
 #define EMPTY_STRING \
     ROOT_EMPTY_STRING
 
-inline static REBSPC* AS_SPECIFIER(REBCTX *context) {
-    return cast(REBSPC*, context);
+inline static REBSPC* AS_SPECIFIER(void *p) {
+    assert(p != NULL);
+    REBSPC *specifier = cast(REBSPC*, p);
+
+#if !defined(NDEBUG)
+    if (specifier->header.bits & NODE_FLAG_CELL) {
+        REBFRM *f = cast(REBFRM*, specifier);
+        assert(f->eval_type == REB_FUNCTION);
+    }
+    else if (NOT(specifier->header.bits & ARRAY_FLAG_VARLIST)) {
+        assert(specifier == SPECIFIED);
+    }
+#endif
+
+    return specifier;
 }
 
 inline static REBSPC *VAL_SPECIFIER(const REBVAL *v) {
-    assert(ANY_ARRAY(v));
+    assert(VAL_TYPE(v) == REB_0_REFERENCE || ANY_ARRAY(v));
     return AS_SPECIFIER(VAL_SPECIFIC(v));
 }
 
 inline static void INIT_VAL_ARRAY(RELVAL *v, REBARR *a) {
-    v->extra.binding = (REBARR*)SPECIFIED; // !!! cast() complains, investigate
+    INIT_BINDING(v, UNBOUND);
     v->payload.any_series.series = SER(a);
 }
 

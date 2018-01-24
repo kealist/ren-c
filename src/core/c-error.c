@@ -81,7 +81,7 @@ void Assert_State_Balanced_Debug(
     struct Reb_State *s,
     const char *file,
     int line
-) {
+){
     if (s->dsp != DSP) {
         printf(
             "DS_PUSH()x%d without DS_POP/DS_DROP\n",
@@ -188,7 +188,7 @@ REBOOL Trapped_Helper_Halted(struct Reb_State *s)
     // accumulated in the collect buffer.
     //
     if (ARR_LEN(BUF_COLLECT) != 0)
-        Collect_Keys_End(NULL); // !!! No binder, review implications
+        Collect_End(NULL); // !!! No binder, review implications
 
     // Free any manual series that were extant at the time of the error
     // (that were created since this PUSH_TRAP started).  This includes
@@ -254,9 +254,7 @@ ATTRIBUTE_NO_RETURN void Fail_Core(const void *p)
 
     switch (Detect_Rebol_Pointer(p)) {
     case DETECTED_AS_UTF8: {
-        DECLARE_LOCAL (string);
-        Init_String(string, Make_UTF8_May_Fail(cast(const char*, p)));
-        error = Error(RE_USER, string, END);
+        error = Error_User(cast(const char*, p));
         break; }
 
     case DETECTED_AS_SERIES: {
@@ -268,7 +266,7 @@ ATTRIBUTE_NO_RETURN void Fail_Core(const void *p)
 
     case DETECTED_AS_VALUE: {
         const REBVAL *v = cast(const REBVAL*, p);
-        error = Error(RE_INVALID_ARG, v, END);
+        error = Error_Invalid_Arg_Raw(v);
         break; }
 
     default:
@@ -277,19 +275,6 @@ ATTRIBUTE_NO_RETURN void Fail_Core(const void *p)
 
     ASSERT_CONTEXT(error);
     assert(CTX_TYPE(error) == REB_ERROR);
-
-#if !defined(NDEBUG)
-    //
-    // All calls to Fail_Core should originate from the `fail` macro,
-    // which in the debug build sets TG_Erroring_C_File and TG_Erroring_C_Line.
-    // Any error creations as arguments to that fail should have picked
-    // it up, and we now need to NULL it out so other Make_Error calls
-    // that are not inside of a fail invocation don't get confused and
-    // have the wrong information
-    //
-    assert(TG_Erroring_C_File != NULL);
-    TG_Erroring_C_File = NULL;
-#endif
 
     // If we raise the error we'll lose the stack, and if it's an early
     // error we always want to see it (do not use ATTEMPT or TRY on
@@ -313,8 +298,10 @@ ATTRIBUTE_NO_RETURN void Fail_Core(const void *p)
     //
     REBFRM *f = FS_TOP;
     while (f != Saved_State->frame) {
-        if (Is_Any_Function_Frame(f))
-            Drop_Function_Args_For_Frame_Core(f, FALSE); // don't drop chunks
+        if (Is_Function_Frame(f)) {
+            const REBOOL drop_chunks = FALSE;
+            Drop_Function_Core(f, drop_chunks);
+        }
 
         // See notes in Do_Va_Core() about how it is required by C standard
         // to call va_end() after va_start().  If we longjmp past the point
@@ -325,7 +312,7 @@ ATTRIBUTE_NO_RETURN void Fail_Core(const void *p)
             va_end(*f->source.vaptr);
 
         REBFRM *prior = f->prior;
-        Drop_Frame_Core(f);
+        Abort_Frame_Core(f); // will call va_end() if variadic frame
         f = prior;
     }
 
@@ -352,7 +339,7 @@ REBCNT Stack_Depth(void)
 
     REBFRM *f = FS_TOP;
     while (f) {
-        if (Is_Any_Function_Frame(f))
+        if (Is_Function_Frame(f))
             if (NOT(Is_Function_Frame_Fulfilling(f))) {
                 //
                 // We only count invoked functions (not group or path
@@ -479,95 +466,48 @@ void Set_Location_Of_Error(
         //
         // Only invoked functions (not pending functions, groups, etc.)
         //
-        if (NOT(Is_Any_Function_Frame(f)))
+        if (NOT(Is_Function_Frame(f)))
             continue;
         if (Is_Function_Frame_Fulfilling(f))
             continue;
 
         DS_PUSH_TRASH;
-        Init_Word(DS_TOP, FRM_LABEL(f));
+        Get_Frame_Label_Or_Blank(DS_TOP, f);
     }
     Init_Block(&vars->where, Pop_Stack_Values(dsp_orig));
 
     // Nearby location of the error.  Reify any valist that is running,
     // so that the error has an array to present.
     //
-    if (FRM_IS_VALIST(where)) {
-        const REBOOL truncated = TRUE;
-        Reify_Va_To_Array_In_Frame(where, truncated);
-    }
+    Init_Near_For_Frame(&vars->nearest, where);
 
-    // Get at most 6 values out of the array.  Ideally 3 before and after
-    // the error point.  If truncating either the head or tail of the
-    // values, put ellipses.
-
-    REBINT start = FRM_INDEX(where) - 3;
-    if (start < 0) {
-        DS_PUSH_TRASH;
-        Init_Word(DS_TOP, Canon(SYM_ELLIPSIS));
-
-        start = 0;
-    }
-
-    REBCNT count = 0;
-    RELVAL *item = ARR_AT(FRM_ARRAY(where), start);
-    while (NOT_END(item) && count++ < 6) {
-        DS_PUSH_RELVAL(item, where->specifier);
-        if (count == FRM_INDEX(where) - start) {
+    // Try to fill in the file and line information of the error from the
+    // stack, looking for arrays with SERIES_FLAG_FILE_LINE.
+    //
+    f = where;
+    for (; f != NULL; f = f->prior) {
+        if (FRM_IS_VALIST(f)) {
             //
-            // Leave a marker at the point of the error (currently `??`)
+            // !!! We currently skip any calls from C (e.g. rebDo()) and look
+            // for calls from Rebol files for the file and line.  However,
+            // rebDo() might someday supply its C code __FILE__ and __LINE__,
+            // which might be interesting to put in the error instead.
             //
-            // Note: something like `=>ERROR=>` would be better, but have to
-            // insert a today-legal WORD!
-            //
-            DS_PUSH_TRASH;
-            Init_Word(DS_TOP, Canon(SYM__Q_Q));
+            continue;
         }
-        ++item;
+        if (NOT_SER_FLAG(f->source.array, SERIES_FLAG_FILE_LINE))
+            continue;
+        break;
     }
+    if (f != NULL) {
+        REBSTR *file = LINK(f->source.array).file;
+        REBUPT line = MISC(f->source.array).line;
 
-    if (NOT_END(item)) {
-        DS_PUSH_TRASH;
-        Init_Word(DS_TOP, Canon(SYM_ELLIPSIS));
-    }
-
-    Init_Block(&vars->nearest, Pop_Stack_Values(dsp_orig));
-
-#if !defined(NDEBUG)
-    if (TG_Erroring_C_File) {
-        //
-        // !!! Note that a WORD! is used because FILE! strings cannot be
-        // interned at this time, and the general mechanism for storing
-        // filenames in usermode blocks wants to avoid generating a lot
-        // of copies of the same string, given that the total number of
-        // files one is working with is probably a limited set.
-        //
-        Init_Word(
-            &vars->file,
-            Intern_UTF8_Managed(
-                cb_cast(TG_Erroring_C_File), strlen(TG_Erroring_C_File)
-            )
-        );
-        Init_Integer(&vars->line, TG_Erroring_C_Line);
-    }
-    else
-#endif
-    { // ^-- mind the ELSE
-        // Try to fill in the file and line information of the error from the
-        // stack, looking for arrays with SERIES_FLAG_FILE_LINE.
-        //
-        f = where;
-        for (; f != NULL; f = f->prior) {
-            if (FRM_IS_VALIST(f))
-                continue;
-            if (NOT(GET_SER_FLAG(f->source.array, SERIES_FLAG_FILE_LINE)))
-                continue;
-            break;
-        }
-        if (f != NULL) {
-            Init_Word(&vars->file, SER(f->source.array)->link.filename);
-            Init_Integer(&vars->line, SER(f->source.array)->misc.line);
-        }
+        REBSYM file_sym = STR_SYMBOL(file);
+        if (file_sym != SYM___ANONYMOUS__)
+            Init_Word(&vars->file, file);
+        if (line != 0)
+            Init_Integer(&vars->line, line);
     }
 }
 
@@ -983,10 +923,8 @@ REBCTX *Make_Error_Managed_Core(REBCNT code, va_list *vaptr)
                     arg = BLANK_VALUE;
                 #else
                     printf(
-                        "too few args passed for error code %d at %s line %d",
-                        cast(int, code),
-                        TG_Erroring_C_File ? TG_Erroring_C_File : "<unknown>",
-                        TG_Erroring_C_File ? TG_Erroring_C_Line : -1
+                        "too few args passed for error code %d\n",
+                        cast(int, code)
                     );
                     assert(FALSE);
 
@@ -996,7 +934,7 @@ REBCTX *Make_Error_Managed_Core(REBCNT code, va_list *vaptr)
                 }
 
             #if !defined(NDEBUG)
-                if (GET_VAL_FLAG(arg, VALUE_FLAG_RELATIVE)) {
+                if (IS_RELATIVE(cast(const RELVAL*, arg))) {
                     //
                     // Make_Error doesn't have any way to pass in a specifier,
                     // so only specific values should be used.
@@ -1092,6 +1030,20 @@ REBCTX *Error(REBCNT num, ... /* REBVAL *arg1, REBVAL *arg2, ... */)
 
 
 //
+//  Error_User: C
+//
+// Simple error constructor from a string (historically this was called a
+// "user error" since MAKE ERROR! of a STRING! would produce them in usermode
+// without any error template in %errors.r)
+//
+REBCTX *Error_User(const char *str) {
+    DECLARE_LOCAL (message);
+    Init_String(message, Make_UTF8_May_Fail(cb_cast(str)));
+    return Error(RE_USER, message, END);
+}
+
+
+//
 //  Error_Lookback_Quote_Too_Late: C
 //
 REBCTX *Error_Lookback_Quote_Too_Late(const RELVAL *word, REBSPC *specifier) {
@@ -1100,7 +1052,7 @@ REBCTX *Error_Lookback_Quote_Too_Late(const RELVAL *word, REBSPC *specifier) {
     DECLARE_LOCAL (specific);
     Derelativize(specific, word, specifier);
 
-    fail (Error_Enfix_Quote_Late_Raw(specific));
+    return Error_Enfix_Quote_Late_Raw(specific);
 }
 
 
@@ -1112,10 +1064,10 @@ REBCTX *Error_Lookback_Quote_Too_Late(const RELVAL *word, REBSPC *specifier) {
 // corresponding to refinements must be canonized to either TRUE or FALSE
 // by these specializations, because that's what the called function expects.
 //
-REBCTX *Error_Non_Logic_Refinement(REBFRM *f) {
+REBCTX *Error_Non_Logic_Refinement(const RELVAL *param, const REBVAL *arg) {
     DECLARE_LOCAL (word);
-    Init_Word(word, VAL_PARAM_SPELLING(f->param));
-    fail (Error_Non_Logic_Refine_Raw(word, Type_Of(f->arg)));
+    Init_Word(word, VAL_PARAM_SPELLING(param));
+    return Error_Non_Logic_Refine_Raw(word, Type_Of(arg));
 }
 
 
@@ -1141,17 +1093,17 @@ REBCTX *Error_Bad_Func_Def(const REBVAL *spec, const REBVAL *body)
 //
 //  Error_No_Arg: C
 //
-REBCTX *Error_No_Arg(REBSTR *label, const RELVAL *param)
+REBCTX *Error_No_Arg(REBFRM *f, const RELVAL *param)
 {
     assert(IS_TYPESET(param));
 
     DECLARE_LOCAL (param_word);
     Init_Word(param_word, VAL_PARAM_SPELLING(param));
 
-    DECLARE_LOCAL (label_word);
-    Init_Word(label_word, label);
+    DECLARE_LOCAL (label);
+    Get_Frame_Label_Or_Blank(label, f);
 
-    return Error_No_Arg_Raw(label_word, param_word);
+    return Error_No_Arg_Raw(label, param_word);
 }
 
 
@@ -1176,6 +1128,48 @@ REBCTX *Error_No_Memory(REBCNT bytes)
 
     Init_Integer(bytes_value, bytes);
     return Error_No_Memory_Raw(bytes_value);
+}
+
+
+//
+//  Error_No_Relative: C
+//
+REBCTX *Error_No_Relative_Core(const RELVAL *any_word)
+{
+    DECLARE_LOCAL (unbound);
+    Init_Any_Word(
+        unbound,
+        VAL_TYPE(any_word),
+        VAL_WORD_SPELLING(any_word)
+    );
+
+    return Error_No_Relative_Raw(unbound);
+}
+
+
+//
+//  Error_Not_Varargs: C
+//
+REBCTX *Error_Not_Varargs(
+    REBFRM *f,
+    const RELVAL *param,
+    enum Reb_Kind kind
+){
+    assert(GET_VAL_FLAG(param, TYPESET_FLAG_VARIADIC));
+    assert(kind != REB_VARARGS);
+
+    // Since the "types accepted" are a lie (an [integer! <...>] takes
+    // VARARGS! when fulfilled in a frame directly, not INTEGER!) then
+    // an "honest" parameter has to be made to give the error.
+    //
+    DECLARE_LOCAL (honest_param);
+    Init_Typeset(
+        honest_param,
+        FLAGIT_KIND(REB_VARARGS), // actually expected
+        VAL_PARAM_SPELLING(param)
+    );
+
+    return Error_Arg_Type(f, honest_param, kind);
 }
 
 
@@ -1218,20 +1212,20 @@ REBCTX *Error_Bad_Func_Def_Core(const RELVAL *item, REBSPC *specifier)
 // by the error handling).  See the remarks about the state of f->refine in
 // the Reb_Frame definition.
 //
-REBCTX *Error_Bad_Refine_Revoke(REBFRM *f)
+REBCTX *Error_Bad_Refine_Revoke(const RELVAL *param, const REBVAL *arg)
 {
-    assert(IS_TYPESET(f->param));
+    assert(IS_TYPESET(param));
 
     DECLARE_LOCAL (param_name);
-    Init_Word(param_name, VAL_PARAM_SPELLING(f->param));
+    Init_Word(param_name, VAL_PARAM_SPELLING(param));
 
-    while (VAL_PARAM_CLASS(f->param) != PARAM_CLASS_REFINEMENT)
-        --f->param;
+    while (VAL_PARAM_CLASS(param) != PARAM_CLASS_REFINEMENT)
+        --param;
 
     DECLARE_LOCAL (refine_name);
-    Init_Refinement(refine_name, VAL_PARAM_SPELLING(f->param));
+    Init_Refinement(refine_name, VAL_PARAM_SPELLING(param));
 
-    if (IS_VOID(f->arg)) // was void and shouldn't have been
+    if (IS_VOID(arg)) // was void and shouldn't have been
         return Error_Bad_Refine_Revoke_Raw(refine_name, param_name);
 
     // wasn't void and should have been
@@ -1248,21 +1242,6 @@ REBCTX *Error_No_Value_Core(const RELVAL *target, REBSPC *specifier) {
     Derelativize(specified, target, specifier);
 
     return Error_No_Value_Raw(specified);
-}
-
-
-//
-//  Error_Partial_Lookback: C
-//
-REBCTX *Error_Partial_Lookback(REBFRM *f)
-{
-    DECLARE_LOCAL (label);
-    Init_Word(label, FRM_LABEL(f));
-
-    DECLARE_LOCAL (param_name);
-    Init_Word(param_name, VAL_PARAM_SPELLING(f->param));
-
-    return Error_Partial_Lookback_Raw(label, param_name);
 }
 
 
@@ -1373,7 +1352,7 @@ REBCTX *Error_Unexpected_Type(enum Reb_Kind expected, enum Reb_Kind actual)
 // a type different than the arg given (which had `arg_type`)
 //
 REBCTX *Error_Arg_Type(
-    REBSTR *label,
+    REBFRM *f,
     const RELVAL *param,
     enum Reb_Kind kind
 ) {
@@ -1382,8 +1361,8 @@ REBCTX *Error_Arg_Type(
     DECLARE_LOCAL (param_word);
     Init_Word(param_word, VAL_PARAM_SPELLING(param));
 
-    DECLARE_LOCAL (label_word);
-    Init_Word(label_word, label);
+    DECLARE_LOCAL (label);
+    Get_Frame_Label_Or_Blank(label, f);
 
     if (kind != REB_MAX_VOID) {
         assert(kind != REB_0);
@@ -1391,7 +1370,7 @@ REBCTX *Error_Arg_Type(
         assert(IS_DATATYPE(datatype));
 
         return Error_Expect_Arg_Raw(
-            label_word,
+            label,
             datatype,
             param_word
         );
@@ -1401,7 +1380,7 @@ REBCTX *Error_Arg_Type(
     // to check it.  Since Get_Type() will fail, use another error.
     //
     return Error_Arg_Required_Raw(
-        label_word,
+        label,
         param_word
     );
 }
@@ -1410,16 +1389,16 @@ REBCTX *Error_Arg_Type(
 //
 //  Error_Bad_Return_Type: C
 //
-REBCTX *Error_Bad_Return_Type(REBSTR *label, enum Reb_Kind kind) {
-    DECLARE_LOCAL (label_word);
-    Init_Word(label_word, label);
+REBCTX *Error_Bad_Return_Type(REBFRM *f, enum Reb_Kind kind) {
+    DECLARE_LOCAL (label);
+    Get_Frame_Label_Or_Blank(label, f);
 
     if (kind == REB_MAX_VOID)
-        return Error_Needs_Return_Value_Raw(label_word);
+        return Error_Needs_Return_Value_Raw(label);
 
     REBVAL *datatype = Get_Type(kind);
     assert(IS_DATATYPE(datatype));
-    return Error_Bad_Return_Type_Raw(label_word, datatype);
+    return Error_Bad_Return_Type_Raw(label, datatype);
 }
 
 
@@ -1446,9 +1425,9 @@ REBCTX *Error_Cannot_Reflect(enum Reb_Kind type, const REBVAL *arg)
 //
 REBCTX *Error_On_Port(REBCNT errnum, REBCTX *port, REBINT err_code)
 {
+    FAIL_IF_BAD_PORT(port);
+
     REBVAL *spec = CTX_VAR(port, STD_PORT_SPEC);
-    if (!IS_OBJECT(spec))
-        fail (Error_Invalid_Port_Raw());
 
     REBVAL *val = VAL_CONTEXT_VAR(spec, STD_PORT_SPEC_HEAD_REF); // informative
     if (IS_BLANK(val))
@@ -1474,27 +1453,29 @@ int Exit_Status_From_Value(REBVAL *value)
     assert(!THROWN(value));
 
     if (IS_INTEGER(value)) {
-        // Fairly obviously, an integer should return an integer
-        // result.  But Rebol integers are 64 bit and signed, while
-        // exit statuses don't go that large.
+        //
+        // Fairly obviously, an integer should return an integer result.
+        // But Rebol integers are 64 bit and signed, while exit statuses don't
+        // go that large.
         //
         return VAL_INT32(value);
     }
     else if (IS_VOID(value) || IS_BLANK(value)) {
-        // An unset would happen with just QUIT or EXIT and no /WITH,
-        // so treating that as a 0 for success makes sense.  A NONE!
-        // seems like nothing to report as well, for instance:
         //
-        //     exit/with if badthing [badthing-code]
+        // An void would happen with just QUIT or EXIT and no /WITH, so
+        // treating that as a 0 for success makes sense.  A blank could also
+        // make sense as success.
+        //
+        //     exit/with any [bad-code-a | bad-code-b]
         //
         return 0;
     }
     else if (IS_ERROR(value)) {
+        //
         // Rebol errors do have an error number in them, and if your
         // program tries to return a Rebol error it seems it wouldn't
         // hurt to try using that.  They may be out of range for
-        // platforms using byte-sized error codes, however...but if
-        // that causes bad things OS_EXIT() should be graceful about it.
+        // platforms using byte-sized error codes, however...
         //
         return VAL_ERR_NUM(value);
     }
@@ -1653,7 +1634,8 @@ void Trap_Security(REBCNT flag, REBSTR *sym, REBVAL *value)
         }
         fail (Error_Security_Raw(value));
     }
-    else if (flag == SEC_QUIT) OS_EXIT(101);
+    else if (flag == SEC_QUIT)
+        exit(101);
 }
 
 
@@ -1674,18 +1656,6 @@ void Check_Security(REBSTR *sym, REBCNT policy, REBVAL *value)
 
 
 //
-//  Make_OS_Error: C
-//
-void Make_OS_Error(REBVAL *out, int errnum)
-{
-    REBCHR str[100];
-
-    OS_FORM_ERROR(errnum, str, 100);
-    Init_String(out, Copy_OS_Str(str, OS_STRLEN(str)));
-}
-
-
-//
 //  Find_Next_Error_Base_Code: C
 //
 // Find in system/catalog/errors the next error base (used by extensions)
@@ -1696,4 +1666,111 @@ REBINT Find_Next_Error_Base_Code(void)
     if (CTX_LEN(categories) > RE_USER / RE_CATEGORY_SIZE)
         fail (Error_Out_Of_Error_Numbers_Raw());
     return (CTX_LEN(categories) - 1) * RE_CATEGORY_SIZE;
+}
+
+
+// Limited molder (used, e.g., for errors)
+//
+static void Mold_Value_Limit(REB_MOLD *mo, RELVAL *v, REBCNT len)
+{
+    REBCNT start = SER_LEN(mo->series);
+    Mold_Value(mo, v);
+
+    if (SER_LEN(mo->series) - start > len) {
+        SET_SERIES_LEN(mo->series, start + len);
+        Append_Unencoded(mo->series, "...");
+    }
+}
+
+
+//
+//  MF_Error: C
+//
+void MF_Error(REB_MOLD *mo, const RELVAL *v, REBOOL form)
+{
+    // Protect against recursion. !!!!
+    //
+    if (NOT(form)) {
+        MF_Context(mo, v, FALSE);
+        return;
+    }
+
+    REBCTX *error = VAL_CONTEXT(v);
+    ERROR_VARS *vars = ERR_VARS(error);
+
+    // Form: ** <type> Error:
+    if (IS_BLANK(&vars->type))
+        Emit(mo, "** S", RM_ERROR_LABEL);
+    else {
+        assert(IS_WORD(&vars->type));
+        Emit(mo, "** W S", &vars->type, RM_ERROR_LABEL);
+    }
+
+    // Append: error message ARG1, ARG2, etc.
+    if (IS_BLOCK(&vars->message))
+        Form_Array_At(mo, VAL_ARRAY(&vars->message), 0, error);
+    else if (IS_STRING(&vars->message))
+        Form_Value(mo, &vars->message);
+    else
+        Append_Unencoded(mo->series, RM_BAD_ERROR_FORMAT);
+
+    // Form: ** Where: function
+    REBVAL *where = KNOWN(&vars->where);
+    if (NOT(IS_BLANK(where))) {
+        Append_Codepoint(mo->series, '\n');
+        Append_Unencoded(mo->series, RM_ERROR_WHERE);
+        Form_Value(mo, where);
+    }
+
+    // Form: ** Near: location
+    REBVAL *nearest = KNOWN(&vars->nearest);
+    if (NOT(IS_BLANK(nearest))) {
+        Append_Codepoint(mo->series, '\n');
+        Append_Unencoded(mo->series, RM_ERROR_NEAR);
+
+        if (IS_STRING(nearest)) {
+            //
+            // !!! The scanner puts strings into the near information in order
+            // to say where the file and line of the scan problem was.  This
+            // seems better expressed as an explicit argument to the scanner
+            // error, because otherwise it obscures the LOAD call where the
+            // scanner was invoked.  Review.
+            //
+            Append_String(
+                mo->series, VAL_SERIES(nearest), 0, VAL_LEN_HEAD(nearest)
+            );
+        }
+        else if (ANY_ARRAY(nearest))
+            Mold_Value_Limit(mo, nearest, 60);
+        else
+            Append_Unencoded(mo->series, RM_BAD_ERROR_FORMAT);
+    }
+
+    // Form: ** File: filename
+    //
+    // !!! In order to conserve space in the system, filenames are interned.
+    // Although interned strings are GC'd when no longer referenced, they can
+    // only be used in ANY-WORD! values at the moment, so the filename is
+    // not a FILE!.
+    //
+    REBVAL *file = KNOWN(&vars->file);
+    if (NOT(IS_BLANK(file))) {
+        Append_Codepoint(mo->series, '\n');
+        Append_Unencoded(mo->series, RM_ERROR_FILE);
+        if (IS_WORD(file))
+            Form_Value(mo, file);
+        else
+            Append_Unencoded(mo->series, RM_BAD_ERROR_FORMAT);
+    }
+
+    // Form: ** Line: line-number
+    REBVAL *line = KNOWN(&vars->line);
+    if (NOT(IS_BLANK(line))) {
+        Append_Codepoint(mo->series, '\n');
+        Append_Unencoded(mo->series, RM_ERROR_LINE);
+        if (IS_INTEGER(line))
+            Form_Value(mo, line);
+        else
+            Append_Unencoded(mo->series, RM_BAD_ERROR_FORMAT);
+    }
 }

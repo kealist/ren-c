@@ -99,24 +99,25 @@ PVAR REBVAL PG_Bar_Value[2];
 PVAR REBVAL PG_False_Value[2];
 PVAR REBVAL PG_True_Value[2];
 
-// Special (but standards-legal) REBVAL* used in the `pending` field of a frame
-// to indicate it fetches its values from a C va_list.
-//
-PVAR REBVAL PG_Va_List_Pending;
+PVAR REBARR* PG_Empty_Array; // optimization of VAL_ARRAY(EMPTY_BLOCK)
 
 // This signal word should be thread-local, but it will not work
 // when implemented that way. Needs research!!!!
 PVAR REBFLGS Eval_Signals;   // Signal flags
 
-// Hook called when BREAKPOINT is hit.  It will return TRUE if the breakpoint
-// is quitting, or FALSE if it is continuing.  (Note that if one is HALTing,
-// then it won't return at all...because that is done via longjmp.)
-//
-PVAR REBBRK PG_Breakpoint_Quitting_Hook;
+PVAR REBBRK PG_Breakpoint_Hook; // hook called to spawn the debugger
 
 // !!! See bad hack in %t-port.c that uses this for the moment.
 //
 PVAR REBVAL PG_Write_Action;
+
+
+// It is possible to swap out the evaluator for one that does tracing, or
+// single step debugging, etc.
+//
+PVAR REBDOF PG_Do; // Rebol "DO function" (takes REBFRM, returns void)
+PVAR REBAPF PG_Apply; // Rebol "APPLY function" (takes REBFRM, returns REB_R)
+
 
 /***********************************************************************
 **
@@ -152,8 +153,8 @@ TVAR REBUPT Stack_Limit;    // Limit address for CPU stack.
     // used for many purposes...including setting breakpoints in routines
     // other than Do_Next that are contingent on a certain "tick" elapsing.
     //
-    TVAR REBUPT TG_Do_Count;
-    TVAR REBUPT TG_Break_At; // The do_count to break
+    TVAR REBUPT TG_Tick; // expressions, EVAL moments, PARSE steps bump this
+    TVAR REBUPT TG_Break_At_Tick; // runtime break tick set by C-DEBUG_BREAK
 
     TVAR REBIPT TG_Num_Black_Series;
 #endif
@@ -184,11 +185,6 @@ TVAR struct Reb_Chunker *TG_Root_Chunker;
 TVAR struct Reb_State *Saved_State; // Saved state for Catch (CPU state, etc.)
 
 #if !defined(NDEBUG)
-    // In debug builds, the `panic` and `fail` macros capture the file and
-    // line number of instantiation so any Make_Error can pick it up.
-    TVAR const char *TG_Erroring_C_File;
-    TVAR int TG_Erroring_C_Line;
-
     TVAR REBOOL TG_Pushing_Mold; // Push_Mold should not directly recurse
 #endif
 
@@ -204,7 +200,3 @@ TVAR REBINT Trace_Level;    // Trace depth desired
 TVAR REBINT Trace_Depth;    // Tracks trace indentation
 TVAR REBCNT Trace_Limit;    // Backtrace buffering limit
 TVAR REBSER *Trace_Buffer;  // Holds backtrace lines
-
-TVAR REBI64 Eval_Functions;
-
-TVAR REBVAL Callback_Error; //Error produced by callback!, note it's not callback://

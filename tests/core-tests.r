@@ -26,7 +26,11 @@
 %datatypes/bitset.test.reb
 %datatypes/block.test.reb
 %datatypes/char.test.reb
-%datatypes/closure.test.reb
+
+; CLOSURE is not supported for the moment
+; https://forum.rebol.info/t/234
+;%datatypes/closure.test.reb
+
 %datatypes/datatype.test.reb
 %datatypes/date.test.reb
 %datatypes/decimal.test.reb
@@ -97,6 +101,7 @@
 %control/default.test.reb
 %control/disarm.test.reb
 %control/do.test.reb
+%control/dont.test.reb
 %control/either.test.reb
 %control/else.test.reb
 %control/exit.test.reb
@@ -137,7 +142,10 @@
 %functions/adapt.test.reb
 %functions/apply.test.reb
 %functions/chain.test.reb
+%functions/enclose.test.reb
 %functions/hijack.test.reb
+%functions/invisible.test.reb
+%functions/redo.test.reb
 %functions/specialize.test.reb
 %math/absolute.test.reb
 %math/add.test.reb

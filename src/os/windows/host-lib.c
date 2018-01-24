@@ -49,7 +49,6 @@
 #include <string.h>
 #include <windows.h>
 #include <process.h>
-#include <shlobj.h>
 #include <assert.h>
 
 #include "reb-host.h"
@@ -57,9 +56,6 @@
 #ifndef REB_CORE
 REBSER* Gob_To_Image(REBGOB *gob);
 #endif
-
-//used to detect non-modal OS dialogs
-BOOL osDialogOpen = FALSE;
 
 
 //
@@ -70,7 +66,7 @@ BOOL osDialogOpen = FALSE;
 //
 void Convert_Date(REBVAL *out, long zone, const SYSTEMTIME *stime)
 {
-    RL_Init_Date(
+    rebInitDate(
         out,
         stime->wYear, // year
         stime->wMonth, // month
@@ -110,152 +106,6 @@ REBINT OS_Config(int id, REBYTE *result)
 
 
 //
-//  OS_Exit: C
-//
-// Called in cases where REBOL needs to quit immediately
-// without returning from the main() function.
-//
-void OS_Exit(int code)
-{
-    //OS_Call_Device(RDI_STDIO, RDC_CLOSE); // close echo
-    OS_Quit_Devices(0);
-#ifndef REB_CORE
-    OS_Destroy_Graphics();
-#endif
-    exit(code);
-}
-
-
-//
-//  OS_Crash: C
-//
-// Tell user that REBOL has crashed. This function must use
-// the most obvious and reliable method of displaying the
-// crash message.
-//
-// If the title is NULL, then REBOL is running in a server mode.
-// In that case, we do not want the crash message to appear on
-// the screen, because the system may be unattended.
-//
-// On some systems, the error may be recorded in the system log.
-//
-void OS_Crash(const REBYTE *title, const REBYTE *content)
-{
-    // Echo crash message if echo file is open:
-    ///PUTE(content);
-    OS_Call_Device(RDI_STDIO, RDC_CLOSE); // close echo
-
-    // A title tells us we should alert the user:
-    if (title) {
-    //  OS_Put_Str(title);
-    //  OS_Put_Str(":\n");
-        // Use ASCII only
-        MessageBoxA(NULL, cs_cast(content), cs_cast(title), MB_ICONHAND);
-    }
-    //  OS_Put_Str(content);
-    exit(100);
-}
-
-
-//
-//  OS_Form_Error: C
-//
-// Translate OS error into a string. The str is the string
-// buffer and the len is the length of the buffer.
-//
-REBCHR *OS_Form_Error(int errnum, REBCHR *str, int len)
-{
-    wchar_t *lpMsgBuf;
-    int ok;
-
-    if (!errnum) errnum = GetLastError();
-
-    // !!! Why does this allocate a buffer when FormatMessage takes a
-    // buffer and a size...exactly the interface we're implementing?
-    ok = FormatMessage(
-            FORMAT_MESSAGE_ALLOCATE_BUFFER |
-            FORMAT_MESSAGE_FROM_SYSTEM |
-            FORMAT_MESSAGE_IGNORE_INSERTS,
-            NULL,
-            errnum,
-            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // Default language
-            cast(wchar_t*, &lpMsgBuf), // see FORMAT_MESSAGE_ALLOCATE_BUFFER
-            0,
-            NULL);
-
-    len--; // termination
-
-    if (!ok) wcsncpy(str, L"unknown error", len);
-    else {
-        wcsncpy(str, lpMsgBuf, len);
-        LocalFree(lpMsgBuf);
-    }
-    return str;
-}
-
-
-//
-//  OS_Get_Env: C
-//
-// Get a value from the environment.
-// Returns size of retrieved value for success or zero if missing.
-//
-// If return size is greater than capacity then value contents
-// are undefined, and size includes null terminator of needed buf
-//
-REBINT OS_Get_Env(REBCHR* buffer, const REBCHR *key, REBINT capacity)
-{
-    // Note: The Windows variant of this API is NOT case-sensitive
-
-    REBINT result = GetEnvironmentVariable(key, buffer, capacity);
-    if (result == 0) { // some failure...
-        if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
-            return -1; // not found
-        }
-        return -2; // other error... fail?
-    }
-    return result;
-}
-
-
-//
-//  OS_Set_Env: C
-//
-// Set a value from the environment.
-// Returns >0 for success and 0 for errors.
-//
-REBOOL OS_Set_Env(REBCHR *envname, REBCHR *envval)
-{
-    return SetEnvironmentVariable(envname, envval);
-}
-
-
-//
-//  OS_List_Env: C
-//
-REBCHR *OS_List_Env(void)
-{
-    wchar_t *env = GetEnvironmentStrings();
-    REBCNT n, len = 0;
-    wchar_t *str;
-
-    str = env;
-    while ((n = wcslen(str))) {
-        len += n + 1;
-        str = env + len; // next
-    }
-    len++;
-
-    str = OS_ALLOC_N(wchar_t, len);
-    memmove(str, env, len * sizeof(wchar_t));
-
-    FreeEnvironmentStrings(env);
-
-    return str;
-}
-
-
-//
 //  OS_Get_Time: C
 //
 // Get the current system date/time in UTC plus zone offset (mins).
@@ -283,18 +133,15 @@ void OS_Get_Time(REBVAL *out)
 // Note: Requires high performance timer.
 //      Q: If not found, use timeGetTime() instead ?!
 //
-i64 OS_Delta_Time(i64 base, int flags)
+i64 OS_Delta_Time(i64 base)
 {
-    UNUSED(flags);
-
-    LARGE_INTEGER freq;
     LARGE_INTEGER time;
-
     if (!QueryPerformanceCounter(&time))
-        OS_Crash(cb_cast("Missing resource"), cb_cast("High performance timer"));
+        rebPanic ("Missing high performance timer");
 
     if (base == 0) return time.QuadPart; // counter (may not be time)
 
+    LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
 
     return ((time.QuadPart - base) * 1000) / (freq.QuadPart / 1000);
@@ -423,99 +270,6 @@ int OS_Reap_Process(int pid, int *status, int flags)
     return 0;
 }
 
-
-//
-//  OS_Request_File: C
-//
-REBOOL OS_Request_File(REBRFR *fr)
-{
-    OPENFILENAME ofn;
-    BOOL ret;
-    //int err;
-    const wchar_t *filters = L"All files\0*.*\0REBOL scripts\0*.r\0Text files\0*.txt\0";
-
-    memset(&ofn, '\0', sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-
-    // ofn.hwndOwner = WIN_WIN(win); // Must find a way to set this
-
-    ofn.lpstrTitle = fr->title;
-    ofn.lpstrInitialDir = fr->dir;
-    ofn.lpstrFile = fr->files;
-    ofn.lpstrFilter = fr->filter ? fr->filter : filters;
-    ofn.nMaxFile = fr->len;
-    ofn.lpstrFileTitle = 0;
-    ofn.nMaxFileTitle = 0;
-
-    ofn.Flags = OFN_HIDEREADONLY | OFN_EXPLORER | OFN_NOCHANGEDIR; //|OFN_NONETWORKBUTTON; //;
-
-    if (GET_FLAG(fr->flags, FRF_MULTI)) ofn.Flags |= OFN_ALLOWMULTISELECT;
-
-    osDialogOpen = TRUE;
-
-    if (GET_FLAG(fr->flags, FRF_SAVE))
-        ret = GetSaveFileName(&ofn);
-    else
-        ret = GetOpenFileName(&ofn);
-
-    osDialogOpen = FALSE;
-
-    //if (!ret)
-    //  err = CommDlgExtendedError(); // CDERR_FINDRESFAILURE
-
-    return ret;
-}
-
-int CALLBACK ReqDirCallbackProc( HWND hWnd, UINT uMsg, LPARAM lParam, LPARAM lpData )
-{
-    UNUSED(lParam);
-
-    static REBOOL inited = FALSE;
-    switch (uMsg) {
-        case BFFM_INITIALIZED:
-            if (lpData) SendMessage(hWnd,BFFM_SETSELECTION,TRUE,lpData);
-            SetForegroundWindow(hWnd);
-            inited = TRUE;
-            break;
-        case BFFM_SELCHANGED:
-            if (inited && lpData) {
-                SendMessage(hWnd,BFFM_SETSELECTION,TRUE,lpData);
-                inited = FALSE;
-            }
-            break;
-    }
-    return 0;
-}
-
-
-//
-//  OS_Request_Dir: C
-//
-// WARNING: TEMPORARY implementation! Used only by host-core.c
-// Will be most probably changed in future.
-//
-REBOOL OS_Request_Dir(REBCHR* title, REBCHR** folder, REBCHR* path)
-{
-    BROWSEINFO bi;
-    wchar_t buffer[MAX_PATH];
-    LPCITEMIDLIST pFolder;
-    ZeroMemory(buffer, MAX_PATH);
-    ZeroMemory(&bi, sizeof(bi));
-    bi.hwndOwner = NULL;
-    bi.pszDisplayName = buffer;
-    bi.lpszTitle = title;
-    bi.ulFlags = BIF_EDITBOX | BIF_NEWDIALOGSTYLE | BIF_RETURNONLYFSDIRS | BIF_SHAREABLE;
-    bi.lpfn = ReqDirCallbackProc;
-    bi.lParam = (LPARAM)path;
-
-    osDialogOpen = TRUE;
-    pFolder = SHBrowseForFolder(&bi);
-    osDialogOpen = FALSE;
-    if (pFolder == NULL) return FALSE;
-    if (!SHGetPathFromIDList(pFolder, buffer) ) return FALSE;
-    wcscpy(*folder, buffer);
-    return TRUE;
-}
 
 //
 //  OS_GOB_To_Image: C

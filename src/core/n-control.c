@@ -35,20 +35,24 @@
 //   so that THEN and ELSE can distinguish whether a condition ran.
 //
 // * It is possible to ask the return result to not be "blankified", but
-//   return the true value, with the /OPT refinement.  This is specialized
-//   as functions ending in *.  (IF*, EITHER*, CASE*, SWITCH*...)
+//   give back the possibly-void value, with the /ONLY refinement.  This is
+//   specialized as functions ending in *.  (IF*, EITHER*, CASE*, SWITCH*...)
 //
 // * Other specializations exist returning a logic of whether the body ever
 //   ran by using the /? refinement.  So CASE? does not return the branch
 //   values, just true or false based on whether a branch ran.  This is
 //   based on testing the result for void.
 //
-// * Zero-arity function values used as branches will be executed.  Future
-//   plans may allow for single-arity functions to be passed the condition,
-//   see Run_Branch_Throws() for notes.
+// * Zero-arity function values used as branches will be executed, and
+//   single-arity functions used as branches will also be executed--but passed
+//   the value of the triggering condition.  See Run_Branch_Throws().
 //
-// * The /ONLY option suppresses execution of either FUNCTION! branches or
-//   BLOCK! branches, instead evaluating to the raw function or block value.
+// * If the /ONLY option is not used, then there is added checking on the
+//   condition and branches.  The condition is not allowed to be a literal
+//   block, e.g. `[x = 10]`, but may be an expression evaluating to a block.
+//   The branches are not allowed to be evaluative *unless* they evaluate to
+//   a block...literals such as strings or integers may be used, but not
+//   variables or expressions that evaluate to strings or integers.
 //
 
 #include "sys-core.h"
@@ -57,16 +61,13 @@
 //
 //  if: native [
 //
-//  {If TRUE? condition, return evaluation of branch value.}
+//  {If TRUTHY? condition, take branch (blocks and functions evaluated)}
 //
 //      return: [<opt> any-value!]
-//          {void on FALSE?, branch result if TRUE? or BLANK! if void}
+//          {void on FALSEY? condition, else branch result (BLANK! if void)}
 //      condition [any-value!]
-//      branch [<opt> any-value!]
-//          {Evaluated if block or function and not /ONLY}
+//      branch [block! function!]
 //      /only
-//          "Return block and function branches instead of evaluating them"
-//      /opt
 //          "If branch runs and returns void, do not convert it to BLANK!"
 //  ]
 //
@@ -74,34 +75,26 @@ REBNATIVE(if)
 {
     INCLUDE_PARAMS_OF_IF;
 
-    // Test is "safe", e.g. no literal blocks like `if [x] [...]`
-    //
-    if (IS_CONDITIONAL_TRUE_SAFE(ARG(condition))) {
-        if (Run_Branch_Throws(D_OUT, ARG(branch), REF(only)))
-            return R_OUT_IS_THROWN;
+    if (IS_CONDITIONAL_FALSE(ARG(condition), REF(only)))
+        return R_VOID;
 
-        if (REF(opt))
-            return R_OUT;
-        return R_OUT_BLANK_IF_VOID;
-    }
+    if (Run_Branch_Throws(D_OUT, ARG(condition), ARG(branch), REF(only)))
+        return R_OUT_IS_THROWN;
 
-    return R_VOID;
+    return R_OUT;
 }
 
 
 //
 //  unless: native [
 //
-//  {If FALSE? condition, return evaluation of branch value.}
+//  {If FALSEY? condition, take branch (blocks and functions evaluated)}
 //
 //      return: [<opt> any-value!]
-//          {Void on FALSE?, branch result if TRUE? condition (may be void)}
+//          {void on TRUTHY? condition, else branch result (BLANK! if void)}
 //      condition [any-value!]
-//      branch [<opt> any-value!]
-//          {Evaluated if block or function and not /ONLY}
+//      branch [block! function!]
 //      /only
-//          "Return block and function branches instead of evaluating them"
-//      /opt
 //          "If branch runs and returns void, do not convert it to BLANK!"
 //  ]
 //
@@ -109,54 +102,230 @@ REBNATIVE(unless)
 {
     INCLUDE_PARAMS_OF_UNLESS;
 
-    // Test is "safe", e.g. no literal blocks like `unless [x] [...]`
-    //
-    if (NOT(IS_CONDITIONAL_TRUE_SAFE(ARG(condition)))) {
-        if (Run_Branch_Throws(D_OUT, ARG(branch), REF(only)))
-            return R_OUT_IS_THROWN;
+    if (IS_CONDITIONAL_TRUE(ARG(condition), REF(only)))
+        return R_VOID;
 
-        if (REF(opt))
-            return R_OUT;
-        return R_OUT_BLANK_IF_VOID;
-    }
+    if (Run_Branch_Throws(D_OUT, ARG(condition), ARG(branch), REF(only)))
+        return R_OUT_IS_THROWN;
 
-    return R_VOID;
+    return R_OUT;
 }
 
 
 //
 //  either: native [
 //
-//  {If TRUE condition?, evaluate first branch, else evaluate second branch.}
+//  {If TRUTHY? condition, take first branch, else take second branch.}
 //
 //      return: [<opt> any-value!]
 //      condition [any-value!]
-//      true-branch [<opt> any-value!]
-//      false-branch [<opt> any-value!]
+//      true-branch [block! function!]
+//      false-branch [block! function!]
 //      /only
-//          "Return block and function branches instead of evaluating them"
-//      /opt
-//          "Do not convert void branch results to BLANK!"
+//          "If branch runs and returns void, do not convert it to BLANK!"
 //  ]
 //
 REBNATIVE(either)
 {
     INCLUDE_PARAMS_OF_EITHER;
 
-    // Test is "safe", e.g. no literal blocks like `either [x] [...] [...]`
-    //
-    if (IS_CONDITIONAL_TRUE_SAFE(ARG(condition))) {
-        if (Run_Branch_Throws(D_OUT, ARG(true_branch), REF(only)))
-            return R_OUT_IS_THROWN;
-    }
-    else {
-        if (Run_Branch_Throws(D_OUT, ARG(false_branch), REF(only)))
-            return R_OUT_IS_THROWN;
+    if (Run_Branch_Throws(
+        D_OUT,
+        ARG(condition),
+        IS_CONDITIONAL_TRUE(ARG(condition), REF(only))
+            ? ARG(true_branch)
+            : ARG(false_branch),
+        REF(only)
+    )){
+        return R_OUT_IS_THROWN;
     }
 
-    if (REF(opt))
+    return R_OUT;
+}
+
+
+//
+//  either-test: native [
+//
+//  {If value passes test, return that value, otherwise take the branch.}
+//
+//      return: [<opt> any-value!]
+//          {Input value if it matched, or branch result (BLANK! if void)}
+//      test [function! datatype! typeset! block! logic!]
+//          {Typeset membership, LOGIC! to test TRUTHY?, filter function}
+//      value [<opt> any-value!]
+//      branch [block! function!]
+//      /only
+//          "If branch runs and returns void, do not convert it to BLANK!"
+//  ]
+//
+REBNATIVE(either_test)
+{
+    INCLUDE_PARAMS_OF_EITHER_TEST;
+
+    REBVAL *test = ARG(test);
+    REBVAL *value = ARG(value);
+
+    if (IS_LOGIC(test)) {
+        if (IS_VOID(value) || VAL_LOGIC(test) != IS_TRUTHY(value))
+            goto test_failed;
+        return R_FROM_BOOL(VAL_LOGIC(test));
+    }
+
+    // Force single items into array style access so only one version of the
+    // code needs to be written.
+    //
+    RELVAL *item;
+    REBSPC *specifier;
+    if (IS_BLOCK(test)) {
+        item = VAL_ARRAY_AT(test);
+        specifier = VAL_SPECIFIER(test);
+    }
+    else {
+        Move_Value(D_CELL, test);
+        item = D_CELL; // implicitly terminated
+        specifier = SPECIFIED;
+    }
+
+    REB_R r; // goto crosses initialization
+    r = R_UNHANDLED;
+
+    for (; NOT_END(item); ++item) {
+        //
+        // If we're dealing with a single item for the test, provided e.g.
+        // as :even?, then it's already fetched.  But if it was a block like
+        // [:even? integer!] we enumerate it in word form and have to get it.
+        //
+        const RELVAL *var = IS_WORD(item)
+            ? Get_Opt_Var_May_Fail(item, specifier)
+            : item;
+
+        if (IS_DATATYPE(var)) {
+            if (VAL_TYPE_KIND(var) == VAL_TYPE(value))
+                r = R_TRUE; // any type matching counts
+            else if (r == R_UNHANDLED)
+                r = R_FALSE; // at least one type has to speak up now
+        }
+        else if (IS_TYPESET(var)) {
+            if (TYPE_CHECK(var, VAL_TYPE(value)))
+                r = R_TRUE; // any typeset matching counts
+            else if (r == R_UNHANDLED)
+                r = R_FALSE; // at least one type has to speak up now
+        }
+        else if (IS_FUNCTION(var)) {
+            const REBOOL fully = TRUE;
+            if (Apply_Only_Throws(D_OUT, fully, const_KNOWN(var), value, END))
+                return R_OUT_IS_THROWN;
+
+            if (IS_VOID(D_OUT))
+                fail (Error_No_Return_Raw());
+
+            if (IS_FALSEY(D_OUT))
+                goto test_failed; // any function failing breaks it
+
+            // At least one function matching tips the balance, but
+            // can't alone outmatch no types matching, if any types
+            // were matched at all.
+            //
+            if (r == R_UNHANDLED)
+                r = R_TRUE;
+            continue;
+        }
+        else
+            fail (Error_Invalid_Type(VAL_TYPE(var)));
+    }
+
+    if (r == R_UNHANDLED) {
+        //
+        // !!! When the test is just [], what's that?  People aren't likely to
+        // write it literally, but it could happen from a COMPOSE or similar.
+        //
+        fail ("No tests found in EITHER-TEST.");
+    }
+
+    if (r == R_FALSE) {
+        //
+        // This means that some types didn't match and were not later
+        // redeemed by a type that did match.  Consider it failure.
+        //
+        goto test_failed;
+    }
+
+    // Someone spoke up for test success and was not overridden.
+    //
+    assert(r == R_TRUE);
+    Move_Value(D_OUT, ARG(value));
+    return R_OUT;
+
+test_failed:
+    if (Run_Branch_Throws(D_OUT, ARG(value), ARG(branch), REF(only)))
+        return R_OUT_IS_THROWN;
+
+    return R_OUT;
+}
+
+
+//
+//  either-test-void: native [
+//
+//  {If value is void, return void, otherwise take the branch.}
+//
+//      return: [<opt> any-value!]
+//          {Void if input is void, or branch result (BLANK! if void)}
+//      value [<opt> any-value!]
+//      branch [block! function!]
+//      /only
+//          "If branch runs and returns void, do not convert it to BLANK!"
+//  ]
+//
+REBNATIVE(either_test_void)
+//
+// Native optimization of `specialize 'either-test-value [test: :void?]`
+// Worth it to write because this is the functionality enfixed as THEN.
+{
+    INCLUDE_PARAMS_OF_EITHER_TEST_VOID;
+
+    if (IS_VOID(ARG(value))) {
+        Move_Value(D_OUT, ARG(value));
         return R_OUT;
-    return R_OUT_BLANK_IF_VOID;
+    }
+
+    if (Run_Branch_Throws(D_OUT, ARG(value), ARG(branch), REF(only)))
+        return R_OUT_IS_THROWN;
+
+    return R_OUT;
+}
+
+
+//
+//  either-test-value: native [
+//
+//  {If value is not void, return the value, otherwise take the branch.}
+//
+//      return: [<opt> any-value!]
+//          {Input value if not void, or branch result (BLANK! if void)}
+//      value [<opt> any-value!]
+//      branch [block! function!]
+//      /only
+//          "If branch runs and returns void, do not convert it to BLANK!"
+//  ]
+//
+REBNATIVE(either_test_value)
+//
+// Native optimization of `specialize 'either-test-value [test: :any-value?]`
+// Worth it to write because this is the functionality enfixed as ELSE.
+{
+    INCLUDE_PARAMS_OF_EITHER_TEST_VALUE;
+
+    if (!IS_VOID(ARG(value))) {
+        Move_Value(D_OUT, ARG(value));
+        return R_OUT;
+    }
+
+    if (Run_Branch_Throws(D_OUT, ARG(value), ARG(branch), REF(only)))
+        return R_OUT_IS_THROWN;
+
+    return R_OUT;
 }
 
 
@@ -180,7 +349,7 @@ REBNATIVE(all)
     DECLARE_FRAME (f);
     Push_Frame(f, ARG(block));
 
-    while (NOT_END(f->value)) {
+    while (FRM_HAS_MORE(f)) {
         if (Do_Next_In_Frame_Throws(D_CELL, f)) {
             Drop_Frame(f);
             Move_Value(D_OUT, D_CELL);
@@ -190,7 +359,7 @@ REBNATIVE(all)
         if (IS_VOID(D_CELL)) // voids do not "vote" true or false
             continue;
 
-        if (IS_CONDITIONAL_FALSE(D_CELL)) { // a failed ALL returns BLANK!
+        if (IS_FALSEY(D_CELL)) { // a failed ALL returns BLANK!
             Drop_Frame(f);
             return R_BLANK;
         }
@@ -226,7 +395,7 @@ REBNATIVE(any)
 
     REBOOL voted = FALSE;
 
-    while (NOT_END(f->value)) {
+    while (FRM_HAS_MORE(f)) {
         if (Do_Next_In_Frame_Throws(D_OUT, f)) {
             Drop_Frame(f);
             return R_OUT_IS_THROWN;
@@ -235,7 +404,7 @@ REBNATIVE(any)
         if (IS_VOID(D_OUT)) // voids do not "vote" true or false
             continue;
 
-        if (IS_CONDITIONAL_TRUE(D_OUT)) { // successful ANY returns the value
+        if (IS_TRUTHY(D_OUT)) { // successful ANY returns the value
             Drop_Frame(f);
             return R_OUT;
         }
@@ -275,7 +444,7 @@ REBNATIVE(none)
 
     REBOOL voted = FALSE;
 
-    while (NOT_END(f->value)) {
+    while (FRM_HAS_MORE(f)) {
         if (Do_Next_In_Frame_Throws(D_OUT, f)) {
             Drop_Frame(f);
             return R_OUT_IS_THROWN;
@@ -284,7 +453,7 @@ REBNATIVE(none)
         if (IS_VOID(D_OUT)) // voids do not "vote" true or false
             continue;
 
-        if (IS_CONDITIONAL_TRUE(D_OUT)) { // any true results mean failure
+        if (IS_TRUTHY(D_OUT)) { // any true results mean failure
             Drop_Frame(f);
             return R_BLANK;
         }
@@ -301,34 +470,24 @@ REBNATIVE(none)
 }
 
 
+// Shared code for CASE (which runs BLOCK! clauses as code) and CHOOSE (which
+// returns values as-is, e.g. `choose [true [print "hi"]]` => `[print "hi]`
 //
-//  case: native [
-//
-//  {Evaluates each condition, and when true, evaluates what follows it.}
-//
-//      return: [<opt> any-value!]
-//          {Last matched case evaluation, or void if no cases matched}
-//      cases [block!]
-//          "Block of cases (conditions followed by branches)"
-//      /all
-//          {Evaluate all cases (do not stop at first TRUE? case)}
-//      /only
-//          "Return block and function branches instead of evaluating them"
-//      /opt
-//          "If branch runs and returns void, do not convert it to BLANK!"
-//  ]
-//
-REBNATIVE(case)
-{
-    INCLUDE_PARAMS_OF_CASE; // ? is renamed as "q"
-
+static REB_R Case_Choose_Core(
+    REBVAL *out,
+    REBVAL *cell, // scratch "D_CELL", GC safe (and implicitly terminated)
+    REBVAL *block, // "choices" or "cases", GC safe
+    REBOOL all,
+    REBOOL only,
+    REBOOL choose // do not evaluate blocks, just "choose" them
+){
     DECLARE_FRAME (f);
-    Push_Frame(f, ARG(cases));
+    Push_Frame(f, block);
 
     // With the block argument pushed in the enumerator, that frame slot is
     // available for scratch space in the rest of the routine.
 
-    while (NOT_END(f->value)) {
+    while (FRM_HAS_MORE(f)) {
         if (IS_BAR(f->value)) { // interstitial BAR! legal, `case [1 2 | 3 4]`
             Fetch_Next_In_Frame(f);
             continue;
@@ -336,15 +495,16 @@ REBNATIVE(case)
 
         // Perform a DO/NEXT's worth of evaluation on a "condition" to test
 
-        if (Do_Next_In_Frame_Throws(D_CELL, f)) {
-            Move_Value(D_OUT, D_CELL);
-            goto return_thrown;
+        if (Do_Next_In_Frame_Throws(cell, f)) {
+            Move_Value(out, cell);
+            Drop_Frame(f);
+            return R_OUT_IS_THROWN;
         }
 
-        if (IS_VOID(D_CELL)) // no void conditions allowed (as with IF)
+        if (IS_VOID(cell)) // no void conditions allowed (as with IF)
             fail (Error_No_Return_Raw());
 
-        if (IS_END(f->value)) // require conditions and branches in pairs
+        if (FRM_AT_END(f)) // require conditions and branches in pairs
             fail (Error_Past_End_Raw());
 
         if (IS_BAR(f->value)) // BAR! out of sync between condition and branch
@@ -364,59 +524,126 @@ REBNATIVE(case)
         // `foo: [x] | case [foo [y]]`, since it is evaluated, or use a
         // GROUP! as in `case [([x]) [y]]`.
         //
-        if (NOT(IS_CONDITIONAL_TRUE_SAFE(D_CELL))) {
-            if (Do_Next_In_Frame_Throws(D_CELL, f)) {
-                Move_Value(D_OUT, D_CELL);
-                goto return_thrown;
-            }
-
-            continue;
+        // We need to hang onto the condition in the cell slot, in case the
+        // branch is an arity-1 FUNCTION! and wants to be passed what that
+        // condition evaluated to.  Move it into the block rebval, which we no
+        // longer need (the frame captured it).  Note that we can't evaluate
+        // into arguments directly...
+        //
+        Move_Value(block, cell);
+        if (Do_Next_In_Frame_Throws(cell, f)) {
+            Move_Value(out, cell);
+            Drop_Frame(f);
+            return R_OUT_IS_THROWN;
         }
 
-        // When the condition is TRUE?, CASE actually does a double evaluation
+        // CHOOSE simply sets the out slot to the matched value as-is.  But
+        // when the condition is TRUE?, CASE actually does a double evaluation
         // if a block is yielded as the branch:
         //
         //     stuff: [print "This will be printed"]
         //     case [true stuff]
         //
         // Similar to IF TRUE STUFF, so CASE can act like many IFs at once.
-
-        if (Do_Next_In_Frame_Throws(D_CELL, f)) {
-            Move_Value(D_OUT, D_CELL);
-            goto return_thrown;
-        }
-
+        //
         // !!! Optimization note: if the previous evaluation had gone into
         // D_OUT directly it could just stay there in some cases; and even
         // block evaluation doesn't need the copy.  Review how this shared
         // code might get more efficient if the data were already in D_OUT.
         //
-        if (Run_Branch_Throws(D_OUT, D_CELL, REF(only)))
-            goto return_thrown;
+        if (choose) {
+            if (IS_CONDITIONAL_FALSE(block, only))
+                continue;
 
-        if (NOT(REF(all)))
-            goto return_matched;
+            Move_Value(out, cell);
+        }
+        else {
+            // The check for IS_CONDITIONAL_FALSE is deferred until after we
+            // see if it's a CASE or a CHOOSE, so that when running CASE we
+            // ensure any evaluated but *non-taken* branches are type-checked
+            //
+            if (NOT(IS_FUNCTION(cell)) && NOT(IS_BLOCK(cell)))
+                fail (Error_Invalid_Arg_Raw(cell));
+
+            if (IS_CONDITIONAL_FALSE(block, only))
+                continue;
+
+            // Note that block now holds the cached evaluated condition
+            //
+            if (Run_Branch_Throws(out, block, cell, only)) {
+                Drop_Frame(f);
+                return R_OUT_IS_THROWN;
+            }
+        }
+
+        if (NOT(all)) {
+            Drop_Frame(f);
+            return R_OUT;
+        }
 
         // keep matching if /ALL
     }
 
-    goto return_maybe_matched;
+    // CASE/ALL can get here even if D_OUT not written
 
-return_maybe_matched: // CASE/ALL can get here even if D_OUT not written
     Drop_Frame(f);
-    if (REF(opt))
-        return R_OUT_VOID_IF_UNWRITTEN; // user wants voids as-is
-    return R_OUT_VOID_IF_UNWRITTEN_BLANK_IF_VOID;
+    return R_OUT_VOID_IF_UNWRITTEN;
+}
 
-return_matched:
-    Drop_Frame(f);
-    if (REF(opt))
-        return R_OUT; // user wants voids as-is
-    return R_OUT_BLANK_IF_VOID;
 
-return_thrown:
-    Drop_Frame(f);
-    return R_OUT_IS_THROWN;
+//
+//  case: native [
+//
+//  {Evaluates each condition, and when true, evaluates what follows it.}
+//
+//      return: [<opt> any-value!]
+//          {Last matched case evaluation, or void if no cases matched}
+//      cases [block!]
+//          "Block of cases (conditions followed by branches)"
+//      /all
+//          {Evaluate all cases (do not stop at first TRUTHY? case)}
+//      /only
+//          "If branch runs and returns void, do not convert it to BLANK!"
+//  ]
+//
+REBNATIVE(case)
+{
+    INCLUDE_PARAMS_OF_CASE;
+
+    const REBOOL choose = FALSE;
+    return Case_Choose_Core(
+        D_OUT, D_CELL, ARG(cases), REF(all), REF(only), choose
+    );
+}
+
+
+//
+//  choose: native [
+//
+//  {Evaluates each condition, and gives back the value that follows it}
+//
+//      return: [<opt> any-value!]
+//          {Last matched choice value, or void if no choices matched}
+//      choices [block!]
+//          {Evaluate all choices (do not stop at first TRUTHY? choice)}
+//      /all
+//          {Return the value for the last matched choice (instead of first)}
+//  ]
+//
+REBNATIVE(choose)
+{
+    INCLUDE_PARAMS_OF_CHOOSE;
+
+    // There's no need to worry about "blankification" here, though the value
+    // might be void.  For now assume that means it's not a valid choice,
+    // and give an error.  Review.
+    //
+    const REBOOL only = FALSE;
+
+    const REBOOL choose = TRUE;
+    return Case_Choose_Core(
+        D_OUT, D_CELL, ARG(choices), REF(all), only, choose
+    );
 }
 
 
@@ -433,19 +660,25 @@ return_thrown:
 //          "Block of cases (comparison lists followed by block branches)"
 //      /default
 //          "Default case if no others found"
-//      default-case
-//          "Block to execute (or value to return)"
+//      default-case [function! block!]
+//          "Block to execute or function to run if no cases match"
 //      /all
 //          "Evaluate all matches (not just first one)"
 //      /strict
 //          {Use STRICT-EQUAL? when comparing cases instead of EQUAL?}
-//      /opt
+//      /only
 //          "If branch runs and returns void, do not convert it to BLANK!"
 //  ]
 //
 REBNATIVE(switch)
+//
+// !!! SWITCH historically has had a /DEFAULT refinement.  However, with the
+// rise of the void-means-no-result convention and THEN and ELSE, it is
+// somewhat inelegant.  Consider removing it, when a suitable way to let
+// users create expanded versions of functions with their own refinements
+// exists, so that creating compatibility can be easy/performant.
 {
-    INCLUDE_PARAMS_OF_SWITCH; // ? is renamed as "q"
+    INCLUDE_PARAMS_OF_SWITCH;
 
     DECLARE_FRAME (f);
     Push_Frame(f, ARG(cases));
@@ -458,40 +691,47 @@ REBNATIVE(switch)
 
     REBVAL *value = ARG(value);
 
-    // For safety, notice if someone wrote `switch [x] [...]` with a literal
-    // block in source, as that is likely a mistake.
+    // If /ONLY is not used, then do a safety check to see if someone wrote
+    // `switch [x] [...]` with a literal block, as that is likely a mistake.
     //
-    if (IS_BLOCK(value) && GET_VAL_FLAG(value, VALUE_FLAG_UNEVALUATED))
+    if (
+        NOT(REF(only))
+        && IS_BLOCK(value)
+        && GET_VAL_FLAG(value, VALUE_FLAG_UNEVALUATED)
+    ){
         fail (Error_Block_Switch_Raw(value));
+    }
 
-    // Frame's extra D_CELL is free since the function has > 1 arg.  Reuse it
-    // as a temporary GC-safe location for holding evaluations.  This
-    // holds the last test so that `switch 9 [1 ["a"] 2 ["b"] "c"]` is "c".
+    // SWITCH's extra D_CELL is a temporary GC-safe location for holding
+    // evaluations.  Initialize it to void, as it holds the last test so that
+    // `switch 9 [1 ["a"] 2 ["b"] "c"]` is "c".  (Empirically this is about
+    // twice as fast as using `switch/default`, another reason to kill it.)
 
     Init_Void(D_CELL); // used for "fallout"
 
-    while (NOT_END(f->value)) {
-
-        // If a block is seen at this point, it doesn't correspond to any
+    while (FRM_HAS_MORE(f)) {
+        //
+        // If a branch is seen at this point, it doesn't correspond to any
         // condition to match.  If no more tests are run, let it suppress the
         // feature of the last value "falling out" the bottom of the switch
+        //
+        // (Note a FUNCTION! literal is likely only to be in the switch if
+        // it was composed into the block.  This is a speculative feature.)
 
-        if (IS_BLOCK(f->value)) {
+        if (IS_BLOCK(f->value) || IS_FUNCTION(f->value)) {
             Init_Void(D_CELL);
-            goto continue_loop;
+            Fetch_Next_In_Frame(f);
+            continue;
         }
 
         // GROUP!, GET-WORD! and GET-PATH! are evaluated in Ren-C's SWITCH
         // All other types are seen as-is (hence words act "quoted")
-
-        if (
-            IS_GROUP(f->value)
-            || IS_GET_WORD(f->value)
-            || IS_GET_PATH(f->value)
-        ){
+        //
+        if (IS_QUOTABLY_SOFT(f->value)) {
             if (Eval_Value_Core_Throws(D_CELL, f->value, f->specifier)) {
                 Move_Value(D_OUT, D_CELL);
-                goto return_thrown;
+                Drop_Frame(f);
+                return R_OUT_IS_THROWN;
             }
         }
         else
@@ -506,71 +746,73 @@ REBNATIVE(switch)
         // !!! This means fallout can be modified from its intent.  Rather
         // than copy here, this is a reminder to review the mechanism by
         // which equality is determined--and why it has to mutate.
+        //
+        // !!! A branch composed into the switch cases block may want to see
+        // the un-mutated condition value, in which case this should not
+        // be changing D_CELL
 
-        if (!Compare_Modify_Values(ARG(value), D_CELL, REF(strict) ? 1 : 0))
-            goto continue_loop;
+        if (!Compare_Modify_Values(ARG(value), D_CELL, REF(strict) ? 1 : 0)) {
+            Fetch_Next_In_Frame(f);
+            continue;
+        }
 
         // Skip ahead to try and find a block, to treat as code for the match
 
         do {
             Fetch_Next_In_Frame(f);
-            if (IS_END(f->value))
+            if (FRM_AT_END(f))
                 goto return_defaulted;
-        } while (!IS_BLOCK(f->value));
+        } while (!IS_BLOCK(f->value) && !IS_FUNCTION(f->value));
 
         // Run the code if it was found.  Because it writes D_OUT with a value
-        // (or void), it won't be END--so we'll know at least one case has run.
-
-        REBSPC *derived; // goto would cross initialization
-        derived = Derive_Specifier(VAL_SPECIFIER(ARG(cases)), f->value);
-        if (Do_At_Throws(
-            D_OUT,
-            VAL_ARRAY(f->value),
-            VAL_INDEX(f->value),
-            derived
-        )) {
-            goto return_thrown;
+        // (or void), it won't be END--we'll know at least one case has run.
+        //
+        // Derelativize the FUNCTION! or BLOCK! into the cases cell, which is
+        // available because the frame already captured it.
+        //
+        // !!! We only have to derelativize because we're not using plain
+        // Do_At_Throws()...which takes a specifier.  If the literal-FUNCTION!
+        // in the cases feature turns out to be superfluous, use that instead.
+        //
+        Derelativize(ARG(cases), f->value, f->specifier);
+        if (Run_Branch_Throws(D_OUT, D_CELL, ARG(cases), REF(only))) {
+            Drop_Frame(f);
+            return R_OUT_IS_THROWN;
         }
 
         // Only keep processing if the /ALL refinement was specified
 
-        if (NOT(REF(all)))
-            goto return_matched;
-
-    continue_loop:
-        Fetch_Next_In_Frame(f);
+        if (NOT(REF(all))) {
+            Drop_Frame(f);
+            return R_OUT;
+        }
     }
 
-    if (NOT_END(D_OUT)) // at least one case body's DO ran and overwrote D_OUT
-        goto return_matched;
+    if (NOT_END(D_OUT)) { // at least one case body ran and overwrote D_OUT
+        Drop_Frame(f);
+        return R_OUT;
+    }
 
 return_defaulted:
+    assert(IS_END(D_OUT)); // nothing should have been written into D_OUT
+
     Drop_Frame(f);
 
-    if (REF(default)) {
-        const REBOOL only = FALSE; // !!! Should it use REF(only)?
-
-        if (Run_Branch_Throws(D_OUT, ARG(default_case), only))
-            return R_OUT_IS_THROWN;
-
-        if (REF(opt))
-            return R_OUT;
-        return R_OUT_BLANK_IF_VOID;
+    if (NOT(REF(default))) {
+        Move_Value(D_OUT, D_CELL); // last test "falls out", might be void
+        return R_OUT;
     }
 
-    Move_Value(D_OUT, D_CELL); // last test "falls out", might be void
+    // The default branch is run, but the condition triggering it is said to
+    // be a void.  Hence if the default case is a single-arity function, that
+    // is the argument it will be receiving.  (Loops like FOREVER pass in
+    // END, so only single-arity functions can be used, but by using void
+    // here it allows a common function to take the default.)
+    //
+    if (Run_Branch_Throws(D_OUT, VOID_CELL, ARG(default_case), REF(only)))
+        return R_OUT_IS_THROWN;
+
     return R_OUT;
-
-return_matched:
-    Drop_Frame(f);
-
-    if (REF(opt))
-        return R_OUT;
-    return R_OUT_BLANK_IF_VOID;
-
-return_thrown:
-    Drop_Frame(f);
-    return R_OUT_IS_THROWN;
 }
 
 

@@ -88,9 +88,9 @@ ctx-zip: context [
     ][
         value: get-ishort value
         to time! reduce [
-            63488 and* value / 2048
-            2016 and* value / 32
-            31 and* value * 2
+            63488 and+ value / 2048
+            2016 and+ value / 32
+            31 and+ value * 2
         ]
     ]
 
@@ -100,9 +100,9 @@ ctx-zip: context [
     ][
         value: get-ishort value
         to date! reduce [
-            65024 and* value / 512 + 1980
-            480 and* value / 32
-            31 and* value
+            65024 and+ value / 512 + 1980
+            480 and+ value / 32
+            31 and+ value
         ]
     ]
 
@@ -118,9 +118,9 @@ ctx-zip: context [
             "Data to compress"
     ][
         ; info on data before compression
-        crc: head reverse crc-32 data
+        crc: head of reverse crc-32 data
 
-        uncompressed-size: to-ilong length-of data
+        uncompressed-size: to-ilong length of data
 
         either empty? data [
             method: 'store
@@ -128,10 +128,10 @@ ctx-zip: context [
             ; zlib stream
             compressed-data: compress data
             ; if compression inefficient, store the data instead
-            either (length-of data) > (length-of compressed-data) [
+            either (length of data) > (length of compressed-data) [
                 data: copy/part
                     skip compressed-data 2
-                    skip tail compressed-data -8
+                    skip tail of compressed-data -8
                 method: 'deflate
             ][
                 method: 'store
@@ -140,7 +140,7 @@ ctx-zip: context [
         ]
 
         ; info on data after compression
-        compressed-size: to-ilong length-of data
+        compressed-size: to-ilong length of data
 
         reduce [
             ; local file entry
@@ -158,7 +158,7 @@ ctx-zip: context [
                 crc     ; crc-32
                 compressed-size
                 uncompressed-size
-                to-ishort length-of name ; filename length
+                to-ishort length of name ; filename length
                 #{0000} ; extrafield length
                 name    ; filename
                         ; no extrafield
@@ -180,7 +180,7 @@ ctx-zip: context [
                 crc     ; crc-32
                 compressed-size
                 uncompressed-size
-                to-ishort length-of name ; filename length
+                to-ishort length of name ; filename length
                 #{0000} ; extrafield length
                 #{0000} ; filecomment length
                 #{0000} ; disknumber start
@@ -195,13 +195,13 @@ ctx-zip: context [
     ]
 
     any-file?: func [
-        "Returns TRUE for file and* url values." value [<opt> any-value!]
+        "Returns TRUE for file and url values." value [<opt> any-value!]
     ][
         any [file? value url? value]
     ]
 
     to-path-file: func [
-        {Converts url! to file! and* removes heading "/"}
+        {Converts url! to file! and removes heading "/"}
         value [file! url!] "AnyValue to convert"
     ][
         if file? value [
@@ -286,7 +286,7 @@ ctx-zip: context [
                 append central-directory entry/2
                 ; compressed file + header
                 out entry/1
-                files-size: files-size + length-of entry/1
+                files-size: files-size + length of entry/1
             ]
             ; next arg
             source: next source
@@ -298,7 +298,7 @@ ctx-zip: context [
             #{0000} ; disk central dir
             to-ishort nb-entries ; nb entries disk
             to-ishort nb-entries ; nb entries
-            to-ilong length-of central-directory
+            to-ilong length of central-directory
             to-ilong files-size
             #{0000} ; zip file comment length
                     ; zip file comment
@@ -337,7 +337,7 @@ ctx-zip: context [
                 (nb-entries: nb-entries + 1)
                 2 skip ; version
                 copy flags: 2 skip
-                    (if not zero? flags/1 and* 1 [return false])
+                    (if not zero? flags/1 and+ 1 [return false])
                 copy method-number: 2 skip (
                     method-number: get-ishort method-number
                     method: select [0 store 8 deflate] method-number
@@ -389,7 +389,7 @@ ctx-zip: context [
                             throw blank
                         ]
 
-                        if uncompressed-size != length-of data [
+                        if uncompressed-size != length of data [
                             info "^- -> failed [wrong output size]^/"
                             throw blank
                         ]
@@ -419,7 +419,7 @@ ctx-zip: context [
                             empty? uncompressed-data
                         ][blank][uncompressed-data]
                     ][
-                        ; make directory and* / or+ write file
+                        ; make directory and/or write file
                         either #"/" = last name [
                             if not exists? where/:name [
                                 make-dir/deep where/:name

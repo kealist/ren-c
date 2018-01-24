@@ -140,26 +140,39 @@ static void Append_To_Context(REBCTX *context, REBVAL *arg)
 
     RELVAL *item = VAL_ARRAY_AT(arg);
 
-    struct Reb_Binder binder;
-    INIT_BINDER(&binder);
+    // Can't actually fail() during a collect, so make sure any errors are
+    // set and then jump to a Collect_End()
+    //
+    REBCTX *error = NULL;
 
-    Collect_Keys_Start(COLLECT_ANY_WORD);
+    struct Reb_Collector collector;
+    Collect_Start(&collector, COLLECT_ANY_WORD | COLLECT_AS_TYPESET);
+
+    // Leave the [0] slot blank while collecting (ROOTKEY/ROOTPARAM), but
+    // valid (but "unreadable") bits so that the copy will still work.
+    //
+    Init_Unreadable_Blank(ARR_HEAD(BUF_COLLECT));
+    SET_ARRAY_LEN_NOTERM(BUF_COLLECT, 1);
 
     // Setup binding table with obj words.  Binding table is empty so don't
     // bother checking for duplicates.
     //
-    Collect_Context_Keys(&binder, context, FALSE);
+    Collect_Context_Keys(&collector, context, FALSE);
 
     // Examine word/value argument block
 
     RELVAL *word;
     for (word = item; NOT_END(word); word += 2) {
-        if (!IS_WORD(word) && !IS_SET_WORD(word))
-            fail (Error_Invalid_Arg_Core(word, VAL_SPECIFIER(arg)));
+        if (!IS_WORD(word) && !IS_SET_WORD(word)) {
+            error = Error_Invalid_Arg_Core(word, VAL_SPECIFIER(arg));
+            goto collect_end;
+        }
 
         REBSTR *canon = VAL_WORD_CANON(word);
 
-        if (Try_Add_Binder_Index(&binder, canon, ARR_LEN(BUF_COLLECT))) {
+        if (Try_Add_Binder_Index(
+            &collector.binder, canon, ARR_LEN(BUF_COLLECT))
+        ){
             //
             // Wasn't already collected...so we added it...
             //
@@ -168,55 +181,63 @@ static void Append_To_Context(REBCTX *context, REBVAL *arg)
                 ARR_LAST(BUF_COLLECT), ALL_64, VAL_WORD_SPELLING(word)
             );
         }
-        if (IS_END(word + 1)) break; // fix bug#708
+        if (IS_END(word + 1))
+            break; // fix bug#708
     }
 
     TERM_ARRAY_LEN(BUF_COLLECT, ARR_LEN(BUF_COLLECT));
 
     // Append new words to obj
     //
-    REBCNT len = CTX_LEN(context) + 1;
+    REBCNT len; // goto crosses initialization
+    len = CTX_LEN(context) + 1;
     Expand_Context(context, ARR_LEN(BUF_COLLECT) - len);
 
-    RELVAL *key;
-    for (key = ARR_AT(BUF_COLLECT, len); NOT_END(key); key++) {
-        assert(IS_TYPESET(key));
-        Append_Context(context, NULL, VAL_KEY_SPELLING(key));
+    RELVAL *collect_key;
+    for (
+        collect_key = ARR_AT(BUF_COLLECT, len);
+        NOT_END(collect_key);
+        ++collect_key
+    ){
+        assert(IS_TYPESET(collect_key));
+        Append_Context(context, NULL, VAL_KEY_SPELLING(collect_key));
     }
 
     // Set new values to obj words
     for (word = item; NOT_END(word); word += 2) {
-        REBCNT i = Try_Get_Binder_Index(&binder, VAL_WORD_CANON(word));
+        REBCNT i = Get_Binder_Index_Else_0(
+            &collector.binder, VAL_WORD_CANON(word)
+        );
         assert(i != 0);
 
         REBVAL *key = CTX_KEY(context, i);
         REBVAL *var = CTX_VAR(context, i);
 
-        if (GET_VAL_FLAG(var, VALUE_FLAG_PROTECTED))
-            fail (Error_Protected_Key(key));
+        if (GET_VAL_FLAG(var, CELL_FLAG_PROTECTED)) {
+            error = Error_Protected_Key(key);
+            goto collect_end;
+        }
 
-        if (GET_VAL_FLAG(key, TYPESET_FLAG_HIDDEN))
-            fail (Error_Hidden_Raw());
+        if (GET_VAL_FLAG(key, TYPESET_FLAG_HIDDEN)) {
+            error = Error_Hidden_Raw();
+            goto collect_end;
+        }
 
         if (IS_END(word + 1)) {
             Init_Blank(var);
             break; // fix bug#708
         }
         else {
+            assert(NOT_VAL_FLAG(&word[1], VALUE_FLAG_ENFIXED));
             Derelativize(var, &word[1], VAL_SPECIFIER(arg));
-
-            // Should the VALUE_FLAG_ENFIXED be preserved here?
-            //
-            if (GET_VAL_FLAG(&word[1], VALUE_FLAG_ENFIXED))
-                SET_VAL_FLAG(var, VALUE_FLAG_ENFIXED);
-
         }
     }
 
-    // release binding table
-    Collect_Keys_End(&binder);
+collect_end:
+    Collect_End(&collector);
 
-    SHUTDOWN_BINDER(&binder);
+    if (error != NULL)
+        fail (error);
 }
 
 
@@ -259,7 +280,7 @@ static REBCTX *Trim_Context(REBCTX *context)
         if (GET_VAL_FLAG(key, TYPESET_FLAG_HIDDEN))
             continue;
 
-        Move_Value(var_new, var);
+        Move_Var(var_new, var);
         ++var_new;
         Move_Value(key_new, key);
         ++key_new;
@@ -453,16 +474,15 @@ void TO_Context(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
 //
 //  PD_Context: C
 //
-REBINT PD_Context(REBPVS *pvs)
+REB_R PD_Context(REBPVS *pvs, const REBVAL *picker, const REBVAL *opt_setval)
 {
-    REBCTX *c = VAL_CONTEXT(pvs->value);
+    REBCTX *c = VAL_CONTEXT(pvs->out);
 
-    if (NOT(IS_WORD(pvs->picker)))
-        fail (Error_Bad_Path_Select(pvs));
+    if (NOT(IS_WORD(picker)))
+        return R_UNHANDLED;
 
-    REBCNT n = Find_Canon_In_Context(
-        c, VAL_WORD_CANON(pvs->picker), FALSE
-    );
+    const REBOOL always = FALSE;
+    REBCNT n = Find_Canon_In_Context(c, VAL_WORD_CANON(picker), always);
 
     if (n == 0) {
         //
@@ -470,27 +490,26 @@ REBINT PD_Context(REBPVS *pvs)
         // lookup that fails here is hacked in, but desirable for parity
         // with the behavior of GET-WORD!
         //
-        if (IS_GET_PATH(pvs->orig) && IS_END(pvs->item + 1)) {
-            Init_Void(pvs->store);
-            return PE_USE_STORE;
+        if (pvs->eval_type == REB_GET_PATH && FRM_AT_END(pvs)) {
+            Init_Void(pvs->out);
+            return R_OUT;
         }
-        fail (Error_Bad_Path_Select(pvs));
+        return R_UNHANDLED;
     }
 
     if (CTX_VARS_UNAVAILABLE(c))
-        fail (Error_No_Relative_Raw(pvs->picker));
+        fail (Error_No_Relative_Raw(picker));
 
-    if (pvs->opt_setval && IS_END(pvs->item + 1)) {
+    if (opt_setval != NULL) {
         FAIL_IF_READ_ONLY_CONTEXT(c);
 
-        if (GET_VAL_FLAG(CTX_VAR(c, n), VALUE_FLAG_PROTECTED))
-            fail (Error_Protected_Word_Raw(pvs->picker));
+        if (GET_VAL_FLAG(CTX_VAR(c, n), CELL_FLAG_PROTECTED))
+            fail (Error_Protected_Word_Raw(picker));
     }
 
-    pvs->value = CTX_VAR(c, n);
-    pvs->value_specifier = SPECIFIED;
+    Init_Reference(pvs->out, CTX_VAR(c, n), SPECIFIED);
 
-    return PE_SET_IF_END;
+    return R_REFERENCE;
 }
 
 
@@ -499,38 +518,27 @@ REBINT PD_Context(REBPVS *pvs)
 //
 //  {Get a reference to the "meta" object associated with a value.}
 //
-//      value [function! object! module!]
+//      value [function! any-context!]
 //  ]
 //
 REBNATIVE(meta_of)
 //
-// The first implementation of linking a "meta object" to another object
-// originates from the original module system--where it was called the
-// "module spec".  By moving it out of object REBVALs to the misc field of
-// a keylist, it becomes possible to change the meta object and have that
-// change seen by all references.
-//
-// As modules are still the first client of this meta information, it works
-// a similar way.  It is mutable by all references by default, unless
-// it is protected.
-//
-// !!! This feature is under development and expected to extend to functions
-// and possibly other types of values--both as the meta information, and
-// as being able to have the meta information.
+// See notes accompanying the `meta` field in the REBSER definition.
 {
     INCLUDE_PARAMS_OF_META_OF;
 
-    REBVAL *value = ARG(value);
+    REBVAL *v = ARG(value);
 
     REBCTX *meta;
-    if (IS_FUNCTION(value))
-        meta = VAL_FUNC_META(value);
+    if (IS_FUNCTION(v))
+        meta = VAL_FUNC_META(v);
     else {
-        assert(ANY_CONTEXT(value));
-        meta = VAL_CONTEXT_META(value);
+        assert(ANY_CONTEXT(v));
+        meta = MISC(CTX_VARLIST(VAL_CONTEXT(v))).meta;
     }
 
-    if (!meta) return R_BLANK;
+    if (meta == NULL)
+        return R_BLANK;
 
     Init_Object(D_OUT, meta);
     return R_OUT;
@@ -543,16 +551,13 @@ REBNATIVE(meta_of)
 //  {Set "meta" object associated with all references to a value.}
 //
 //      return: [<opt>]
-//      value [function! object! module!]
+//      value [function! any-context!]
 //      meta [object! blank!]
 //  ]
 //
 REBNATIVE(set_meta)
 //
-// !!! You cannot currently put meta information onto a FRAME!, because the
-// slot where the meta information would go is where the meta information
-// would live for the function--since frames use a functions "paramlist"
-// as their keylist.  Types taken are deliberately narrow for the moment.
+// See notes accompanying the `meta` field in the REBSER definition.
 {
     INCLUDE_PARAMS_OF_SET_META;
 
@@ -565,13 +570,13 @@ REBNATIVE(set_meta)
         meta = NULL;
     }
 
-    REBVAL *value = ARG(value);
+    REBVAL *v = ARG(value);
 
-    if (IS_FUNCTION(value))
-        SER(VAL_FUNC_PARAMLIST(value))->link.meta = meta;
+    if (IS_FUNCTION(v))
+        MISC(VAL_FUNC_PARAMLIST(v)).meta = meta;
     else {
-        assert(ANY_CONTEXT(value));
-        INIT_CONTEXT_META(VAL_CONTEXT(value), meta);
+        assert(ANY_CONTEXT(v));
+        MISC(CTX_VARLIST(VAL_CONTEXT(v))).meta = meta;
     }
 
     return R_VOID;
@@ -581,39 +586,285 @@ REBNATIVE(set_meta)
 //
 //  Copy_Context_Core: C
 //
-// R3-Alpha hadn't factored out a routine to copy objects, it was just in the
-// COPY action.  This is a basic factoring of that, which had the ability to
-// specify what types would be copied and whether they would be done deeply.
+// Copying a generic context is not as simple as getting the original varlist
+// and duplicating that.  For instance, a "live" FRAME! context (e.g. one
+// which is created by a function call on the stack) has to have its "vars"
+// (the args and locals) copied from the chunk stack.  Several other things
+// have to be touched up to ensure consistency of the rootval and the
+// relevant ->link and ->misc fields in the series node.
 //
-REBCTX *Copy_Context_Core(REBCTX *original, REBOOL deep, REBU64 types)
+REBCTX *Copy_Context_Core(REBCTX *original, REBU64 types)
 {
-    REBARR *varlist = Copy_Array_Shallow(CTX_VARLIST(original), SPECIFIED);
-    SET_SER_FLAG(varlist, ARRAY_FLAG_VARLIST);
+    if (CTX_VARS_UNAVAILABLE(original))
+        fail ("Cannot copy a context with unavailable vars"); // !!! improve
+
+    REBARR *original_array = NULL; // may not be an array
+    REBARR *varlist = Make_Array_For_Copy(
+        CTX_LEN(original) + 1, SERIES_MASK_NONE, original_array
+    );
+    REBVAL *dest = KNOWN(ARR_HEAD(varlist)); // all context vars are SPECIFIED
 
     // The type information and fields in the rootvar (at head of the varlist)
-    // are filled in because it's a copy, but the varlist needs to be updated
-    // in the copy to the one just created.
+    // get filled in with a copy, but the varlist needs to be updated in the
+    // copied rootvar to the one just created.
     //
-    ARR_HEAD(varlist)->payload.any_context.varlist = varlist;
+    Move_Value(dest, CTX_VALUE(original));
+    dest->payload.any_context.varlist = varlist;
+
+    ++dest;
+
+    // Now copy the actual vars in the context, from wherever they may be
+    // (might be in an array, or might be in the chunk stack for FRAME!)
+    //
+    REBVAL *src = CTX_VARS_HEAD(original);
+    for (; NOT_END(src); ++src, ++dest)
+        Move_Var(dest, src); // must preserve VALUE_FLAG_ENFIXED
+
+    TERM_ARRAY_LEN(varlist, CTX_LEN(original) + 1);
+    SET_SER_FLAG(varlist, ARRAY_FLAG_VARLIST);
 
     REBCTX *copy = CTX(varlist); // now a well-formed context
 
     // Reuse the keylist of the original.  (If the context of the source or
     // the copy are expanded, the sharing is unlinked and a copy is made).
+    // This goes into the ->link field of the REBSER node.
     //
     INIT_CTX_KEYLIST_SHARED(copy, CTX_KEYLIST(original));
+
+    // A FRAME! in particular needs to know if it points back to a stack
+    // frame.  The pointer is NULLed out when the stack level completes.
+    // If we're copying a frame here, we know it's not running.
+    //
+    if (CTX_TYPE(original) == REB_FRAME)
+        MISC(varlist).meta = NULL;
+    else {
+        // !!! Should the meta object be copied for other context types?
+        // Deep copy?  Shallow copy?  Just a reference to the same object?
+        //
+        MISC(varlist).meta = NULL;
+    }
 
     if (types != 0) {
         Clonify_Values_Len_Managed(
             CTX_VARS_HEAD(copy),
             SPECIFIED,
             CTX_LEN(copy),
-            deep,
+            SERIES_MASK_NONE,
             types
         );
     }
 
     return copy;
+}
+
+
+//
+//  MF_Context: C
+//
+void MF_Context(REB_MOLD *mo, const RELVAL *v, REBOOL form)
+{
+    REBCTX *c = VAL_CONTEXT(v);
+
+    // Prevent endless mold loop:
+    //
+    if (Find_Pointer_In_Series(TG_Mold_Stack, c) != NOT_FOUND) {
+        if (NOT(form)) {
+            Pre_Mold(mo, v); // If molding, get #[object! etc.
+            Append_Codepoint(mo->series, '[');
+        }
+        Append_Unencoded(mo->series, "...");
+
+        if (NOT(form)) {
+            Append_Codepoint(mo->series, ']');
+            End_Mold(mo);
+        }
+        return;
+    }
+    Push_Pointer_To_Series(TG_Mold_Stack, c);
+
+    if (form) {
+        //
+        // Mold all words and their values:
+        //
+        REBVAL *key = CTX_KEYS_HEAD(c);
+        REBVAL *var = CTX_VARS_HEAD(c);
+        REBOOL had_output = FALSE;
+        for (; NOT_END(key); key++, var++) {
+            if (NOT_VAL_FLAG(key, TYPESET_FLAG_HIDDEN)) {
+                had_output = TRUE;
+                Emit(mo, "N: V\n", VAL_KEY_SPELLING(key), var);
+            }
+        }
+
+        // Remove the final newline...but only if WE added to the buffer
+        //
+        if (had_output) {
+            SET_SERIES_LEN(mo->series, SER_LEN(mo->series) - 1);
+            TERM_SEQUENCE(mo->series);
+        }
+
+        Drop_Pointer_From_Series(TG_Mold_Stack, c);
+        return;
+    }
+
+    // Otherwise we are molding
+
+    Pre_Mold(mo, v);
+
+    Append_Codepoint(mo->series, '[');
+
+    mo->indent++;
+
+    // !!! New experimental Ren-C code for the [[spec][body]] format of the
+    // non-evaluative MAKE OBJECT!.
+
+    // First loop: spec block.  This is difficult because unlike functions,
+    // objects are dynamically modified with new members added.  If the spec
+    // were captured with strings and other data in it as separate from the
+    // "keylist" information, it would have to be updated to reflect newly
+    // added fields in order to be able to run a corresponding MAKE OBJECT!.
+    //
+    // To get things started, we aren't saving the original spec that made
+    // the object...but regenerate one from the keylist.  If this were done
+    // with functions, they would "forget" their help strings in MOLDing.
+
+    New_Indented_Line(mo);
+    Append_Codepoint(mo->series, '[');
+
+    REBVAL *keys_head = CTX_KEYS_HEAD(c);
+    REBVAL *vars_head;
+    if (CTX_VARS_UNAVAILABLE(VAL_CONTEXT(v))) {
+        //
+        // If something like a function call has gone of the stack, the data
+        // for the vars will no longer be available.  The keys should still
+        // be good, however.
+        //
+        vars_head = NULL;
+    }
+    else
+        vars_head = CTX_VARS_HEAD(VAL_CONTEXT(v));
+
+    REBVAL *key = keys_head;
+    for (; NOT_END(key); ++key) {
+        if (GET_VAL_FLAG(key, TYPESET_FLAG_HIDDEN))
+            continue;
+
+        if (key != keys_head)
+            Append_Codepoint(mo->series, ' ');
+
+        // !!! Feature of "private" words in object specs not yet implemented,
+        // but if it paralleled how <local> works for functions then it would
+        // be shown as SET-WORD!
+        //
+        DECLARE_LOCAL (any_word);
+        Init_Any_Word(any_word, REB_WORD, VAL_KEY_SPELLING(key));
+        Mold_Value(mo, any_word);
+    }
+
+    Append_Codepoint(mo->series, ']');
+    New_Indented_Line(mo);
+    Append_Codepoint(mo->series, '[');
+
+    mo->indent++;
+
+    key = keys_head;
+
+    REBVAL *var = vars_head;
+
+    for (; NOT_END(key); var ? (++key, ++var) : ++key) {
+        if (GET_VAL_FLAG(key, TYPESET_FLAG_HIDDEN))
+            continue;
+
+        // Having the key mentioned in the spec and then not being assigned
+        // a value in the body is how voids are denoted.
+        //
+        if (var && IS_VOID(var))
+            continue;
+
+        New_Indented_Line(mo);
+
+        REBSTR *spelling = VAL_KEY_SPELLING(key);
+        Append_UTF8_May_Fail(
+            mo->series, STR_HEAD(spelling), STR_NUM_BYTES(spelling)
+        );
+
+        Append_Unencoded(mo->series, ": ");
+
+        if (var)
+            Mold_Value(mo, var);
+        else
+            Append_Unencoded(mo->series, ": --optimized out--");
+    }
+
+    mo->indent--;
+    New_Indented_Line(mo);
+    Append_Codepoint(mo->series, ']');
+    mo->indent--;
+    New_Indented_Line(mo);
+    Append_Codepoint(mo->series, ']');
+
+    End_Mold(mo);
+
+    Drop_Pointer_From_Series(TG_Mold_Stack, c);
+}
+
+
+//
+//  Context_Common_Action_Maybe_Unhandled: C
+//
+// Similar to Series_Common_Action_Maybe_Unhandled.  Introduced because
+// PORT! wants to act like a context for some things, but if you ask an
+// ordinary object if it's OPEN? it doesn't know how to do that.
+//
+REB_R Context_Common_Action_Maybe_Unhandled(
+    REBFRM *frame_,
+    REBSYM action
+){
+    REBVAL *value = D_ARG(1);
+    REBVAL *arg = D_ARGC > 1 ? D_ARG(2) : NULL;
+
+    REBCTX *c = VAL_CONTEXT(value);
+
+    switch (action) {
+
+    case SYM_REFLECT: {
+        REBSYM property = VAL_WORD_SYM(arg);
+        assert(property != SYM_0);
+
+        switch (property) {
+        case SYM_LENGTH: // !!! Should this be legal?
+            Init_Integer(D_OUT, CTX_LEN(c));
+            return R_OUT;
+
+        case SYM_TAIL_Q: // !!! Should this be legal?
+            Init_Logic(D_OUT, LOGICAL(CTX_LEN(c) == 0));
+            return R_OUT;
+
+        case SYM_WORDS:
+            Init_Block(D_OUT, Context_To_Array(c, 1));
+            return R_OUT;
+
+        case SYM_VALUES:
+            Init_Block(D_OUT, Context_To_Array(c, 2));
+            return R_OUT;
+
+        case SYM_BODY:
+            Init_Block(D_OUT, Context_To_Array(c, 3));
+            return R_OUT;
+
+        // Noticeably not handled by average objects: SYM_OPEN_Q (`open?`)
+
+        default:
+            break;
+        }
+
+        break; }
+
+    default:
+        break;
+    }
+
+    return R_UNHANDLED; // not a common operation, not handled
 }
 
 
@@ -624,22 +875,27 @@ REBCTX *Copy_Context_Core(REBCTX *original, REBOOL deep, REBU64 types)
 //
 REBTYPE(Context)
 {
+    REB_R r = Context_Common_Action_Maybe_Unhandled(frame_, action);
+    if (r != R_UNHANDLED)
+        return r;
+
     REBVAL *value = D_ARG(1);
     REBVAL *arg = D_ARGC > 1 ? D_ARG(2) : NULL;
 
+    REBCTX *c = VAL_CONTEXT(value);
+
     switch (action) {
+
+    case SYM_REFLECT:
+        // should be handled by the common handler
+        break;
+
     case SYM_APPEND:
-        FAIL_IF_READ_ONLY_CONTEXT(VAL_CONTEXT(value));
+        FAIL_IF_READ_ONLY_CONTEXT(c);
         if (!IS_OBJECT(value) && !IS_MODULE(value))
             fail (Error_Illegal_Action(VAL_TYPE(value), action));
-        Append_To_Context(VAL_CONTEXT(value), arg);
+        Append_To_Context(c, arg);
         Move_Value(D_OUT, D_ARG(1));
-        return R_OUT;
-
-    case SYM_LENGTH_OF:
-        if (!IS_OBJECT(value))
-            fail (Error_Illegal_Action(VAL_TYPE(value), action));
-        Init_Integer(D_OUT, CTX_LEN(VAL_CONTEXT(value)));
         return R_OUT;
 
     case SYM_COPY: { // Note: words are not copied and bindings not changed!
@@ -664,11 +920,7 @@ REBTYPE(Context)
         else
             types = 0;
 
-        Init_Any_Context(
-            D_OUT,
-            VAL_TYPE(value),
-            Copy_Context_Core(VAL_CONTEXT(value), REF(deep), types)
-        );
+        Init_Any_Context(D_OUT, VAL_TYPE(value), Copy_Context_Core(c, types));
         return R_OUT; }
 
     case SYM_SELECT_P:
@@ -676,36 +928,19 @@ REBTYPE(Context)
         if (!IS_WORD(arg))
             return R_BLANK;
 
-        REBCNT n = Find_Canon_In_Context(
-            VAL_CONTEXT(value), VAL_WORD_CANON(arg), FALSE
-        );
+        REBCNT n = Find_Canon_In_Context(c, VAL_WORD_CANON(arg), FALSE);
 
         if (n == 0)
             return R_BLANK;
 
-        if (cast(REBCNT, n) > CTX_LEN(VAL_CONTEXT(value)))
+        if (cast(REBCNT, n) > CTX_LEN(c))
             return R_BLANK;
 
         if (action == SYM_FIND) return R_TRUE;
 
-        Move_Value(D_OUT, CTX_VAR(VAL_CONTEXT(value), n));
+        Move_Value(D_OUT, CTX_VAR(c, n));
         return R_OUT;
     }
-
-    case SYM_REFLECT: {
-        REBSYM sym = VAL_WORD_SYM(arg);
-        REBCNT reflector;
-
-        switch (sym) {
-        case SYM_WORDS: reflector = 1; break;
-        case SYM_VALUES: reflector = 2; break;
-        case SYM_BODY: reflector = 3; break;
-        default:
-            fail (Error_Cannot_Reflect(VAL_TYPE(value), arg));
-        }
-
-        Init_Block(D_OUT, Context_To_Array(VAL_CONTEXT(value), reflector));
-        return R_OUT; }
 
     case SYM_TRIM: {
         INCLUDE_PARAMS_OF_TRIM;
@@ -724,19 +959,8 @@ REBTYPE(Context)
             fail (Error_Bad_Refines_Raw());
         }
 
-        Init_Any_Context(
-            D_OUT,
-            VAL_TYPE(value),
-            Trim_Context(VAL_CONTEXT(value))
-        );
+        Init_Any_Context(D_OUT, VAL_TYPE(value), Trim_Context(c));
         return R_OUT; }
-
-    case SYM_TAIL_Q:
-        if (IS_OBJECT(value)) {
-            Init_Logic(D_OUT, LOGICAL(CTX_LEN(VAL_CONTEXT(value)) == 0));
-            return R_OUT;
-        }
-        fail (Error_Illegal_Action(VAL_TYPE(value), action));
 
     default:
         break;
@@ -783,23 +1007,7 @@ REBNATIVE(construct)
     enum Reb_Kind target;
     REBCTX *context;
 
-    if (IS_STRUCT(spec)) {
-        //
-        // !!! Compatibility for `MAKE struct [...]` from Atronix R3.  There
-        // isn't any real "inheritance management" for structs but it allows
-        // the re-use of the structure's field definitions, so it is a means
-        // of saving on memory (?)
-        //
-        REBSTU *stu = Copy_Struct_Managed(VAL_STRUCT(spec));
-
-        Move_Value(D_OUT, STU_VALUE(stu));
-
-        // !!! Comment said "only accept value initialization"
-        //
-        Init_Struct_Fields(D_OUT, body);
-        return R_OUT;
-    }
-    else if (IS_GOB(spec)) {
+    if (IS_GOB(spec)) {
         //
         // !!! Compatibility for `MAKE gob [...]` or `MAKE gob NxN` from
         // R3-Alpha GUI.  Start by copying the gob (minus pane and parent),

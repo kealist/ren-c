@@ -130,6 +130,60 @@ void TO_Function(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
 
 
 //
+//  MF_Function: C
+//
+void MF_Function(REB_MOLD *mo, const RELVAL *v, REBOOL form)
+{
+    UNUSED(form);
+
+    Pre_Mold(mo, v);
+
+    Append_Codepoint(mo->series, '[');
+
+    // !!! The system is no longer keeping the spec of functions, in order
+    // to focus on a generalized "meta info object" service.  MOLD of
+    // functions temporarily uses the word list as a substitute (which
+    // drops types)
+    //
+    REBARR *words_list = List_Func_Words(v, TRUE); // show pure locals
+    Mold_Array_At(mo, words_list, 0, 0);
+    Free_Array(words_list);
+
+    if (IS_FUNCTION_INTERPRETED(v)) {
+        //
+        // MOLD is an example of user-facing code that needs to be complicit
+        // in the "lie" about the effective bodies of the functions made
+        // by the optimized generators FUNC and PROC...
+
+        REBOOL is_fake;
+        REBARR *body = Get_Maybe_Fake_Func_Body(&is_fake, const_KNOWN(v));
+
+        Mold_Array_At(mo, body, 0, 0);
+
+        if (is_fake)
+            Free_Array(body); // was shallow copy
+    }
+    else if (IS_FUNCTION_SPECIALIZER(v)) {
+        //
+        // !!! Interim form of looking at specialized functions... show
+        // the frame
+        //
+        //     >> source first
+        //     first: make function! [[aggregate index] [
+        //         aggregate: $void
+        //         index: 1
+        //     ]]
+        //
+        REBVAL *exemplar = KNOWN(VAL_FUNC_BODY(v));
+        Mold_Value(mo, exemplar);
+    }
+
+    Append_Codepoint(mo->series, ']');
+    End_Mold(mo);
+}
+
+
+//
 //  REBTYPE: C
 //
 REBTYPE(Function)
@@ -163,15 +217,13 @@ REBTYPE(Function)
         // code, yet has a distinct identity.  This means it would not be
         // HIJACK'd if the function that it was copied from was.
 
-        REBFUN *underlying = FUNC_UNDERLYING(VAL_FUNC(value));
-
         REBARR *proxy_paramlist = Copy_Array_Deep_Managed(
             VAL_FUNC_PARAMLIST(value),
             SPECIFIED // !!! Note: not actually "deep", just typesets
         );
         ARR_HEAD(proxy_paramlist)->payload.function.paramlist
             = proxy_paramlist;
-        SER(proxy_paramlist)->link.meta = VAL_FUNC_META(value);
+        MISC(proxy_paramlist).meta = VAL_FUNC_META(value);
         SET_SER_FLAG(proxy_paramlist, ARRAY_FLAG_PARAMLIST);
 
         // If the function had code, then that code will be bound relative
@@ -183,13 +235,14 @@ REBTYPE(Function)
         REBFUN *proxy = Make_Function(
             proxy_paramlist,
             FUNC_DISPATCHER(VAL_FUNC(value)),
-            underlying,
-            NULL // not changing the specialization
+            FUNC_FACADE(VAL_FUNC(value)), // can reuse the facade
+            FUNC_EXEMPLAR(VAL_FUNC(value)) // not changing the specialization
         );
 
-        // A new body_holder was created inside Make_Function().
+        // A new body_holder was created inside Make_Function().  Rare case
+        // where we can bit-copy a possibly-relative value.
         //
-        *FUNC_BODY(proxy) = *VAL_FUNC_BODY(value);
+        Blit_Cell(FUNC_BODY(proxy), VAL_FUNC_BODY(value));
 
         Move_Value(D_OUT, FUNC_VALUE(proxy));
         D_OUT->extra.binding = VAL_BINDING(value);
@@ -199,18 +252,11 @@ REBTYPE(Function)
         REBSYM sym = VAL_WORD_SYM(arg);
 
         switch (sym) {
-        case SYM_ADDR:
-            if (IS_FUNCTION_RIN(value)) {
-                //
-                // The CFUNC is fabricated by the FFI if it's a callback, or
-                // just the wrapped DLL function if it's an ordinary routine
-                //
-                Init_Integer(
-                    D_OUT, cast(REBUPT, RIN_CFUNC(VAL_FUNC_ROUTINE(value)))
-                );
+
+        case SYM_CONTEXT: {
+            if (Get_Context_Of(D_OUT, value))
                 return R_OUT;
-            }
-            break;
+            return R_BLANK; }
 
         case SYM_WORDS:
             Init_Block(D_OUT, List_Func_Words(value, FALSE)); // no locals
@@ -298,6 +344,36 @@ REBTYPE(Function)
             return R_OUT;
         }
 
+        // We use a heuristic that if the first element of a function's body
+        // is a series with the file and line bits set, then that's what it
+        // returns for FILE OF and LINE OF.
+        //
+        case SYM_FILE: {
+            if (NOT(ANY_SERIES(VAL_FUNC_BODY(value))))
+                return R_BLANK;
+
+            REBSER *s = VAL_SERIES(VAL_FUNC_BODY(value));
+
+            if (NOT_SER_FLAG(s, SERIES_FLAG_FILE_LINE))
+                return R_BLANK;
+
+            // !!! How to tell whether it's a URL! or a FILE! ?
+            //
+            Scan_File(D_OUT, STR_HEAD(LINK(s).file), SER_LEN(LINK(s).file));
+            return R_OUT; }
+
+        case SYM_LINE: {
+            if (NOT(ANY_SERIES(VAL_FUNC_BODY(value))))
+                return R_BLANK;
+
+            REBSER *s = VAL_SERIES(VAL_FUNC_BODY(value));
+
+            if (NOT_SER_FLAG(s, SERIES_FLAG_FILE_LINE))
+                return R_BLANK;
+
+            Init_Integer(D_OUT, MISC(s).line);
+            return R_OUT; }
+
         default:
             fail (Error_Cannot_Reflect(VAL_TYPE(value), arg));
         }
@@ -321,12 +397,16 @@ REBTYPE(Function)
 //
 REBNATIVE(func_class_of)
 //
-// !!! The concept of the VAL_FUNC_CLASS was killed, because functions get
-// their classification by way of their dispatch pointers.  Generally
-// speaking, functions should be a "black box" to user code, and it's only
-// at the "meta" level that a function would choose to expose whether it
-// is something like a specialization or an adaptation...but that would be
-// purely documentary, and could lie.
+// !!! This is a stopgap measure.  Generally speaking, functions should be a
+// "black box" to user code, and it's only in META-OF data that a function
+// would choose to expose whether it is something like a specialization or an
+// adaptation.
+//
+// Currently, BODY-OF relies on this.  But not only do not all functions have
+// "bodies" (specializations, etc.) some have C code bodies (natives).
+// With a variety of dispatchers, there would need to be some reverse lookup
+// by dispatcher to reliably provide reflectors (META-OF could work but could
+// get out of sync with the dispatcher, e.g. with hijacking)
 {
     INCLUDE_PARAMS_OF_FUNC_CLASS_OF;
 
@@ -337,17 +417,11 @@ REBNATIVE(func_class_of)
         n = 2;
     else if (IS_FUNCTION_ACTION(value))
         n = 3;
-    else if (IS_FUNCTION_RIN(value)) {
-        if (NOT(RIN_IS_CALLBACK(VAL_FUNC_ROUTINE(value))))
-            n = 5;
-        else
-            n = 6;
-    }
     else if (IS_FUNCTION_SPECIALIZER(value))
         n = 7;
     else {
         // !!! A shaky guess, but assume native if none of the above.
-        // (COMMAND! was once 4)
+        // (COMMAND! was once 4, 5 and 6 were routine and callback).
         n = 1;
     }
 
@@ -359,22 +433,25 @@ REBNATIVE(func_class_of)
 //
 //  PD_Function: C
 //
-REBINT PD_Function(REBPVS *pvs)
+REB_R PD_Function(REBPVS *pvs, const REBVAL *picker, const REBVAL *opt_setval)
 {
-    if (IS_BLANK(pvs->picker)) {
+    UNUSED(pvs);
+    UNUSED(opt_setval);
+
+    if (IS_BLANK(picker)) {
         //
         // Leave the function value as-is, and continue processing.  This
         // enables things like `append/(all [foo 'dup])/only`...
         //
-        return PE_OK;
+        return R_OUT;
     }
 
     // The first evaluation of a GROUP! and GET-WORD! are processed by the
     // general path mechanic before reaching this dispatch.  So if it's not
     // a word or one of those that evaluated to a word raise an error.
     //
-    if (!IS_WORD(pvs->picker))
-        fail (Error_Bad_Refine_Raw(pvs->picker));
+    if (!IS_WORD(picker))
+        fail (Error_Bad_Refine_Raw(picker));
 
     // We could generate a "refined" function variant at each step:
     //
@@ -385,7 +462,7 @@ REBINT PD_Function(REBPVS *pvs)
     // understood to push the canonized word to the data stack in the
     // function case.
     //
-    DS_PUSH(pvs->picker);
+    DS_PUSH(picker);
 
     // Go ahead and canonize the word symbol so we don't have to do it each
     // time in order to get a case-insensitive compare.  (Note that canons can
@@ -393,7 +470,7 @@ REBINT PD_Function(REBPVS *pvs)
     //
     Canonize_Any_Word(DS_TOP);
 
-    // Leave the function value as is in pvs->value
+    // Leave the function value as is in pvs->out
     //
-    return PE_OK;
+    return R_OUT;
 }

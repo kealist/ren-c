@@ -58,7 +58,7 @@ REBOOL Reduce_Any_Array_Throws(
 
     DECLARE_LOCAL (reduced);
 
-    while (NOT_END(f->value)) {
+    while (FRM_HAS_MORE(f)) {
         if (IS_BAR(f->value)) {
             if (flags & REDUCE_FLAG_KEEP_BARS) {
                 DS_PUSH_TRASH;
@@ -95,7 +95,13 @@ REBOOL Reduce_Any_Array_Throws(
     if (flags & REDUCE_FLAG_INTO)
         Pop_Stack_Values_Into(out, dsp_orig);
     else
-        Init_Any_Array(out, VAL_TYPE(any_array), Pop_Stack_Values(dsp_orig));
+        Init_Any_Array(
+            out,
+            VAL_TYPE(any_array),
+            Pop_Stack_Values_Core(
+                dsp_orig, NODE_FLAG_MANAGED | SERIES_FLAG_FILE_LINE
+            )
+        );
 
     Drop_Frame(f);
     return FALSE;
@@ -199,7 +205,7 @@ REBOOL Compose_Any_Array_Throws(
     DECLARE_LOCAL (composed);
     DECLARE_LOCAL (specific);
 
-    while (NOT_END(f->value)) {
+    while (FRM_HAS_MORE(f)) {
         if (IS_GROUP(f->value)) {
             //
             // Evaluate the GROUP! at current position into `composed` cell.
@@ -301,7 +307,13 @@ REBOOL Compose_Any_Array_Throws(
     if (into)
         Pop_Stack_Values_Into(out, dsp_orig);
     else
-        Init_Any_Array(out, VAL_TYPE(any_array), Pop_Stack_Values(dsp_orig));
+        Init_Any_Array(
+            out,
+            VAL_TYPE(any_array),
+            Pop_Stack_Values_Core(
+                dsp_orig, NODE_FLAG_MANAGED | SERIES_FLAG_FILE_LINE
+            )
+        );
 
     Drop_Frame(f);
     return FALSE;

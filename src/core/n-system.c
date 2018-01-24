@@ -124,8 +124,10 @@ REBNATIVE(exit_rebol)
 //      size [integer!]
 //      /torture
 //          "Constant recycle (for internal debugging)"
+//      /watch
+//          "Monitor recycling (debug only)"
 //      /verbose
-//          "Dump out information about series being recycled"
+//          "Dump out information about series being recycled (debug only)"
 //  ]
 //
 REBNATIVE(recycle)
@@ -181,172 +183,20 @@ REBNATIVE(recycle)
         count = Recycle();
     }
 
+    if (REF(watch)) {
+    #if defined(NDEBUG)
+        fail (Error_Debug_Only_Raw());
+    #else
+        // There might should be some kind of generic way to set these kinds
+        // of flags individually, perhaps having them live in SYSTEM/...
+        //
+        Reb_Opts->watch_recycle = NOT(Reb_Opts->watch_recycle);
+        Reb_Opts->watch_expand = NOT(Reb_Opts->watch_expand);
+    #endif
+    }
+
     Init_Integer(D_OUT, count);
     return R_OUT;
-}
-
-
-//
-//  stats: native [
-//
-//  {Provides status and statistics information about the interpreter.}
-//
-//      /show
-//          "Print formatted results to console"
-//      /profile
-//          "Returns profiler object"
-//      /timer
-//          "High resolution time difference from start"
-//      /evals
-//          "Number of values evaluated by interpreter"
-//      /dump-series
-//          "Dump all series in pool"
-//      pool-id [integer!]
-//          "-1 for all pools"
-//  ]
-//
-REBNATIVE(stats)
-{
-    INCLUDE_PARAMS_OF_STATS;
-
-    if (REF(timer)) {
-        VAL_RESET_HEADER(D_OUT, REB_TIME);
-        VAL_NANO(D_OUT) = OS_DELTA_TIME(PG_Boot_Time, 0) * 1000;
-        return R_OUT;
-    }
-
-    if (REF(evals)) {
-        REBI64 n = Eval_Cycles + Eval_Dose - Eval_Count;
-        Init_Integer(D_OUT, n);
-        return R_OUT;
-    }
-
-#ifdef NDEBUG
-    UNUSED(REF(show));
-    UNUSED(REF(profile));
-    UNUSED(REF(dump_series));
-    UNUSED(ARG(pool_id));
-
-    fail (Error_Debug_Only_Raw());
-#else
-    if (REF(profile)) {
-        Move_Value(D_OUT, Get_System(SYS_STANDARD, STD_STATS));
-        if (IS_OBJECT(D_OUT)) {
-            REBVAL *stats = VAL_CONTEXT_VAR(D_OUT, 1);
-
-            VAL_RESET_HEADER(stats, REB_TIME);
-            VAL_NANO(stats) = OS_DELTA_TIME(PG_Boot_Time, 0) * 1000;
-            stats++;
-            Init_Integer(stats, Eval_Cycles + Eval_Dose - Eval_Count);
-            stats++;
-            Init_Integer(stats, 0); // no such thing as natives, only functions
-            stats++;
-            Init_Integer(stats, Eval_Functions);
-
-            stats++;
-            Init_Integer(stats, PG_Reb_Stats->Series_Made);
-            stats++;
-            Init_Integer(stats, PG_Reb_Stats->Series_Freed);
-            stats++;
-            Init_Integer(stats, PG_Reb_Stats->Series_Expanded);
-            stats++;
-            Init_Integer(stats, PG_Reb_Stats->Series_Memory);
-            stats++;
-            Init_Integer(stats, PG_Reb_Stats->Recycle_Series_Total);
-
-            stats++;
-            Init_Integer(stats, PG_Reb_Stats->Blocks);
-            stats++;
-            Init_Integer(stats, PG_Reb_Stats->Objects);
-
-            stats++;
-            Init_Integer(stats, PG_Reb_Stats->Recycle_Counter);
-        }
-
-        return R_OUT;
-    }
-
-    if (REF(dump_series)) {
-        REBVAL *pool_id = ARG(pool_id);
-        Dump_Series_In_Pool(VAL_INT32(pool_id));
-        return R_BLANK;
-    }
-
-    Init_Integer(D_OUT, Inspect_Series(REF(show)));
-
-    if (REF(show))
-        Dump_Pools();
-
-    return R_OUT;
-#endif
-}
-
-
-//
-//  evoke: native [
-//
-//  "Special guru meditations. (Not for beginners.)"
-//
-//      chant [word! block! integer!]
-//          "Single or block of words ('? to list)"
-//  ]
-//
-REBNATIVE(evoke)
-{
-    INCLUDE_PARAMS_OF_EVOKE;
-
-#ifdef NDEBUG
-    UNUSED(ARG(chant));
-
-    fail (Error_Debug_Only_Raw());
-#else
-    RELVAL *arg = ARG(chant);
-    REBCNT len;
-
-    Check_Security(Canon(SYM_DEBUG), POL_READ, 0);
-
-    if (IS_BLOCK(arg)) {
-        len = VAL_LEN_AT(arg);
-        arg = VAL_ARRAY_AT(arg);
-    }
-    else len = 1;
-
-    for (; len > 0; len--, arg++) {
-        if (IS_WORD(arg)) {
-            switch (VAL_WORD_SYM(arg)) {
-            case SYM_CRASH_DUMP:
-                Reb_Opts->crash_dump = TRUE;
-                break;
-
-            case SYM_WATCH_RECYCLE:
-                Reb_Opts->watch_recycle = NOT(Reb_Opts->watch_recycle);
-                break;
-
-            case SYM_CRASH:
-                panic ("evoke 'crash was executed");
-
-            default:
-                Debug_Fmt(RM_EVOKE_HELP);
-            }
-        }
-        if (IS_INTEGER(arg)) {
-            switch (Int32(arg)) {
-            case 0:
-                Check_Memory_Debug();
-                break;
-
-            case 1:
-                Reb_Opts->watch_expand = TRUE;
-                break;
-
-            default:
-                Debug_Fmt(RM_EVOKE_HELP);
-            }
-        }
-    }
-
-    return R_VOID;
-#endif
 }
 
 
@@ -410,6 +260,10 @@ REBNATIVE(check)
 #else
     REBVAL *value = ARG(value);
 
+    // For starters, check the memory (if it's bad, all other bets are off)
+    //
+    Check_Memory_Debug();
+
     // !!! Should call generic ASSERT_VALUE macro with more cases
     //
     if (ANY_SERIES(value)) {
@@ -427,35 +281,147 @@ REBNATIVE(check)
 #endif
 }
 
+
+// Fast count of number of binary digits in a number:
 //
-//  c-break-debug: native [
+// https://stackoverflow.com/a/15327567/211160
 //
-//  "Break at next evaluation point, use ONLY when running under a C debugger"
+int ceil_log2(unsigned long long x) {
+    static const unsigned long long t[6] = {
+        0xFFFFFFFF00000000ull,
+        0x00000000FFFF0000ull,
+        0x000000000000FF00ull,
+        0x00000000000000F0ull,
+        0x000000000000000Cull,
+        0x0000000000000002ull
+    };
+
+    int y = (((x & (x - 1)) == 0) ? 0 : 1);
+    int j = 32;
+    int i;
+
+    for (i = 0; i < 6; i++) {
+    int k = (((x & t[i]) == 0) ? 0 : j);
+        y += k;
+        x >>= k;
+        j >>= 1;
+    }
+
+    return y;
+}
+
+
+//
+//  c-debug-break-at: native [
+//
+//  {Break at known evaluation point (only use when running under C debugger}
+//
 //      return: [<opt>]
-//      /skip
-//          points [integer!]
-//          {points to skip before breaking: 0 being next point}
-//      /at
-//          point [integer!]
-//          {Break at a certain point}
+//      tick [integer! blank!]
+//          {Get from PANIC, REBFRM.tick, REBSER.tick, REBVAL.extra.tick}
+//      /relative
+//          {TICK parameter represents a count relative to the current tick}
+//      /compensate
+//          {Round tick up, as in https://math.stackexchange.com/q/2521219/}
+// ]
+//
+REBNATIVE(c_debug_break_at)
+{
+    INCLUDE_PARAMS_OF_C_DEBUG_BREAK_AT;
+
+#ifndef NDEBUG
+    if (REF(compensate)) {
+        //
+        // Imagine two runs of Rebol console initialization.  In the first,
+        // the tick count is 304 when C-DEBUG-BREAK/COMPENSATE is called,
+        // right after command line parsing.  Later on a panic() is hit and
+        // reports tick count 1020 in the crash log.
+        //
+        // Wishing to pick apart the bug before it happens, the Rebol Core
+        // Developer then re-runs the program with `--breakpoint=1020`, hoping
+        // to break at that tick, to catch the downstream appearance of the
+        // tick in the panic().  But since command-line processing is in
+        // usermode, the addition of the parameter throws off the ticks!
+        //
+        // https://en.wikipedia.org/wiki/Observer_effect_(physics)
+        //
+        // Let's say that after the command line processing, it still runs
+        // C-DEBUG-BREAK/COMPENSATE, this time at tick 403.  Imagine our goal
+        // is to make the parameter to /COMPENSATE something that can be used
+        // to conservatively guess the same value to set the tick to, and
+        // that /COMPENSATE ARG(bound) that gives a maximum of how far off we
+        // could possibly be from the "real" tick. (e.g. "argument processing
+        // took no more than 200 additional ticks", which this is consistent
+        // with...since 403-304 = 99).
+        //
+        // The reasoning for why the formula below works for this rounding is
+        // given in this StackExchange question and answer:
+        //
+        // https://math.stackexchange.com/q/2521219/
+        //
+        TG_Tick =
+            (cast(REBUPT, 1) << (ceil_log2(TG_Tick) + 1))
+            + VAL_INT64(ARG(tick))
+            - 1;
+        return R_VOID;
+    }
+
+    if (REF(relative))
+        TG_Break_At_Tick = frame_->tick + 1 + VAL_INT64(ARG(tick));
+    else
+        TG_Break_At_Tick = VAL_INT64(ARG(tick));
+    return R_VOID;
+#else
+    UNUSED(ARG(tick));
+    UNUSED(ARG(relative));
+    UNUSED(REF(compensate));
+
+    fail (Error_Debug_Only_Raw());
+#endif
+}
+
+
+//
+//  c-debug-break: native [
+//
+//  "Break at next evaluation point (only use when running under C debugger)"
+//
+//      return: [<opt> any-value!]
+//          {Invisibly returns what the expression to the right would have}
+//      :value [<opt> <end> any-value!]
+//          {The head cell of the code to evaluate after the break happens}
 //  ]
 //
-REBNATIVE(c_break_debug)
+REBNATIVE(c_debug_break)
 {
-#ifndef NDEBUG
-    INCLUDE_PARAMS_OF_C_BREAK_DEBUG;
+    INCLUDE_PARAMS_OF_C_DEBUG_BREAK;
 
-    if (REF(skip) && REF(at)) {
-        fail (Error_Bad_Refines_Raw());
-    } else if (REF(skip)) {
-        TG_Break_At = frame_->do_count_debug + 1 + VAL_INT64(ARG(points));
-    } else if (REF(at)) {
-        TG_Break_At = VAL_INT64(ARG(point));
-    } else {
-        TG_Break_At = frame_->do_count_debug + 1;
-    }
+#ifndef NDEBUG
+    TG_Break_At_Tick = frame_->tick + 1;
+
+    // C-DEBUG-BREAK wants to appear invisible to the evaluator, so you can
+    // use it at any position (like PROBE).  But unlike PROBE, it doesn't want
+    // an evaluated argument...because that would defeat the purpose:
+    //
+    //    print c-debug-break mold value
+    //
+    // You would like the break to happen *before* the MOLD, not after it's
+    // happened and been passed as an argument!)
+    //
+    // So we take a hard quoted parameter and then reuse the same mechanic
+    // that EVAL does.  However, the evaluator is picky about voids...and will
+    // assert if it ever is asked to "evaluate" one.  So squash the request
+    // to evaluate if it's a void.
+    //
+    Move_Value(D_CELL, ARG(value));
+    if (IS_VOID(D_CELL))
+        SET_VAL_FLAG(D_CELL, VALUE_FLAG_EVAL_FLIP);
+
+    return R_REEVALUATE_CELL;
+
 #else
-    UNUSED(frame_);
+    UNUSED(ARG(value));
+
+    fail (Error_Debug_Only_Raw());
 #endif
-    return R_VOID;
 }

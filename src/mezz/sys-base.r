@@ -129,7 +129,7 @@ do*: function [
     ; LOAD it will trigger before the failure of changing the working dir)
     ; It is loaded as UNBOUND so that DO-NEEDS runs before INTERN.
     ;
-    code: ensure block! (load/header/type source 'unbound)
+    code: really block! (load/header/type source 'unbound)
 
     ; LOAD/header returns a block with the header object in the first
     ; position, or will cause an error.  No exceptions, not even for
@@ -137,7 +137,7 @@ do*: function [
     ;
     ; !!! Should the header always be locked by LOAD?
     ;
-    hdr: lock to-value ensure [object! blank!] first code
+    hdr: lock really [object! blank!] first code
     is-module: 'module = select hdr 'type
     code: next code
 
@@ -204,7 +204,7 @@ do*: function [
             result: import catch/quit/with [
                 module/mixin hdr code (opt do-needs/no-user hdr)
             ] :finalizer
-            if next_DO* [set var tail code]
+            if next_DO* [set var tail of code]
         ][
             do-needs hdr  ; Load the script requirements
             intern code   ; Bind the user script

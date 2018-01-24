@@ -42,7 +42,7 @@ intern: function [
     data [block! any-word!] "Word or block of words to be added (deeply)"
 ][
     ; for optimization below (index for resolve)
-    index: 1 + length-of usr: system/contexts/user
+    index: 1 + length of usr: system/contexts/user
 
     ; Extend the user context with new words
     data: bind/new :data usr
@@ -105,8 +105,7 @@ load-header: function [
     /required
         "Script header is required"
 
-    <has>
-
+    <static>
     non-ws (make bitset! [not 1 - 32])
 ][
     ; This function decodes the script header from the script body.
@@ -150,14 +149,18 @@ load-header: function [
         string? source [tmp: to binary! source]
 
         not data: script? tmp [ ; no script header found
-            return either required ['no-header] [reduce [_ tmp tail tmp]]
+            return either required ['no-header] [reduce [_ tmp tail of tmp]]
         ]
 
-        ; get 'rebol keyword
-        set* [key: rest:] transcode/only data blank
+        true [
+            ; get 'rebol keyword
+            ;
+            set* [key: rest:] transcode/only data
 
-        ; get header block
-        set* [hdr: rest:] transcode/next/relax rest blank
+            ; get header block
+            ;
+            set* [hdr: rest:] transcode/next/relax rest
+        ]
 
         not block? :hdr [
             ; header block is incomplete
@@ -187,7 +190,7 @@ load-header: function [
             end: skip rest tmp
         ]
 
-        not end [end: tail data]
+        not end [end: tail of data]
 
         only [
             ; decompress and checksum not done
@@ -220,21 +223,21 @@ load-header: function [
                         return 'bad-compress
                     ]
 
-                    if all [sum | sum != checksum/secure rest] [
+                    if sum and (sum != checksum/secure rest) [
                         return 'bad-checksum
                     ]
                 ] ; else assumed not compressed
 
-                all [sum | sum != checksum/secure/part rest end] [
+                sum and (sum <> checksum/secure/part rest end) [
                     return 'bad-checksum
                 ]
             ]
         ]
 
-        :key != 'rebol [
+        :key <> 'rebol [
             ; block-embedded script, only script compression, ignore hdr/length
 
-            tmp: ensure binary! rest ; saved for possible checksum calc later
+            tmp: really binary! rest ; saved for possible checksum calc later
 
             ; decode embedded script
             rest: skip first set [data: end:] transcode/next data 2
@@ -245,11 +248,12 @@ load-header: function [
                         return 'bad-compress
                     ]
 
-                    if all [sum sum != checksum/secure rest] [
+                    if sum and (sum <> checksum/secure rest) [
                         return 'bad-checksum
                     ]
                 ]
-                all [sum sum != checksum/secure/part tmp back end] [
+
+                sum and (sum <> checksum/secure/part tmp back end) [
                     return 'bad-checksum
                 ]
             ]
@@ -257,15 +261,15 @@ load-header: function [
 
     ]
 
-    ensure [binary! blank!] hdr/checksum
-    ensure [block! blank!] hdr/options
+    really [binary! blank!] hdr/checksum
+    really [block! blank!] hdr/options
 
     ; Return a BLOCK! with 3 elements in it
     ;
     return reduce [
-        ensure object! hdr
-        ensure [binary! block!] rest
-        ensure binary! end
+        really object! hdr
+        really [binary! block!] rest
+        really binary! end
     ]
 ]
 
@@ -384,11 +388,9 @@ load: function [
 
         ;-- Bind code to user context:
         not any [
-            'unbound = :ftype ;-- may be void
-                |
-            'module = select hdr 'type
-                |
-            find select hdr 'options 'unbound
+            | 'unbound = :ftype ;-- may be void
+            | 'module = select hdr 'type
+            | find select hdr 'options 'unbound
         ][
             data: intern data
         ]
@@ -398,7 +400,7 @@ load: function [
             all_LOAD
             header
             empty? data
-            1 < length-of data
+            1 < length of data
         ][
             data: first data
         ]
@@ -443,12 +445,12 @@ do-needs: function [
                     cause-error 'syntax 'needs reduce ['core needs]
                 ]
 
-                3 >= length-of needs [ ; no platform id
+                3 >= length of needs [ ; no platform id
                     blank
                 ]
 
-                (needs and* 0.0.0.255.255)
-                != (system/version and* 0.0.0.255.255) [
+                (needs and+ 0.0.0.255.255)
+                <> (system/version and+ 0.0.0.255.255) [
                     cause-error 'syntax 'needs reduce ['core needs]
                 ]
             ]
@@ -462,14 +464,14 @@ do-needs: function [
     ]
 
     ; Parse the needs dialect [source <version> <checksum-hash>]
-    mods: make block! length-of needs
+    mods: make block! length of needs
     name: vers: hash: _
     unless parse needs [
         here:
         opt [opt 'core set vers tuple! (do-needs vers)]
         any [
             here:
-            set name [word! | file! | url!]
+            set name [word! | file! | url! | tag!]
             set vers opt tuple!
             set hash opt binary!
             (join mods [name vers hash])
@@ -510,8 +512,9 @@ do-needs: function [
     ]
 
     case [
-        block [mods] ; /block: return block of modules
-        not empty? to-value :mixins [mixins] ; else return mixins, if any
+        block [mods] ; /block refinement asks for block of modules
+        not empty? to-value :mixins [mixins] ; else if any mixins, return them
+        true [blank] ; return blank otherwise
     ]
 ]
 
@@ -535,7 +538,7 @@ load-ext-module: function [
             /body
             code [block!]
                 "Equivalent rebol code"
-            <has>
+            <static>
             index (-1)
         ] compose [
             index: index + 1
@@ -543,7 +546,7 @@ load-ext-module: function [
             :f
         ]
     ]
-    mod: make module! (length-of code) / 2
+    mod: make module! (length of code) / 2
     set-meta mod hdr
     if errors: find code to set-word! 'errors [
         eo: construct make object! [
@@ -649,8 +652,8 @@ load-module: function [
                 set [mod: modsum:] next tmp [blank]
 
                 <check> [
-                    ensure [module! block!] mod
-                    ensure [binary! blank!] modsum
+                    really [module! block!] mod
+                    really [binary! blank!] modsum
                 ]
 
                 ; If no further processing is needed, shortcut return
@@ -703,7 +706,7 @@ load-module: function [
                 cause-error 'script 'bad-refines blank
             ]
 
-            data: make block! length-of source
+            data: make block! length of source
 
             unless parse source [
                 any [
@@ -741,7 +744,7 @@ load-module: function [
         void? :mod [mod: _]
         module? mod [
             delay: no-share: _ hdr: meta-of mod
-            ensure [block! blank!] hdr/options
+            really [block! blank!] hdr/options
         ]
         block? mod [set* [hdr: code:] mod]
 
@@ -753,7 +756,9 @@ load-module: function [
             set [hdr: code:] load-header/required data
             case [
                 word? hdr [cause-error 'syntax hdr source]
-                import blank ; /import overrides 'delay option
+                import [
+                    ; /import overrides 'delay option
+                ]
                 not delay [delay: find? hdr/options 'delay]
             ]
             if hdr/checksum [modsum: copy hdr/checksum]
@@ -781,9 +786,8 @@ load-module: function [
         ; See if it's there already, or there is something more recent
         all [
             ; set to false later if existing module is used
-            override?: not no-lib
-
-            set [name0: mod0: sum0:] pos: find/skip system/modules name 3
+            | override?: not no-lib
+            | set [name0: mod0: sum0:] pos: find/skip system/modules name 3
         ] [
             ; Get existing module's info
             case/all [
@@ -791,9 +795,9 @@ load-module: function [
                 block? :mod0 [hdr0: first mod0] ; cached preparsed header
 
                 <check> [
-                    ensure word! name0
-                    ensure object! hdr0
-                    ensure [binary! blank!] sum0
+                    really word! name0
+                    really object! hdr0
+                    really [binary! blank!] sum0
                 ]
 
                 not tuple? ver0: :hdr0/version [ver0: 0.0.0]
@@ -861,8 +865,8 @@ load-module: function [
                 binary? code [code: to block! code]
             ]
 
-            ensure object! hdr
-            ensure block! code
+            really object! hdr
+            really block! code
 
             mod: catch/quit [
                 module/mixin hdr code (opt do-needs/no-user hdr)
@@ -943,7 +947,9 @@ import: function [
     ]
 
     case [
-        mod  blank  ; success!
+        mod [
+            ; success!
+        ]
 
         word? module [
             ; Module (as word!) is not loaded already, so let's try to find it.
@@ -979,10 +985,13 @@ import: function [
     ; Do any imports to the user context that are necessary.
     ; The lib imports were handled earlier by LOAD-MODULE.
     case [
-        ; Do nothing if /no-user or no exports.
-        no-user  blank
-        not block? exports: select hdr: meta-of mod 'exports  blank
-        empty? exports  blank
+        any [
+            | no-user
+            | not block? exports: select hdr: meta-of mod 'exports
+            | empty? exports
+        ][
+            ; Do nothing if /no-user or no exports.
+        ]
 
         any [
             no-lib
@@ -1004,23 +1013,36 @@ import: function [
 
 
 load-extension: function [
-    file [file! handle!] "library file or handle to init function in the builtin extension"
-    /no-user "Do not export to the user context"
-    /no-lib "Do not export to the lib context"
+    file [file! handle!]
+        "library file or handle to init function in the builtin extension"
+    /no-user
+        "Do not export to the user context"
+    /no-lib
+        "Do not export to the lib context"
 ][
-
     ext: load-extension-helper file
-    ;print ["ext:" mold ext]
+
     if locked? ext [; already loaded
         return ext
     ]
     case [
+        ; !!! This used to treat BINARY! scripts as compressed and STRING!
+        ; as uncompressed, but it used byte-oriented data to back the STRING!
+        ; which temporarily requires UTF-8 to wide string expansion.  Hence
+        ; decompression is done in the C, and all are assumed to be UTF8
+        ; binary for the moment.  This can do a usermode decompress after
+        ; UTF-8 everywhere is implemented, because byte-oriented UTF-8 will
+        ; be a legal string series.
+        ;
         string? ext/script [
+            fail "STRING! ext/script shouldn't happen right now (temporary)"
             script: load/header ext/script
         ]
         binary? ext/script [
-            script: decompress ext/script
-            script: load/header script
+            comment [
+                script: load/header decompress ext/script
+            ]
+            script: load/header ext/script
         ]
     ] else [
         ; ext/script should ALWAYS be set by the extension but if it's not,
@@ -1035,12 +1057,12 @@ load-extension: function [
     modules: make block! 1
     for-each [spec impl error-base] ext/modules [
         append modules apply 'load-ext-module [
-                spec: spec
-                impl: impl
-                error-base: error-base
-                unloadable: true
-                no-user: no-user
-                no-lib: no-lib
+            spec: spec
+            impl: impl
+            error-base: error-base
+            unloadable: true
+            no-user: no-user
+            no-lib: no-lib
         ]
     ]
 
@@ -1079,8 +1101,8 @@ unload-extension: procedure [
     remove find system/extensions ext
     for-each m ext/modules [
         remove/part back find system/modules m 3
-        ;print ["words-of m:" words-of m]
-        for-each w words-of m [
+        ;print ["words of m:" words of m]
+        for-each w words of m [
             v: get w
             if all [function? :v 1 = func-class-of :v] [
                 unload-native :v

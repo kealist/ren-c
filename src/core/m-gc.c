@@ -133,7 +133,7 @@ static inline void Mark_Rebser_Only(REBSER *s)
     assert(NOT_SER_FLAG(s, SERIES_FLAG_ARRAY));
 
     if (s->header.bits & SERIES_FLAG_FILE_LINE)
-        s->link.filename->header.bits |= NODE_FLAG_MARKED;
+        LINK(s).file->header.bits |= NODE_FLAG_MARKED;
     s->header.bits |= NODE_FLAG_MARKED;
 }
 
@@ -209,7 +209,7 @@ inline static void Queue_Mark_Array_Deep(REBARR *a) {
     assert(NOT_SER_FLAG(a, ARRAY_FLAG_PAIRLIST));
 
     if (GET_SER_FLAG(a, SERIES_FLAG_FILE_LINE))
-        SER(a)->link.filename->header.bits |= NODE_FLAG_MARKED;
+        LINK(a).file->header.bits |= NODE_FLAG_MARKED;
 
     Queue_Mark_Array_Subclass_Deep(a);
 }
@@ -257,6 +257,50 @@ inline static void Queue_Mark_Map_Deep(REBMAP *m) {
     // being a recursion.  (e.g. marking underlying function for this function)
 }
 
+inline static void Queue_Mark_Binding_Deep(const RELVAL *v) {
+    assert(Is_Bindable(v));
+
+    REBNOD *binding = v->extra.binding;
+
+#if !defined(NDEBUG)
+    if (binding->header.bits & NODE_FLAG_CELL) {
+        // assert(GET_VAL_FLAG(v, VALUE_FLAG_STACK));
+
+        REBFRM *f = cast(REBFRM*, binding);
+        assert(f->eval_type == REB_FUNCTION);
+
+        // must be on the stack still, also...
+        //
+        REBFRM *temp = FS_TOP;
+        while (temp != NULL) {
+            if (temp == f)
+                break;
+            temp = temp->prior;
+        }
+        assert(temp != NULL);
+    }
+    else if (binding->header.bits & ARRAY_FLAG_PARAMLIST) {
+        //
+        // It's a function, any reasonable added check?
+    }
+    else if (binding->header.bits & ARRAY_FLAG_VARLIST) {
+        //
+        // It's a context, any reasonable added check?
+    }
+    else {
+        assert(binding->header.bits & SERIES_FLAG_ARRAY);
+        if (IS_VARARGS(v)) {
+            assert(binding != UNBOUND);
+            assert(ARR_LEN(ARR(binding)) == 1); // singular
+        } else
+            assert(binding == UNBOUND);
+    }
+#endif
+
+    if (NOT(binding->header.bits & NODE_FLAG_CELL))
+        Queue_Mark_Array_Subclass_Deep(ARR(binding));
+}
+
 
 static void Queue_Mark_Opt_Value_Deep(const RELVAL *v);
 
@@ -295,9 +339,7 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
 #if !defined(NDEBUG)
     if (IS_UNREADABLE_IF_DEBUG(v))
         return;
-#endif
 
-#if !defined(NDEBUG)
     in_mark = TRUE;
 #endif
 
@@ -318,9 +360,7 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
     case REB_FUNCTION: {
         REBFUN *func = VAL_FUNC(v);
         Queue_Mark_Function_Deep(func);
-
-        if (VAL_BINDING(v) != NULL)
-            Queue_Mark_Array_Subclass_Deep(VAL_BINDING(v));
+        Queue_Mark_Binding_Deep(v);
 
     #if !defined(NDEBUG)
         //
@@ -339,7 +379,7 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
         // facade is "fronting for" in the head slot.  The facade must always
         // hold the same number of parameters as the underlying function.
         //
-        REBARR *facade = SER(FUNC_PARAMLIST(func))->misc.facade;
+        REBARR *facade = LINK(FUNC_PARAMLIST(func)).facade;
         assert(IS_FUNCTION(ARR_HEAD(facade)));
         REBARR *underlying = ARR_HEAD(facade)->payload.function.paramlist;
         if (underlying != facade) {
@@ -374,42 +414,24 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
         assert(
             NOT_SER_INFO(spelling, STRING_INFO_CANON)
             || (
-                spelling->misc.bind_index.high == 0
-                && spelling->misc.bind_index.low == 0
+                MISC(spelling).bind_index.high == 0
+                && MISC(spelling).bind_index.low == 0
             )
         );
 
-        if (GET_VAL_FLAG(v, WORD_FLAG_BOUND)) {
-            assert(v->payload.any_word.index != 0);
+        Queue_Mark_Binding_Deep(v);
 
-            if (GET_VAL_FLAG(v, VALUE_FLAG_RELATIVE)) {
-                // Bound relative to a function, keep that function alive.
-                //
-                // (To turn a relative binding into a specific one, a
-                // frame is needed from the BLOCK!/GROUP!/PATH! etc. that
-                // holds a word instance.  So those frames are kept alive
-                // by the REB_BLOCK/REB_GROUP/REB_PATH lines in this switch
-                // where they mark their "binding" field.)
-                //
-                REBFUN* func = VAL_WORD_FUNC(v);
-                Queue_Mark_Function_Deep(func);
-            }
-            else {
-                // Bound to a specific context, keep that context alive.
-                //
-                REBCTX* context = VAL_WORD_CONTEXT(const_KNOWN(v));
-                Queue_Mark_Context_Deep(context);
-            }
+    #if !defined(NDEBUG)
+        if (IS_WORD_BOUND(v)) {
+            assert(v->payload.any_word.index != 0);
         }
         else {
             // The word is unbound...make sure index is 0 in debug build.
             // (it can be left uninitialized in release builds, for now)
             //
-            assert(!GET_VAL_FLAG(v, VALUE_FLAG_RELATIVE));
-        #if !defined(NDEBUG)
             assert(v->payload.any_word.index == 0);
-        #endif
         }
+    #endif
         break; }
 
     case REB_PATH:
@@ -418,21 +440,8 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
     case REB_LIT_PATH:
     case REB_BLOCK:
     case REB_GROUP: {
-        if (IS_SPECIFIC(v)) {
-            REBSPC *specifier = VAL_SPECIFIER(const_KNOWN(v));
-            if (specifier != SPECIFIED)
-                Queue_Mark_Context_Deep(CTX(specifier));
-        }
-        else {
-            // We trust that if a relative array's context needs to make
-            // it into the transitive closure, that will be taken care
-            // of by a higher-up array reference that holds it.
-            //
-            REBFUN* func = VAL_RELATIVE(v);
-            Queue_Mark_Function_Deep(func);
-        }
-
         Queue_Mark_Array_Deep(VAL_ARRAY(v));
+        Queue_Mark_Binding_Deep(v);
         break; }
 
     case REB_BINARY:
@@ -445,6 +454,7 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
         REBSER *series = VAL_SERIES(v);
         assert(SER_WIDE(series) <= sizeof(REBUNI));
         Mark_Rebser_Only(series);
+        assert(v->extra.binding == UNBOUND);
         break; }
 
     case REB_HANDLE: { // See %sys-handle.h
@@ -545,33 +555,13 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
 
     case REB_VARARGS: {
         //
-        // Binding may be NULL if the varargs was a MAKE VARARGS! and hasn't
-        // been passed through any parameter.  Otherwise it is the frame
-        // context where the param and arg live (possibly expired).
+        // Paramlist may be NULL if the varargs was a MAKE VARARGS! and hasn't
+        // been passed through any parameter.
         //
-        REBARR *binding = v->extra.binding;
-        if (binding != NULL) {
-            if (IS_ARRAY_MANAGED(binding))
-                Queue_Mark_Context_Deep(CTX(v->extra.binding));
-            else {
-                // !!! Should assert that the binding is to a frame that is
-                // in mid-fulfillment on the stack
-            }
-        }
+        if (v->payload.varargs.facade != NULL)
+            Queue_Mark_Function_Deep(FUN(v->payload.varargs.facade));
 
-        // The data feed is either a frame context or a singular block which
-        // holds the shared index among all same varargs into that array.
-        //
-        REBARR *feed = v->payload.varargs.feed;
-        assert(GET_SER_FLAG(feed, ARRAY_FLAG_VARLIST) || ARR_LEN(feed) == 1);
-        if (IS_ARRAY_MANAGED(feed))
-            Queue_Mark_Array_Subclass_Deep(feed);
-        else {
-            // !!! Should also assert that this is a frame in mid-fulfillment
-            // on the stack.
-            //
-            assert(GET_SER_FLAG(feed, ARRAY_FLAG_VARLIST));
-        }
+        Queue_Mark_Binding_Deep(v);
         break; }
 
     case REB_OBJECT:
@@ -592,11 +582,12 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
         // could apply to any OBJECT!, but the binding cheaply makes it
         // a method for that object.)
         //
-        REBARR *binding = VAL_BINDING(v);
-        if (binding != NULL) {
+        Queue_Mark_Binding_Deep(v);
+
+    #if !defined(NDEBUG)
+        if (v->extra.binding != UNBOUND) {
             assert(CTX_TYPE(context) == REB_FRAME);
 
-        #if !defined(NDEBUG)
             if (CTX_VARS_UNAVAILABLE(context)) {
                 //
                 // !!! It seems a bit wasteful to keep alive the binding of a
@@ -609,12 +600,10 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
             else {
                 struct Reb_Frame *f = CTX_FRAME_IF_ON_STACK(context);
                 if (f != NULL) // comes from execution, not MAKE FRAME!
-                    assert(binding == f->binding);
+                    assert(v->extra.binding == f->binding);
             }
-        #endif
-
-            Queue_Mark_Array_Subclass_Deep(binding);
         }
+    #endif
 
         REBFUN *phase = v->payload.any_context.phase;
         if (phase != NULL) {
@@ -627,7 +616,6 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
         REBVAL *archetype = CTX_VALUE(context);
         assert(CTX_TYPE(context) == VAL_TYPE(v));
         assert(VAL_CONTEXT(archetype) == context);
-        assert(VAL_CONTEXT_META(archetype) == CTX_META(context));
     #endif
 
         // Note: for VAL_CONTEXT_FRAME, the FRM_CALL is either on the stack
@@ -646,22 +634,26 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
 
     case REB_STRUCT: {
         //
+        // !!! The ultimate goal for STRUCT! is that it be part of the FFI
+        // extension and fall into the category of a "user defined type".
+        // This essentially means it would be an opaque variant of a context.
+        // User-defined types aren't fully designed, so struct is achieved
+        // through a hacky set of hooks for now...but it does use arrays in
+        // a fairly conventional way that should translate to the user
+        // defined type system once it exists.
+        //
         // The struct gets its GC'able identity and is passable by one
         // pointer from the fact that it is a single-element array that
         // contains the REBVAL of the struct itself.  (Because it is
         // "singular" it is only a REBSER node--no data allocation.)
         //
-        Queue_Mark_Array_Deep(VAL_STRUCT(v));
+        REBSTU *stu = v->payload.structure.stu;
+        Queue_Mark_Array_Deep(stu);
 
         // The schema is the hierarchical description of the struct.
         //
-        REBFLD *schema = SER(VAL_STRUCT(v))->link.schema;
-        assert(FLD_IS_STRUCT(schema));
+        REBFLD *schema = LINK(stu).schema;
         Queue_Mark_Array_Deep(schema);
-
-        // The symbol needs to be GC protected, but only fields have them
-        //
-        assert(FLD_NAME(schema) == NULL);
 
         // The data series needs to be marked.  It needs to be marked
         // even for structs that aren't at the 0 offset--because their
@@ -700,7 +692,10 @@ static void Queue_Mark_Opt_Value_Deep(const RELVAL *v)
 inline static void Queue_Mark_Value_Deep(const RELVAL *v)
 {
 #if !defined(NDEBUG)
-    if (IS_VOID(v))
+    //
+    // Note: IS_VOID() would trip on unreadable blanks, which is okay for GC
+    //
+    if (VAL_TYPE_RAW(v) == REB_MAX_VOID)
         panic (v);
 #endif
     Queue_Mark_Opt_Value_Deep(v);
@@ -760,7 +755,9 @@ static void Propagate_All_GC_Marks(void)
         RELVAL *v = ARR_HEAD(a);
 
         if (GET_SER_FLAG(a, ARRAY_FLAG_PARAMLIST)) {
-            //
+            assert(IS_FUNCTION(v));
+            assert(v->extra.binding == UNBOUND); // archetypes have no binding
+
             // These queueings cannot be done in Queue_Mark_Function_Deep
             // because of the potential for overflowing the C stack with calls
             // to Queue_Mark_Function_Deep.
@@ -768,37 +765,63 @@ static void Propagate_All_GC_Marks(void)
             REBARR *body_holder = v->payload.function.body_holder;
             Queue_Mark_Singular_Array(body_holder);
 
-            REBCTX *exemplar = SER(body_holder)->link.exemplar;
+            REBARR *facade = LINK(a).facade;
+            Queue_Mark_Array_Subclass_Deep(facade);
+
+            REBCTX *exemplar = LINK(body_holder).exemplar;
             if (exemplar != NULL)
                 Queue_Mark_Context_Deep(exemplar);
 
-            REBCTX *meta = SER(a)->link.meta;
+            REBCTX *meta = MISC(a).meta;
             if (meta != NULL)
                 Queue_Mark_Context_Deep(meta);
 
-            REBARR *facade = SER(a)->misc.facade;
-            Queue_Mark_Array_Subclass_Deep(facade);
-
-            assert(IS_FUNCTION(v));
-            assert(v->extra.binding == NULL); // archetypes have no binding
             ++v; // function archetype completely marked by this process
         }
         else if (GET_SER_FLAG(a, ARRAY_FLAG_VARLIST)) {
             //
+            // Currently only FRAME! uses binding
+            //
+            assert(ANY_CONTEXT(v));
+            assert(v->extra.binding == UNBOUND || VAL_TYPE(v) == REB_FRAME);
+
             // These queueings cannot be done in Queue_Mark_Context_Deep
             // because of the potential for overflowing the C stack with calls
             // to Queue_Mark_Context_Deep.
 
-            REBARR *keylist = SER(a)->link.keylist;
-            assert(keylist == CTX_KEYLIST(CTX(a)));
-            Queue_Mark_Array_Subclass_Deep(keylist); // might be paramlist
+            REBNOD *keysource = LINK(a).keysource;
+            if (keysource->header.bits & NODE_FLAG_CELL) {
+                //
+                // Must be a FRAME! and it must be on the stack running.  If
+                // it has stopped running, then the keylist must be set to
+                // UNBOUND which would not be a cell.
+                //
+                // There's nothing to mark for GC since the frame is on the
+                // stack, which should preserve the function paramlist.
+                //
+                assert(IS_FRAME(v));
+            }
+            else {
+                REBARR *keylist = ARR(keysource);
+                if (IS_FRAME(v)) {
+                    //
+                    // Keylist is the "facade", it may not be a paramlist but
+                    // it needs to be "paramlist shaped"...and the [0] element
+                    // has to be a FUNCTION!.
+                    //
+                    assert(IS_FUNCTION(ARR_HEAD(keylist)));
+                }
+                else {
+                    assert(NOT_SER_FLAG(keylist, ARRAY_FLAG_PARAMLIST));
+                    assert(IS_UNREADABLE_IF_DEBUG(ARR_HEAD(keylist)));
+                }
+                Queue_Mark_Array_Subclass_Deep(keylist);
+            }
 
-            REBCTX *meta = SER(keylist)->link.meta;
+            REBCTX *meta = MISC(a).meta;
             if (meta != NULL)
                 Queue_Mark_Context_Deep(meta);
 
-            assert(ANY_CONTEXT(v));
-            assert(v->extra.binding == NULL); // archetypes have no binding
             ++v; // context archtype completely marked by this process
         }
         else if (GET_SER_FLAG(a, ARRAY_FLAG_PAIRLIST)) {
@@ -809,7 +832,7 @@ static void Propagate_All_GC_Marks(void)
             // seemed to be a source of bugs, but it may be added again...in
             // which case the hashlist may be NULL.
             //
-            REBSER *hashlist = SER(a)->link.hashlist;
+            REBSER *hashlist = LINK(a).hashlist;
             assert(hashlist != NULL);
 
             Mark_Rebser_Only(hashlist);
@@ -880,7 +903,7 @@ static void Reify_Any_C_Valist_Frames(void)
 
     REBFRM *f = FS_TOP;
     for (; f != NULL; f = f->prior) {
-        if (f->flags.bits & DO_FLAG_VA_LIST) {
+        if (FRM_IS_VALIST(f)) {
             const REBOOL truncated = TRUE;
             Reify_Va_To_Array_In_Frame(f, truncated);
         }
@@ -907,13 +930,16 @@ static void Mark_Root_Series(void)
         REBSER *s = cast(REBSER *, seg + 1);
         REBCNT n;
         for (n = Mem_Pools[SER_POOL].units; n > 0; --n, ++s) {
+            //
+            // !!! A smarter switch statement here could do this more
+            // optimally...see the sweep code for an example.
+            //
             if (IS_FREE_NODE(s))
                 continue;
-
-            assert(NOT(Is_Rebser_Marked(s))); // can't be marked yet
-
             if (NOT(s->header.bits & NODE_FLAG_ROOT))
                 continue;
+            if (s->header.bits & NODE_FLAG_MARKED)
+                continue; // this can happen if a previous root marked it
 
             // If something is marked as a root, then it has its contents
             // GC managed...even if it is not itself a candidate for GC.
@@ -949,7 +975,8 @@ static void Mark_Root_Series(void)
                 // might be executed with the pairing as the OUT slot (since
                 // it is memory guaranteed not to relocate)
                 //
-                Mark_Rebser_Only(s);
+                if (GET_SER_FLAG(s, NODE_FLAG_MANAGED))
+                    Mark_Rebser_Only(s); // mark node only if managed
                 Queue_Mark_Value_Deep(key);
                 if (NOT_END(paired))
                     Queue_Mark_Value_Deep(paired);
@@ -1109,7 +1136,12 @@ static void Mark_Frame_Stack_Deep(void)
         // earlier in the recycle process (don't want to create new arrays
         // once the recycling has started...)
         //
-        assert(f->pending != VA_LIST_PENDING);
+    #if !defined(NDEBUG)
+        if (f->flags.bits & DO_FLAG_APPLYING)
+            assert(IS_POINTER_TRASH_DEBUG(f->source.pending));
+        else
+            assert(f->source.pending != NULL); // lives in f->source.array
+    #endif
 
         ASSERT_ARRAY_MANAGED(f->source.array);
         Queue_Mark_Array_Deep(f->source.array);
@@ -1119,16 +1151,27 @@ static void Mark_Frame_Stack_Deep(void)
         // will stay on the stack while the zero-arity function is running.
         // The array still might be used in an error, so can't GC it.
         //
-        if (f->value && NOT_END(f->value) && Is_Value_Managed(f->value))
+        if (FRM_HAS_MORE(f) && Is_Value_Managed(f->value))
             Queue_Mark_Value_Deep(f->value);
 
-        if (f->specifier != SPECIFIED)
-            Queue_Mark_Context_Deep(CTX(f->specifier));
+        if (NOT(f->specifier->header.bits & NODE_FLAG_CELL)) {
+            assert(
+                f->specifier == SPECIFIED
+                || (f->specifier->header.bits & ARRAY_FLAG_VARLIST)
+            );
+            Queue_Mark_Array_Subclass_Deep(ARR(f->specifier));
+        }
 
         if (NOT_END(f->out)) // never NULL, always initialized bit pattern
             Queue_Mark_Opt_Value_Deep(f->out);
 
-        if (NOT(Is_Any_Function_Frame(f))) {
+        // Frame temporary cell should always contain initialized bits, as
+        // DECLARE_FRAME sets it up and no one is supposed to trash it.
+        //
+        if (NOT_END(&f->cell))
+            Queue_Mark_Opt_Value_Deep(&f->cell);
+
+        if (NOT(Is_Function_Frame(f))) {
             //
             // Consider something like `eval copy quote (recycle)`, because
             // while evaluating the group it has no anchor anywhere in the
@@ -1137,11 +1180,9 @@ static void Mark_Frame_Stack_Deep(void)
             continue;
         }
 
-        if (NOT_END(&f->cell))
-            Queue_Mark_Opt_Value_Deep(&f->cell);
-
         Queue_Mark_Function_Deep(f->phase); // never NULL
-        Mark_Rebser_Only(f->label); // also never NULL
+        if (f->opt_label != NULL) // will be NULL if no symbol
+            Mark_Rebser_Only(f->opt_label);
 
         if (!Is_Function_Frame_Fulfilling(f)) {
             assert(IS_END(f->param)); // indicates function is running
@@ -1150,16 +1191,22 @@ static void Mark_Frame_Stack_Deep(void)
             // value while a function is running, currently.  (A more
             // important purpose may come up...)
 
-            if (NOT_END(f->refine) && Is_Value_Managed(f->refine))
+            if (
+                f->refine != NULL
+                && NOT_END(f->refine)
+                && Is_Value_Managed(f->refine)
+            ){
                 Queue_Mark_Opt_Value_Deep(f->refine);
+            }
 
-            if (NOT_END(f->special) && Is_Value_Managed(f->special))
+            if (
+                f->special != NULL
+                && NOT_END(f->special)
+                && Is_Value_Managed(f->special)
+            ){
                 Queue_Mark_Opt_Value_Deep(f->special);
+            }
         }
-
-        // Need to keep the label symbol alive for error messages/stacktraces
-        //
-        Mark_Rebser_Only(f->label);
 
         // We need to GC protect the values in the args no matter what,
         // but it might not be managed yet (e.g. could still contain garbage
@@ -1185,16 +1232,51 @@ static void Mark_Frame_Stack_Deep(void)
         // then skip the cells for pending refinement arguments.
         //
         REBVAL *param = FUNC_FACADE_HEAD(f->phase);
-        REBVAL *arg = f->args_head; // may be stack or dynamic
+        REBVAL *arg = f->args_head;
         for (; NOT_END(param); ++param, ++arg) {
-            if (param == f->param && !f->doing_pickups)
-                break; // protect arg for current param, but no further
+            //
+            // At time of writing, all frame storage is in stack cells...not
+            // varlists.
+            //
+            assert(arg->header.bits & VALUE_FLAG_STACK);
 
-            assert(!IS_UNREADABLE_IF_DEBUG(arg) || f->doing_pickups);
+            if (param == f->param) {
+                //
+                // If a GC can happen while this frame is on the stack in a
+                // function call, that means it's evaluating.  So when param
+                // and f->param match, that means we know this slot is the
+                // output slot for some other frame.  Hence it is protected by
+                // that output slot, and it also may be an END, which is not
+                // legal for any other slots.  We won't be needing to mark it.
+                //
+                assert(IS_END(f->arg) || NOT(IS_TRASH_DEBUG(f->arg)));
+
+                // If we're not doing "pickups" then the cell slots after
+                // this one have not been initialized, not even to trash.
+                // (Unless the args are living in a varlist, in which case
+                // protecting them here is a duplicate anyway)
+                //
+                if (NOT(f->doing_pickups))
+                    break;
+
+                // But since we *are* doing pickups, we must have initialized
+                // all the cells to something...even to trash.  Continue and
+                // mark them.
+                //
+                continue;
+            }
+
+            if (arg->header.bits & NODE_FLAG_FREE) {
+                //
+                // Slot was skipped, e.g. out of order refinement.  It's
+                // initialized bits, but left as trash until f->doing_pickups.
+                //
+                assert(IS_TRASH_DEBUG(arg)); // check more trash bits
+                continue;
+            }
 
             Queue_Mark_Opt_Value_Deep(arg);
         }
-        assert(IS_END(param) ? IS_END(arg) : TRUE); // may not enforce
 
         Propagate_All_GC_Marks();
     }
@@ -1437,11 +1519,6 @@ REBCNT Recycle_Core(REBOOL shutdown, REBSER *sweeplist)
 
         Mark_Frame_Stack_Deep();
 
-        // Mark potential error object from callback!
-        if (!IS_BLANK_RAW(&Callback_Error)) {
-            assert(NOT_VAL_FLAG(&Callback_Error, VALUE_FLAG_RELATIVE));
-            Queue_Mark_Value_Deep(&Callback_Error);
-        }
         Propagate_All_GC_Marks();
 
         Mark_Devices_Deep();
@@ -1578,7 +1655,7 @@ void Guard_Node_Core(const REBNOD *node)
         // being able to resize and reallocate the data pointer.  But this is
         // a somewhat expensive check, so only feasible to run occasionally.
         //
-        REBSER *containing = Try_Find_Containing_Series_Debug(value);
+        REBNOD *containing = Try_Find_Containing_Node_Debug(value);
         if (containing != NULL)
             panic (containing);
     #endif
@@ -1807,10 +1884,10 @@ static void Queue_Mark_Event_Deep(const RELVAL *value)
     }
 
     // FIXME: This test is not in parallel to others.
-    if (VAL_EVENT_TYPE(value) == EVT_DROP_FILE
-        && GET_FLAG(VAL_EVENT_FLAGS(value), EVF_COPIED)
-        )
-    {
+    if (
+        VAL_EVENT_TYPE(value) == EVT_DROP_FILE
+        && LOGICAL(VAL_EVENT_FLAGS(value) & EVF_COPIED)
+    ){
         assert(FALSE);
         Queue_Mark_Array_Deep(ARR(VAL_EVENT_SER(m_cast(RELVAL*, value))));
     }

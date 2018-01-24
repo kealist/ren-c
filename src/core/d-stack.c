@@ -76,7 +76,7 @@ void Collapsify_Array(REBARR *array, REBSPC *specifier, REBCNT limit)
 
 
 //
-//  Make_Where_For_Frame: C
+//  Init_Near_For_Frame: C
 //
 // Each call frame maintains the array it is executing in, the current index
 // in that array, and the index of where the current expression started.
@@ -89,12 +89,6 @@ void Collapsify_Array(REBARR *array, REBSPC *specifier, REBCNT limit)
 // go all the way to the tail of the block (where future potential evaluation
 // should be.
 //
-// !!! Unfortunately, Rebol doesn't formalize this very well.  There is no
-// lock on segments of blocks during their evaluation (should there be?).
-// It's possible for self-modifying code to scramble the blocks being executed.
-// The DO evaluator is robust in terms of not *crashing*, but the semantics
-// may well suprise users.
-//
 // !!! DO also offers a feature whereby values can be supplied at the start
 // of an evaluation which are not resident in the array.  It also can run
 // on an irreversible C va_list of REBVAL*, where these disappear as the
@@ -102,8 +96,10 @@ void Collapsify_Array(REBARR *array, REBSPC *specifier, REBCNT limit)
 // onto these values for the purposes of better error messages (at the cost
 // of performance).
 //
-REBARR *Make_Where_For_Frame(REBFRM *f)
+REBVAL *Init_Near_For_Frame(RELVAL *out, REBFRM *f)
 {
+    REBCNT dsp_start = DSP;
+
     if (FRM_IS_VALIST(f)) {
         //
         // Traversing a C va_arg, so reify into a (truncated) array.
@@ -112,32 +108,34 @@ REBARR *Make_Where_For_Frame(REBFRM *f)
         Reify_Va_To_Array_In_Frame(f, truncated);
     }
 
-
-    // WARNING: MIN is a C macro and repeats its arguments.
-    //
-    REBCNT start = MIN(ARR_LEN(FRM_ARRAY(f)), FRM_EXPR_INDEX(f));
-    REBCNT end = MIN(ARR_LEN(FRM_ARRAY(f)), FRM_INDEX(f));
-
-    assert(end >= start);
-
-    assert(Is_Any_Function_Frame(f));
-    REBOOL pending = Is_Function_Frame_Fulfilling(f);
-
-    REBCNT dsp_start = DSP;
+    // Get at most 6 values out of the array.  Ideally 3 before and after
+    // the error point.  If truncating either the head or tail of the
+    // values, put ellipses.
 
     // !!! We may be running a function where the value for the function was a
     // "head" value not in the array.  These cases could substitute the symbol
     // for the currently executing function.  Reconsider when such cases
     // appear and can be studied.
     /*
+    if (...) {
         DS_PUSH_TRASH;
-        Init_Word(DS_TOP, FRM_LABEL(f));
+        Init_Word(DS_TOP, ...?)
+    }
     */
 
-    REBCNT n;
-    for (n = start; n < end; ++n) {
+    REBINT start = FRM_INDEX(f) - 3;
+    if (start > 0) {
         DS_PUSH_TRASH;
-        if (IS_VOID(ARR_AT(FRM_ARRAY(f), n))) {
+        Init_Word(DS_TOP, Canon(SYM_ELLIPSIS));
+    }
+    else if (start < 0)
+        start = 0;
+
+    REBCNT count = 0;
+    RELVAL *item = ARR_AT(FRM_ARRAY(f), start);
+    for (; NOT_END(item) && count < 6; ++item, ++count) {
+        DS_PUSH_TRASH;
+        if (IS_VOID(item)) {
             //
             // If a va_list is used to do a non-evaluative call (something
             // like R3-Alpha's APPLY/ONLY) then void cells are currently
@@ -151,64 +149,79 @@ REBARR *Make_Where_For_Frame(REBFRM *f)
             Init_Word(DS_TOP, Canon(SYM___VOID__));
         }
         else
-            Derelativize(DS_TOP, ARR_AT(FRM_ARRAY(f), n), f->specifier);
+            Derelativize(DS_TOP, item, f->specifier);
 
-        if (n == start) {
+        if (count == 0) {
             //
             // Get rid of any newline marker on the first element,
-            // that would visually disrupt the backtrace for no reason.
+            // that would visually disrupt a backtrace for no reason.
             //
             CLEAR_VAL_FLAG(DS_TOP, VALUE_FLAG_LINE);
         }
+
+        if (count == FRM_INDEX(f) - start - 1) {
+            //
+            // Leave a marker at the point of the error, currently `~~`.
+            // (Formerly it was ?? but that is now being actually used).
+            //
+            // This is the marker for an execution point, so it can either
+            // mean "error source is to the left" or just "frame is at a
+            // breakpoint at that position".
+            //
+            DS_PUSH_TRASH;
+            Init_Word(DS_TOP, Canon(SYM__T_T));
+        }
     }
 
-    // We add an ellipsis to a pending frame to make it a little bit
-    // clearer what is going on.  If someone sees a where that looks
-    // like just `* [print]` the asterisk alone doesn't quite send
-    // home the message that print is not running and it is
-    // argument fulfillment that is why it's not "on the stack"
-    // yet, so `* [print ...]` is an attempt to say that better.
-    //
-    // !!! This is in-band, which can be mixed up with literal usage
-    // of ellipsis.  Could there be a better "out-of-band" conveyance?
-    // Might the system use colorization in a value option bit?
-    //
-    if (pending) {
+    if (NOT_END(item)) {
         DS_PUSH_TRASH;
         Init_Word(DS_TOP, Canon(SYM_ELLIPSIS));
     }
 
-    REBARR *where = Pop_Stack_Values(dsp_start);
+    // !!! This code can be called on an executing frame, such as when an
+    // error happens in that frame.  Or it can be called on a pending frame
+    // when examining a backtrace...where the function hasn't been called
+    // yet.  This needs some way of differentiation, consider it.
+    //
+    /*
+    if (Is_Function_Frame(f) && Is_Function_Frame_Fulfilling(f)) {
+        ???
+    }
+    */
+
+    REBARR *near = Pop_Stack_Values(dsp_start);
 
     // Simplify overly-deep blocks embedded in the where so they show (...)
     // instead of printing out fully.
     //
-    Collapsify_Array(where, SPECIFIED, 3);
+    Collapsify_Array(near, SPECIFIED, 3);
 
-    return where;
+    if (ANY_ARRAY_KIND(f->eval_type))
+        Init_Any_Array(out, f->eval_type, near);
+    else
+        Init_Block(out, near);
+
+    return KNOWN(out);
 }
 
 
 //
-//  where-of: native [
+//  near-of: native [
 //
 //  "Get execution point summary for a function call (if still on stack)"
 //
-//      level [frame! function! integer! blank!]
+//      frame [frame!]
 //  ]
 //
-REBNATIVE(where_of)
-//
-// !!! This routine should probably be used to get the information for the
-// where of an error, which should likely be out-of-band.
+REBNATIVE(near_of)
 {
-    INCLUDE_PARAMS_OF_WHERE_OF;
+    INCLUDE_PARAMS_OF_NEAR_OF;
 
-    REBFRM *frame = Frame_For_Stack_Level(NULL, ARG(level), TRUE);
-    if (frame == NULL)
-        fail (ARG(level));
+    REBFRM *f = CTX_FRAME_IF_ON_STACK(VAL_CONTEXT(ARG(frame)));
+    if (f == NULL)
+        fail (Error_Frame_Not_On_Stack_Raw());
 
-    Init_Block(D_OUT, Make_Where_For_Frame(frame));
+    Init_Near_For_Frame(D_OUT, f);
     return R_OUT;
 }
 
@@ -218,73 +231,22 @@ REBNATIVE(where_of)
 //
 //  "Get word label used to invoke a function call (if still on stack)"
 //
-//      level [frame! function! integer!]
+//      return: [word! blank!]
+//      frame [frame!]
 //  ]
 //
 REBNATIVE(label_of)
 {
     INCLUDE_PARAMS_OF_LABEL_OF;
 
-    REBFRM *frame = Frame_For_Stack_Level(NULL, ARG(level), TRUE);
+    REBFRM *f = CTX_FRAME_IF_ON_STACK(VAL_CONTEXT(ARG(frame)));
+    if (f == NULL)
+        fail (Error_Frame_Not_On_Stack_Raw());
 
-    // Make it slightly easier by returning a NONE! instead of giving an
-    // error for a frame that isn't on the stack.
-    //
-    // !!! Should a function that was invoked by something other than a WORD!
-    // return something like TRUE instead of a fake symbol?
-    //
-    if (frame == NULL)
+    if (f->opt_label == NULL)
         return R_BLANK;
 
-    Init_Word(D_OUT, FRM_LABEL(frame));
-    return R_OUT;
-}
-
-
-//
-//  file-of: native [
-//
-//  "Get filename of origin for any series"
-//
-//      return: [file! url! blank!]
-//      series [any-series!]
-//  ]
-//
-REBNATIVE(file_of)
-{
-    INCLUDE_PARAMS_OF_FILE_OF;
-
-    REBSER *s = VAL_SERIES(ARG(series));
-
-    if (NOT_SER_FLAG(s, SERIES_FLAG_FILE_LINE))
-        return R_BLANK;
-
-    // !!! How to tell whether it's a URL! or a FILE! ?
-    //
-    Scan_File(D_OUT, STR_HEAD(s->link.filename), SER_LEN(s->link.filename));
-    return R_OUT;
-}
-
-
-//
-//  line-of: native [
-//
-//  "Get line of origin for any series"
-//
-//      return: [integer! blank!]
-//      series [any-series!]
-//  ]
-//
-REBNATIVE(line_of)
-{
-    INCLUDE_PARAMS_OF_LINE_OF;
-
-    REBSER *s = VAL_SERIES(ARG(series));
-
-    if (NOT_SER_FLAG(s, SERIES_FLAG_FILE_LINE))
-        return R_BLANK;
-
-    Init_Integer(D_OUT, s->misc.line);
+    Init_Word(D_OUT, f->opt_label);
     return R_OUT;
 }
 
@@ -292,424 +254,29 @@ REBNATIVE(line_of)
 //
 //  function-of: native [
 //
-//  "Get the FUNCTION! for a stack level or frame"
+//  "Get the FUNCTION! for a frame"
 //
 //      return: [function!]
-//      level [frame! integer!]
+//      frame [frame!]
 //  ]
 //
 REBNATIVE(function_of)
 {
     INCLUDE_PARAMS_OF_FUNCTION_OF;
 
-    REBVAL *level = ARG(level);
+    REBVAL *frame = ARG(frame);
 
-    if (IS_FRAME(level)) {
-        //
-        // If a FRAME!, then the keylist *should* be the function params,
-        // which should be coercible to a function even when the call is
-        // no longer on the stack.
-        //
-        REBCTX *context = VAL_CONTEXT(level);
-        Move_Value(D_OUT, CTX_FRAME_FUNC_VALUE(context));
-    }
-    else {
-        REBFRM *frame = Frame_For_Stack_Level(NULL, level, TRUE);
-        if (!frame)
-            fail (level);
-
-        Move_Value(D_OUT, FUNC_VALUE(frame->phase));
-    }
+    // The phase contains the paramlist of the actual function (the context is
+    // the keylist of the *underlying* function).
+    //
+    // But to get the function REBVAL, the phase has to be combined with the
+    // binding of the FRAME! value.  Otherwise you'd know (for instance) that
+    // you had a RETURN, but you wouldn't know where to return *from*.
+    //
+    Move_Value(D_OUT, FUNC_VALUE(frame->payload.any_context.phase));
+    D_OUT->extra.binding = frame->extra.binding;
 
     return R_OUT;
-}
-
-
-//
-//  backtrace-index: native [
-//
-//  "Get the index of a given frame or function as BACKTRACE shows it"
-//
-//      level [function! frame!]
-//          {The function or frame to get an index for (NONE! if not running)}
-//  ]
-//
-REBNATIVE(backtrace_index)
-{
-    INCLUDE_PARAMS_OF_BACKTRACE_INDEX;
-
-    REBCNT number;
-
-    if (NULL != Frame_For_Stack_Level(&number, ARG(level), TRUE)) {
-        Init_Integer(D_OUT, number);
-        return R_OUT;
-    }
-
-    return R_BLANK;
-}
-
-
-//
-//  backtrace: native [
-//
-//  "Backtrace to find a specific FRAME!, or other queried property."
-//
-//      return: [<opt> block! frame!]
-//          "Nothing if printing, if specific level a frame! else block"
-//      level [<end> blank! integer! function!]
-//          "Stack level to return frame for (blank to list)"
-//      /limit
-//          "Limit the length of the backtrace"
-//      frames [blank! integer!]
-//          "Max number of frames (pending and active), blank for no limit"
-//      /brief
-//          "Do not list depths, just function labels on one line"
-//  ]
-//
-REBNATIVE(backtrace)
-{
-    INCLUDE_PARAMS_OF_BACKTRACE;
-
-    Check_Security(Canon(SYM_DEBUG), POL_READ, 0);
-
-    // Note: Running this code path is *intentionally* redundant with
-    // Frame_For_Stack_Level, as a way of keeping the numbers listed in a
-    // backtrace lined up with what that routine returns.  This isn't a very
-    // performance-critical routine, so it's good to have the doublecheck.
-    //
-    REBVAL *level = ARG(level);
-    REBOOL get_frame = NOT(IS_VOID(level) || IS_BLANK(level));
-    if (get_frame) {
-        //
-        // /LIMIT assumes that you are returning a list of backtrace items,
-        // while specifying a level gives one.  They are mutually exclusive.
-        //
-        if (REF(limit) || REF(brief))
-            fail (Error_Bad_Refines_Raw());
-
-        // See notes on handling of breakpoint below for why 0 is accepted.
-        //
-        if (IS_INTEGER(level) && VAL_INT32(level) < 0)
-            fail (level);
-    }
-
-    REBCNT max_rows; // The "frames" from /LIMIT, plus one (for ellipsis)
-    if (REF(limit)) {
-        if (IS_BLANK(ARG(frames)))
-            max_rows = MAX_U32; // NONE is no limit--as many frames as possible
-        else {
-            if (VAL_INT32(ARG(frames)) < 0)
-                fail (ARG(frames));
-            max_rows = VAL_INT32(ARG(frames)) + 1; // + 1 for ellipsis
-        }
-    }
-    else
-        max_rows = 20; // On an 80x25 terminal leaves room to type afterward
-
-    REBDSP dsp_orig = DSP; // original stack pointer (for gathered backtrace)
-
-    REBCNT row = 0; // row we're on (incl. pending frames and maybe ellipsis)
-    REBCNT number = 0; // level label number in the loop(no pending frames)
-    REBOOL first = TRUE; // special check of first frame for "breakpoint 0"
-
-    REBFRM *f;
-    for (f = FS_TOP->prior; f != NULL; f = f->prior) {
-        //
-        // Only consider invoked or pending functions in the backtrace.
-        //
-        // !!! The pending functions aren't actually being "called" yet,
-        // their frames are in a partial state of construction.  However it
-        // gives a fuller picture to see them in the backtrace.  It may
-        // be interesting to see GROUP! stack levels that are being
-        // executed as well (as they are something like DO).
-        //
-        if (NOT(Is_Any_Function_Frame(f)))
-            continue;
-
-        REBOOL pending = Is_Function_Frame_Fulfilling(f);
-        if (NOT(pending)) {
-            if (
-                first
-                && (
-                    FUNC_DISPATCHER(f->phase) == &N_pause
-                    || FUNC_DISPATCHER(f->phase) == &N_breakpoint
-                )
-            ) {
-                // Omitting breakpoints from the list entirely presents a
-                // skewed picture of what's going on.  But giving them
-                // "index 1" means that inspecting the frame you're actually
-                // interested in (the one where you put the breakpoint) bumps
-                // to 2, which feels unnatural.
-                //
-                // Compromise by not incrementing the stack numbering for
-                // this case, leaving a leading breakpoint frame at index 0.
-            }
-            else
-                ++number;
-        }
-
-        first = FALSE;
-
-        ++row;
-
-    #if !defined(NDEBUG)
-        //
-        // Try and keep the numbering in sync with query used by host to get
-        // function frames to do binding in the REPL with.
-        //
-        if (!pending) {
-            DECLARE_LOCAL (temp_val);
-            Init_Integer(temp_val, number);
-
-            REBCNT temp_num;
-            if (
-                Frame_For_Stack_Level(&temp_num, temp_val, TRUE) != f
-                || temp_num != number
-            ) {
-                printf(
-                    "%d != Frame_For_Stack_Level %d",
-                    cast(int, number),
-                    cast(int, temp_num)
-                );
-                fflush(stdout);
-                assert(FALSE);
-            }
-        }
-    #endif
-
-        if (get_frame) {
-            if (IS_INTEGER(level)) {
-                if (number != cast(REBCNT, VAL_INT32(level))) // is positive
-                    continue;
-            }
-            else {
-                assert(IS_FUNCTION(level));
-                if (f->phase != VAL_FUNC(level))
-                    continue;
-            }
-        }
-        else {
-            if (row >= max_rows) {
-                //
-                // If there's more stack levels to be shown than we were asked
-                // to show, then put an `+ ...` in the list and break.
-                //
-                DS_PUSH_TRASH;
-                Init_Word(DS_TOP, Canon(SYM_PLUS));
-
-                if (NOT(REF(brief))) {
-                    //
-                    // In the non-/ONLY backtrace, the pairing of the ellipsis
-                    // with a plus is used in order to keep the "record size"
-                    // of the list at an even 2.  Asterisk might have been
-                    // used but that is taken for "pending frames".
-                    //
-                    // !!! Review arbitrary symbolic choices.
-                    //
-                    DS_PUSH_TRASH;
-                    Init_Word(DS_TOP, Canon(SYM_ASTERISK));
-                    SET_VAL_FLAG(DS_TOP, VALUE_FLAG_LINE); // put on own line
-                }
-                break;
-            }
-        }
-
-        if (get_frame) {
-            //
-            // If we were fetching a single stack level, then our result will
-            // be a FRAME! (which can be queried for further properties via
-            // `where-of`, `label-of`, `function-of`, etc.)
-            //
-            Init_Any_Context(
-                D_OUT,
-                REB_FRAME,
-                Context_For_Frame_May_Reify_Managed(f)
-            );
-            return R_OUT;
-        }
-
-        // !!! Should /BRIEF omit pending frames?  Should it have a less
-        // "loaded" name for the refinement?
-        //
-        if (REF(brief)) {
-            DS_PUSH_TRASH;
-            Init_Word(DS_TOP, FRM_LABEL(f));
-            continue;
-        }
-
-        DS_PUSH_TRASH;
-        Init_Block(DS_TOP, Make_Where_For_Frame(f));
-
-        // If building a backtrace, we just keep accumulating results as long
-        // as there are stack levels left and the limit hasn't been hit.
-
-        // The integer identifying the stack level (used to refer to it
-        // in other debugging commands).  Since we're going in reverse, we
-        // add it after the props so it will show up before, and give it
-        // the newline break marker.
-        //
-        DS_PUSH_TRASH;
-        if (pending) {
-            //
-            // You cannot (or should not) switch to inspect a pending frame,
-            // as it is partially constructed.  It gets a "*" in the list
-            // instead of a number.
-            //
-            // !!! This may be too restrictive; though it is true you can't
-            // resume/from or exit/from a pending frame (due to the index
-            // not knowing how many values it would have consumed if a
-            // call were to complete), inspecting the existing args could
-            // be okay.  Disallowing it offers more flexibility in the
-            // dealings with the arguments, however (for instance: not having
-            // to initialize not-yet-filled args could be one thing).
-            //
-            Init_Word(DS_TOP, Canon(SYM_ASTERISK));
-        }
-        else
-            Init_Integer(DS_TOP, number);
-
-        SET_VAL_FLAG(DS_TOP, VALUE_FLAG_LINE);
-    }
-
-    // If we ran out of stack levels before finding the single one requested
-    // via /AT, return a NONE!
-    //
-    // !!! Would it be better to give an error?
-    //
-    if (get_frame)
-        return R_BLANK;
-
-    // Return accumulated backtrace otherwise, in the reverse order pushed
-    //
-    Init_Block(D_OUT, Pop_Stack_Values_Reversed(dsp_orig));
-    return R_OUT;
-}
-
-
-//
-//  Frame_For_Stack_Level: C
-//
-// Level can be a void, an INTEGER!, an ANY-FUNCTION!, or a FRAME!.  If
-// level is void then it means give whatever the first call found is.
-//
-// Returns NULL if the given level number does not correspond to a running
-// function on the stack.
-//
-// Can optionally give back the index number of the stack level (counting
-// where the most recently pushed stack level is the lowest #)
-//
-// !!! Unfortunate repetition of logic inside of BACKTRACE.  Assertions
-// are used to try and keep them in sync, by noticing during backtrace
-// if the stack level numbers being handed out don't line up with what
-// would be given back by this routine.  But it would be nice to find a way
-// to unify the logic for omitting things like breakpoint frames, or either
-// considering pending frames or not.
-//
-REBFRM *Frame_For_Stack_Level(
-    REBCNT *number_out,
-    const REBVAL *level,
-    REBOOL skip_current
-) {
-    REBFRM *frame = FS_TOP;
-    REBOOL first = TRUE;
-    REBINT num = 0;
-
-    if (IS_INTEGER(level)) {
-        if (VAL_INT32(level) < 0) {
-            //
-            // !!! fail() here, or just return NULL?
-            //
-            return NULL;
-        }
-    }
-
-    // We may need to skip some number of frames, if there have been stack
-    // levels added since the numeric reference point that "level" was
-    // supposed to refer to has changed.  For now that's only allowed to
-    // be one level, because it's rather fuzzy which stack levels to
-    // omit otherwise (pending? parens?)
-    //
-    if (skip_current)
-        frame = frame->prior;
-
-    for (; frame != NULL; frame = frame->prior) {
-        if (NOT(Is_Any_Function_Frame(frame))) {
-            //
-            // Don't consider pending calls, or GROUP!, or any non-invoked
-            // function as a candidate to target.
-            //
-            // !!! The inability to target a GROUP! by number is an artifact
-            // of implementation, in that there's no hook in Do_Core() at
-            // the point of group evaluation to process the return.  The
-            // matter is different with a pending function call, because its
-            // arguments are only partially processed--hence something
-            // like a RESUME/AT or an EXIT/FROM would not know which array
-            // index to pick up running from.
-            //
-            continue;
-        }
-
-        REBOOL pending = Is_Function_Frame_Fulfilling(frame);
-        if (NOT(pending)) {
-            if (first) {
-                if (
-                    FUNC_DISPATCHER(frame->phase) == &N_pause
-                    || FUNC_DISPATCHER(frame->phase) == N_breakpoint
-                ) {
-                    // this is considered the "0".  Return it only if 0 was requested
-                    // specifically (you don't "count down to it");
-                    //
-                    if (IS_INTEGER(level) && num == VAL_INT32(level))
-                        goto return_maybe_set_number_out;
-                    else {
-                        first = FALSE;
-                        continue;
-                    }
-                }
-                else {
-                    ++num; // bump up from 0
-                }
-            }
-        }
-
-        first = FALSE;
-
-        if (pending) continue;
-
-        if (IS_INTEGER(level) && num == VAL_INT32(level))
-            goto return_maybe_set_number_out;
-
-        if (IS_VOID(level) || IS_BLANK(level)) {
-            //
-            // Take first actual frame if void or blank
-            //
-            goto return_maybe_set_number_out;
-        }
-        else if (IS_INTEGER(level)) {
-            ++num;
-            if (num == VAL_INT32(level))
-                goto return_maybe_set_number_out;
-        }
-        else if (IS_FRAME(level)) {
-            if (frame->varlist == CTX_VARLIST(VAL_CONTEXT(level))) {
-                goto return_maybe_set_number_out;
-            }
-        }
-        else {
-            assert(IS_FUNCTION(level));
-            if (VAL_FUNC(level) == frame->phase)
-                goto return_maybe_set_number_out;
-        }
-    }
-
-    // Didn't find it...
-    //
-    return NULL;
-
-return_maybe_set_number_out:
-    if (number_out)
-        *number_out = num;
-    return frame;
 }
 
 

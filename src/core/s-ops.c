@@ -47,11 +47,11 @@ REBOOL All_Bytes_ASCII(REBYTE *bp, REBCNT len)
 
 
 //
-//  Is_Wide: C
+//  All_Codepoints_Latin1: C
 //
 // Returns TRUE if uni string needs 16 bits.
 //
-REBOOL Is_Wide(const REBUNI *up, REBCNT len)
+REBOOL All_Codepoints_Latin1(const REBUNI *up, REBCNT len)
 {
     for (; len > 0; len--, up++)
         if (*up >= 0x100) return TRUE;
@@ -145,7 +145,7 @@ REBYTE *Temp_Byte_Chars_May_Fail(
 
 
 //
-//  Temp_Bin_Str_Managed: C
+//  Temp_UTF8_At_Managed: C
 //
 // Determines if UTF8 conversion is needed for a series before it
 // is used with a byte-oriented function.
@@ -168,7 +168,7 @@ REBYTE *Temp_Byte_Chars_May_Fail(
 // instead of managing a created result they could be responsible
 // for freeing it if so.
 //
-REBSER *Temp_Bin_Str_Managed(const RELVAL *val, REBCNT *index, REBCNT *length)
+REBSER *Temp_UTF8_At_Managed(const RELVAL *val, REBCNT *index, REBCNT *length)
 {
     REBCNT len = (length && *length) ? *length : VAL_LEN_AT(val);
     REBSER *series;
@@ -219,7 +219,7 @@ REBSER *Temp_Bin_Str_Managed(const RELVAL *val, REBCNT *index, REBCNT *length)
             DECLARE_LOCAL (protect);
             Init_String(protect, series);
 
-            Protect_Value(protect, FLAGIT(PROT_SET));
+            Protect_Value(protect, PROT_SET);
 
             // just a string...not /DEEP...shouldn't need to Uncolor()
         }
@@ -243,67 +243,82 @@ REBSER *Temp_Bin_Str_Managed(const RELVAL *val, REBCNT *index, REBCNT *length)
 //
 REBSER *Xandor_Binary(REBCNT action, REBVAL *value, REBVAL *arg)
 {
-        REBSER *series;
-        REBYTE *p0 = VAL_BIN_AT(value);
-        REBYTE *p1 = VAL_BIN_AT(arg);
-        REBYTE *p2;
+    REBYTE *p0 = VAL_BIN_AT(value);
+    REBYTE *p1 = VAL_BIN_AT(arg);
+
+    REBCNT t0 = VAL_LEN_AT(value);
+    REBCNT t1 = VAL_LEN_AT(arg);
+
+    REBCNT mt = MIN(t0, t1); // smaller array size
+
+    // !!! This used to say "For AND - result is size of shortest input:" but
+    // the code was commented out
+    /*
+        if (action == A_AND || (action == 0 && t1 >= t0))
+            t2 = mt;
+        else
+            t2 = MAX(t0, t1);
+    */
+
+    REBCNT t2 = MAX(t0, t1);
+
+    REBSER *series;
+    if (IS_BITSET(value)) {
+        //
+        // Although bitsets and binaries share some implementation here,
+        // they have distinct allocation functions...and bitsets need
+        // to set the REBSER.misc.negated union field (BITS_NOT) as
+        // it would be illegal to read it if it were cleared via another
+        // element of the union.
+        //
+        assert(IS_BITSET(arg));
+        series = Make_Bitset(t2 * 8);
+    }
+    else {
+        // Ordinary binary
+        //
+        series = Make_Binary(t2);
+        SET_SERIES_LEN(series, t2);
+    }
+
+    REBYTE *p2 = BIN_HEAD(series);
+
+    switch (action) {
+    case SYM_INTERSECT: { // and
         REBCNT i;
-        REBCNT mt, t1, t0, t2;
+        for (i = 0; i < mt; i++)
+            *p2++ = *p0++ & *p1++;
+        CLEAR(p2, t2 - mt);
+        return series; }
 
-        t0 = VAL_LEN_AT(value);
-        t1 = VAL_LEN_AT(arg);
+    case SYM_UNION: { // or
+        REBCNT i;
+        for (i = 0; i < mt; i++)
+            *p2++ = *p0++ | *p1++;
+        break; }
 
-        mt = MIN(t0, t1); // smaller array size
-        // For AND - result is size of shortest input:
-//      if (action == A_AND || (action == 0 && t1 >= t0))
-//          t2 = mt;
-//      else
-        t2 = MAX(t0, t1);
+    case SYM_DIFFERENCE: { // xor
+        REBCNT i;
+        for (i = 0; i < mt; i++)
+            *p2++ = *p0++ ^ *p1++;
+        break; }
 
-        if (IS_BITSET(value)) {
-            //
-            // Although bitsets and binaries share some implementation here,
-            // they have distinct allocation functions...and bitsets need
-            // to set the REBSER.misc.negated union field (BITS_NOT) as
-            // it would be illegal to read it if it were cleared via another
-            // element of the union.
-            //
-            assert(IS_BITSET(arg));
-            series = Make_Bitset(t2 * 8);
-        }
-        else {
-            // Ordinary binary
-            //
-            series = Make_Binary(t2);
-            SET_SERIES_LEN(series, t2);
-        }
+    default: {
+        //
+        // special bit set case EXCLUDE
+        //
+        REBCNT i;
+        for (i = 0; i < mt; i++)
+            *p2++ = *p0++ & ~*p1++;
+        if (t0 > t1)
+            memcpy(p2, p0, t0 - t1); // residual from first only
+        return series; }
+    }
 
-        p2 = BIN_HEAD(series);
-
-        switch (action) {
-        case SYM_AND_T: // and~
-            for (i = 0; i < mt; i++) *p2++ = *p0++ & *p1++;
-            CLEAR(p2, t2 - mt);
-            return series;
-
-        case SYM_OR_T: // or~
-            for (i = 0; i < mt; i++) *p2++ = *p0++ | *p1++;
-            break;
-
-        case SYM_XOR_T: // xor~
-            for (i = 0; i < mt; i++) *p2++ = *p0++ ^ *p1++;
-            break;
-
-        default:
-            // special bit set case EXCLUDE:
-            for (i = 0; i < mt; i++) *p2++ = *p0++ & ~*p1++;
-            if (t0 > t1) memcpy(p2, p0, t0 - t1); // residual from first only
-            return series;
-        }
-
-        // Copy the residual:
-        memcpy(p2, ((t0 > t1) ? p0 : p1), t2 - mt);
-        return series;
+    // Copy the residual
+    //
+    memcpy(p2, ((t0 > t1) ? p0 : p1), t2 - mt);
+    return series;
 }
 
 
@@ -314,20 +329,20 @@ REBSER *Xandor_Binary(REBCNT action, REBVAL *value, REBVAL *arg)
 //
 REBSER *Complement_Binary(REBVAL *value)
 {
-        REBSER *series;
-        REBYTE *str = VAL_BIN_AT(value);
-        REBINT len = VAL_LEN_AT(value);
-        REBYTE *out;
+    REBSER *series;
+    REBYTE *str = VAL_BIN_AT(value);
+    REBINT len = VAL_LEN_AT(value);
+    REBYTE *out;
 
-        series = Make_Binary(len);
-        SET_SERIES_LEN(series, len);
-        out = BIN_HEAD(series);
-        for (; len > 0; len--) {
-            *out++ = ~(*str);
-            ++str;
-        }
+    series = Make_Binary(len);
+    SET_SERIES_LEN(series, len);
+    out = BIN_HEAD(series);
+    for (; len > 0; len--) {
+        *out++ = ~(*str);
+        ++str;
+    }
 
-        return series;
+    return series;
 }
 
 
@@ -556,21 +571,17 @@ REBSER *Entab_Bytes(REBYTE *bp, REBCNT index, REBCNT len, REBINT tabsize)
 //
 REBSER *Entab_Unicode(REBUNI *bp, REBCNT index, REBCNT len, REBINT tabsize)
 {
+    DECLARE_MOLD (mo);
+    SET_MOLD_FLAG(mo, MOLD_FLAG_RESERVE);
+    mo->reserve = len;
+
+    Push_Mold(mo);
+
+    REBUNI *dp = UNI_AT(mo->series, mo->start);
+
     REBINT n = 0;
-    REBUNI *dp;
-    REBUNI c;
-
-    REB_MOLD mo;
-    CLEARS(&mo);
-    mo.opts = MOPT_RESERVE;
-    mo.reserve = len;
-
-    Push_Mold(&mo);
-    dp = UNI_AT(mo.series, mo.start);
-
     for (; index < len; index++) {
-
-        c = bp[index];
+        REBUNI c = bp[index];
 
         // Count leading spaces, insert TAB for each tabsize:
         if (c == ' ') {
@@ -583,26 +594,28 @@ REBSER *Entab_Unicode(REBUNI *bp, REBCNT index, REBCNT len, REBINT tabsize)
 
         // Hitting a leading TAB resets space counter:
         if (c == '\t') {
-            *dp++ = (REBYTE)c;
+            *dp++ = cast(REBYTE, c);
             n = 0;
         }
         else {
             // Incomplete tab space, pad with spaces:
-            for (; n > 0; n--) *dp++ = ' ';
+            for (; n > 0; n--)
+                *dp++ = ' ';
 
             // Copy chars thru end-of-line (or end of buffer):
             while (index < len) {
-                if ((*dp++ = bp[index++]) == '\n') break;
+                if ((*dp++ = bp[index++]) == '\n')
+                    break;
             }
         }
     }
 
     TERM_UNI_LEN(
-        mo.series,
-        mo.start + cast(REBCNT, dp - UNI_AT(mo.series, mo.start))
+        mo->series,
+        mo->start + cast(REBCNT, dp - UNI_AT(mo->series, mo->start))
     );
 
-    return Pop_Molded_String(&mo);
+    return Pop_Molded_String(mo);
 }
 
 
@@ -652,50 +665,54 @@ REBSER *Detab_Bytes(REBYTE *bp, REBCNT index, REBCNT len, REBINT tabsize)
 //
 // Detab a unicode string and return a new series.
 //
-REBSER *Detab_Unicode(REBUNI *bp, REBCNT index, REBCNT len, REBINT tabsize)
-{
-    REBCNT cnt = 0;
-    REBCNT n;
-    REBUNI *dp;
-    REBUNI c;
-
-    REB_MOLD mo;
-    CLEARS(&mo);
+REBSER *Detab_Unicode(
+    const REBUNI *up,
+    REBCNT index,
+    REBCNT len,
+    REBINT tabsize
+){
+    DECLARE_MOLD (mo);
 
     // Estimate new length based on tab expansion:
+    REBCNT count = 0;
+    REBCNT n;
     for (n = index; n < len; n++)
-        if (bp[n] == '\t') // tab character
-            ++cnt;
+        if (up[n] == '\t') // tab character
+            ++count;
 
-    mo.opts = MOPT_RESERVE;
-    mo.reserve = len + (cnt * (tabsize - 1));
+    SET_MOLD_FLAG(mo, MOLD_FLAG_RESERVE);
+    mo->reserve = len + (count * (tabsize - 1));
 
-    Push_Mold(&mo);
-    dp = UNI_AT(mo.series, mo.start);
+    Push_Mold(mo);
+
+    REBUNI *dp = UNI_AT(mo->series, mo->start);
+
     n = 0;
     while (index < len) {
-
-        c = bp[index++];
+        REBUNI c = up[index++];
 
         if (c == '\t') {
             *dp++ = ' ';
             n++;
-            for (; n % tabsize != 0; n++) *dp++ = ' ';
+            for (; n % tabsize != 0; n++)
+                *dp++ = ' ';
             continue;
         }
 
-        if (c == '\n') n = 0;
-        else n++;
+        if (c == '\n')
+            n = 0;
+        else
+            ++n;
 
         *dp++ = c;
     }
 
     TERM_UNI_LEN(
-        mo.series,
-        mo.start + cast(REBCNT, dp - UNI_AT(mo.series, mo.start))
+        mo->series,
+        mo->start + cast(REBCNT, dp - UNI_AT(mo->series, mo->start))
     );
 
-    return Pop_Molded_String(&mo);
+    return Pop_Molded_String(mo);
 }
 
 

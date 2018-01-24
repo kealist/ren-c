@@ -19,12 +19,18 @@ empty?: func [
 ]
 
 
+; !!! Although this follows the -OF naming convention, it doesn't fit the
+; pattern of a reflector as it takes two arguments.  Moreover, it is a bit
+; sketchy...it doesn't check to see that the two series are the same, and
+; if all it's doing is plain subtraction it seems like a poor primitive to
+; be stuck with giving a name and suggested greater semantics to.  Review.
+;
 offset-of: func [
     "Returns the offset between two series positions."
     series1 [any-series!]
     series2 [any-series!]
 ][
-    subtract index-of series2 index-of series1
+    (index of series2) - (index of series1)
 ]
 
 
@@ -32,7 +38,7 @@ last?: single?: func [
     "Returns TRUE if the series length is 1."
     series [any-series! port! map! tuple! bitset! object! gob! any-word!]
 ][
-    1 = length-of series
+    1 = length of series
 ]
 
 
@@ -112,7 +118,7 @@ array: func [
     if block? size [
         if tail? rest: next size [rest: _]
         unless integer? size: first size [
-            cause-error 'script 'expect-arg reduce ['array 'size type-of :size]
+            cause-error 'script 'expect-arg reduce ['array 'size type of :size]
         ]
     ]
     block: make block! size
@@ -129,7 +135,7 @@ array: func [
     ] else [
         insert/dup block either initial [value][_] size
     ]
-    head block
+    head of block
 ]
 
 
@@ -170,21 +176,21 @@ replace: function [
 
     len: case [
         ; leave bitset patterns as-is regardless of target type, len = 1
-        bitset? :pattern 1
+        bitset? :pattern [1]
 
         any-string? target [
             unless string? :pattern [pattern: form :pattern]
-            length-of :pattern
+            length of :pattern
         ]
 
         binary? target [
             ; Target is binary, pattern is not, make pattern a binary
             unless binary? :pattern [pattern: to-binary :pattern]
-            length-of :pattern
+            length of :pattern
         ]
 
-        any-block? :pattern [length-of :pattern]
-    ] else 1
+        any-block? :pattern [length of :pattern]
+    ] else [1]
 
     while [pos: find/(all [case_REPLACE 'case]) target :pattern] [
         ; apply replacement if function, or drops pos if not
@@ -220,7 +226,7 @@ reword: function [
     output [any-string! binary!]
         "The buffer series (modified)"
 
-    <has>
+    <static>
 
     ; Note: this list should be the same as above with delimiters, with
     ; BLOCK! excluded.
@@ -235,7 +241,7 @@ reword: function [
     case_REWORD: case
     case: :lib/case
 
-    unless into [output: make (type-of source) length-of source]
+    unless into [output: make (type of source) length of source]
 
     prefix: _
     suffix: _
@@ -403,7 +409,7 @@ reword: function [
 
     ; Return end of output with /into, head otherwise
     ;
-    either into [output] [head output]
+    either into [output] [head of output]
 ]
 
 
@@ -424,7 +430,7 @@ move: func [
         limit: limit * size
     ]
     part: take/part source limit
-    insert either to [at head source offset] [
+    insert either to [at head of source offset] [
         lib/skip source offset
     ] part
 ]
@@ -444,14 +450,14 @@ extract: func [
 ][  ; Default value is "" for any-string! output
     if zero? width [return any [output make series 0]]  ; To avoid an infinite loop
     len: either positive? width [  ; Length to preallocate
-        divide (length-of series) width  ; Forward loop, use length
+        divide (length of series) width  ; Forward loop, use length
     ][
-        divide index-of series negate width  ; Backward loop, use position
+        divide index of series negate width  ; Backward loop, use position
     ]
     unless index [pos: 1]
     either block? pos [
         unless parse pos [some [any-number! | logic!]] [cause-error 'Script 'invalid-arg reduce [pos]]
-        if void? :output [output: make series len * length-of pos]
+        if void? :output [output: make series len * length of pos]
         if all [not default any-string? output] [value: copy ""]
         for-skip series width [for-next pos [
             if void? val: pick series pos/1 [val: value]
@@ -465,7 +471,7 @@ extract: func [
             output: insert/only output :val
         ]
     ]
-    either into [output] [head output]
+    either into [output] [head of output]
 ]
 
 
@@ -496,7 +502,7 @@ alter: func [
 collect-with: func [
     "Evaluate body, and return block of values collected via keep function."
 
-    return: [block!]
+    return: [any-series!]
     'name [word! lit-word!]
         "Name to which keep function will be assigned (<local> if word!)"
     body [block!]
@@ -534,7 +540,7 @@ collect-with: func [
         do body
     ]
 
-    either into [output] [head output]
+    either into [output] [head of output]
 ]
 
 
@@ -560,11 +566,11 @@ format: function [
     for-each rule rules [
         if word? :rule [rule: get rule]
 
-        val: val + (switch type-of :rule [
+        val: val + switch type of :rule [
             :integer! [abs rule]
-            :string! [length-of rule]
+            :string! [length of rule]
             :char! [1]
-        ] else 0)
+        ] else [0]
     ]
 
     out: make string! val
@@ -574,15 +580,15 @@ format: function [
     for-each rule rules [
         if word? :rule [rule: get rule]
 
-        switch type-of :rule [
+        switch type of :rule [
             :integer! [
                 pad: rule
                 val: form first+ values
                 clear at val 1 + abs rule
                 if negative? rule [
-                    pad: rule + length-of val
+                    pad: rule + length of val
                     if negative? pad [out: skip out negate pad]
-                    pad: length-of val
+                    pad: length of val
                 ]
                 change out :val
                 out: skip out pad ; spacing (remainder)
@@ -594,7 +600,7 @@ format: function [
 
     ; Provided enough rules? If not, append rest:
     if not tail? values [append out values]
-    head out
+    head of out
 ]
 
 
@@ -630,12 +636,12 @@ split: function [
         size: dlm   ; alias for readability
         
         res: collect [
-            parse series (case [
+            parse series case [
                 all [integer? size | into] [
                     if size < 1 [cause-error 'Script 'invalid-arg size]
                     count: size - 1
                     piece-size: (
-                        to integer! round/down divide length-of series size
+                        to integer! round/down divide length of series size
                     )
                     if zero? piece-size [piece-size: 1]
                     [
@@ -660,7 +666,7 @@ split: function [
                         keep/only copy/part mk1 mk2
                     )]
                 ]
-            ])
+            ]
         ]
 
         ; Special processing, to handle cases where the spec'd more items in
@@ -678,8 +684,8 @@ split: function [
                 ;
                 ; We loop here as insert/dup doesn't copy the value inserted.
                 ;
-                if size > length-of res [
-                    loop (size - length-of res) [add-fill-val]
+                if size > length of res [
+                    loop (size - length of res) [add-fill-val]
                 ]
             ]
             integer? dlm []
@@ -732,8 +738,11 @@ find-all: function [
         "Evaluated for each occurrence"
 ][
     verify [any-series? orig: get series]
-    while [any [set series find get series :value (set series orig false)]] [
+    while [any [
+        | set series find get series :value
+        | (set series orig | false) ;-- reset series and break loop
+    ]][
         do body
-        ++ (series)
+        series: ++ 1
     ]
 ]

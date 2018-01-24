@@ -37,22 +37,27 @@ struct Reb_Func {
     struct Reb_Array paramlist;
 };
 
-#if !defined(NDEBUG) && defined(__cplusplus) && __cplusplus >= 201103L
+#if !defined(NDEBUG) && defined(CPLUSPLUS_11)
     template <class T>
-    inline REBFUN *AS_FUNC(T *p) {
+    inline REBFUN *FUN(T *p) {
         static_assert(
             std::is_same<T, void>::value
             || std::is_same<T, REBNOD>::value
             || std::is_same<T, REBSER>::value
             || std::is_same<T, REBARR>::value,
-            "AS_FUNC works on: void*, REBNOD*, REBSER*, REBARR*"
+            "FUN() works on: void*, REBNOD*, REBSER*, REBARR*"
         );
-        REBARR *paramlist = cast(REBARR*, p);
-        assert(GET_SER_FLAG(paramlist, ARRAY_FLAG_PARAMLIST));
-        return cast(REBFUN*, paramlist);
+        assert(
+            (NODE_FLAG_NODE | SERIES_FLAG_ARRAY | ARRAY_FLAG_PARAMLIST)
+            == (reinterpret_cast<REBSER*>(p)->header.bits & (
+                NODE_FLAG_NODE | SERIES_FLAG_ARRAY | ARRAY_FLAG_PARAMLIST
+                | NODE_FLAG_FREE | NODE_FLAG_CELL | NODE_FLAG_END // bad!
+            ))
+        );
+        return reinterpret_cast<REBFUN*>(p);
     }
 #else
-    #define AS_FUNC(p) \
+    #define FUN(p) \
         cast(REBFUN*, (p))
 #endif
 
@@ -66,15 +71,26 @@ inline static REBVAL *FUNC_VALUE(REBFUN *f) {
     return SER_AT(REBVAL, SER(FUNC_PARAMLIST(f)), 0);
 }
 
-inline static REBNAT FUNC_DISPATCHER(REBFUN *f) {
-    return SER(
-        FUNC_VALUE(f)->payload.function.body_holder
-    )->misc.dispatcher;
-}
+// Functions hold their flags in their canon value, some of which are cached
+// flags put there during Make_Function().
+//
+// !!! Review if (and how) a HIJACK might affect these flags (?)
+//
+#define GET_FUN_FLAG(fun, flag) \
+    GET_VAL_FLAG(FUNC_VALUE(fun), (flag))
+
+// Note: On Windows, FUNC_DISPATCH is already defined in the header files
+//
+#define FUNC_DISPATCHER(f) \
+    (MISC(FUNC_VALUE(f)->payload.function.body_holder).dispatcher)
 
 inline static RELVAL *FUNC_BODY(REBFUN *f) {
-    assert(ARR_LEN(FUNC_VALUE(f)->payload.function.body_holder) == 1);
-    return ARR_HEAD(FUNC_VALUE(f)->payload.function.body_holder);
+    REBARR *body_holder = FUNC_VALUE(f)->payload.function.body_holder;
+    
+    // speed this up over ARR_HEAD() since function bodies are always singular
+    //
+    assert(NOT_SER_INFO(body_holder, SERIES_INFO_HAS_DYNAMIC));
+    return cast(RELVAL*, &SER(body_holder)->content.values[0]);
 }
 
 inline static REBVAL *FUNC_PARAM(REBFUN *f, REBCNT n) {
@@ -87,7 +103,7 @@ inline static REBCNT FUNC_NUM_PARAMS(REBFUN *f) {
 }
 
 inline static REBCTX *FUNC_META(REBFUN *f) {
-    return SER(FUNC_PARAMLIST(f))->link.meta;
+    return MISC(FUNC_PARAMLIST(f)).meta;
 }
 
 // *** These FUNC_FACADE fetchers are called VERY frequently, so it is best
@@ -97,7 +113,7 @@ inline static REBCTX *FUNC_META(REBFUN *f) {
 // really good reason...and seeing the impact on the debug build!!! ***
 
 #define FUNC_FACADE(f) \
-    SER(FUNC_PARAMLIST(f))->misc.facade
+    LINK(FUNC_PARAMLIST(f)).facade
 
 #define FUNC_FACADE_NUM_PARAMS(f) \
     (ARR_LEN(FUNC_FACADE(f)) - 1)
@@ -126,12 +142,12 @@ inline static REBCTX *FUNC_META(REBFUN *f) {
 // always have a FUNCTION! value in its 0 slot as the underlying function.
 //
 inline static REBFUN *FUNC_UNDERLYING(REBFUN *f) {
-    return AS_FUNC(ARR_HEAD(FUNC_FACADE(f))->payload.function.paramlist);
+    return FUN(ARR_HEAD(FUNC_FACADE(f))->payload.function.paramlist);
 }
 
 inline static REBCTX *FUNC_EXEMPLAR(REBFUN *f) {
     REBCTX *exemplar = 
-        SER(FUNC_VALUE(f)->payload.function.body_holder)->link.exemplar;
+        LINK(FUNC_VALUE(f)->payload.function.body_holder).exemplar;
 
 #if !defined(NDEBUG)
     if (exemplar != NULL) {
@@ -141,11 +157,6 @@ inline static REBCTX *FUNC_EXEMPLAR(REBFUN *f) {
     return exemplar;
 }
 
-
-// Note: On Windows, FUNC_DISPATCH is already defined in the header files
-//
-#define FUNC_DISPATCHER(f) \
-    (SER(FUNC_VALUE(f)->payload.function.body_holder)->misc.dispatcher)
 
 // There is no binding information in a function parameter (typeset) so a
 // REBVAL should be okay.
@@ -208,13 +219,19 @@ inline static REBRIN *FUNC_ROUTINE(REBFUN *f) {
 //
 #define FUNC_FLAG_UNLOADABLE_NATIVE FUNC_FLAG(5)
 
+// An "invisible" function is one that does not touch its frame output cell,
+// leaving it completely alone.  This is how `10 comment ["hi"] + 20` can
+// work...if COMMENT destroyed the 10 in the output cell it would be lost and
+// the addition could no longer work.
+//
+// !!! One property considered for invisible items was if they might not be
+// quoted in soft-quoted positions.  This would require fetching something
+// that might not otherwise need to be fetched, to test the flag.  Review.
+//
+#define FUNC_FLAG_INVISIBLE FUNC_FLAG(6)
+
 #if !defined(NDEBUG)
     //
-    // BLANK! ("none!") for unused refinements instead of FALSE
-    // Also, BLANK! for args of unused refinements instead of not set
-    //
-    #define FUNC_FLAG_LEGACY_DEBUG FUNC_FLAG(6)
-
     // If a function is a native then it may provide return information as
     // documentation, but not want to pay for the run-time check of whether
     // the type is correct or not.  In the debug build though, it's good
@@ -227,12 +244,13 @@ inline static REBRIN *FUNC_ROUTINE(REBFUN *f) {
 // These are the flags which are scanned for and set during Make_Function
 //
 #define FUNC_FLAG_CACHED_MASK \
-    (FUNC_FLAG_DEFERS_LOOKBACK | FUNC_FLAG_QUOTES_FIRST_ARG)
+    (FUNC_FLAG_DEFERS_LOOKBACK | FUNC_FLAG_QUOTES_FIRST_ARG \
+        | FUNC_FLAG_INVISIBLE)
 
 
 inline static REBFUN *VAL_FUNC(const RELVAL *v) {
     assert(IS_FUNCTION(v));
-    return AS_FUNC(v->payload.function.paramlist);
+    return FUN(v->payload.function.paramlist);
 }
 
 inline static REBARR *VAL_FUNC_PARAMLIST(const RELVAL *v)
@@ -251,10 +269,10 @@ inline static RELVAL *VAL_FUNC_BODY(const RELVAL *v)
     { return ARR_HEAD(v->payload.function.body_holder); }
 
 inline static REBNAT VAL_FUNC_DISPATCHER(const RELVAL *v)
-    { return SER(v->payload.function.body_holder)->misc.dispatcher; }
+    { return MISC(v->payload.function.body_holder).dispatcher; }
 
 inline static REBCTX *VAL_FUNC_META(const RELVAL *v)
-    { return SER(v->payload.function.paramlist)->link.meta; }
+    { return MISC(v->payload.function.paramlist).meta; }
 
 inline static REBOOL IS_FUNCTION_INTERPRETED(const RELVAL *v) {
     //
@@ -283,26 +301,9 @@ inline static REBOOL IS_FUNCTION_CHAINER(const RELVAL *v)
 inline static REBOOL IS_FUNCTION_ADAPTER(const RELVAL *v)
     { return LOGICAL(VAL_FUNC_DISPATCHER(v) == &Adapter_Dispatcher); }
 
-inline static REBOOL IS_FUNCTION_RIN(const RELVAL *v)
-    { return LOGICAL(VAL_FUNC_DISPATCHER(v) == &Routine_Dispatcher); }
-
 inline static REBOOL IS_FUNCTION_HIJACKER(const RELVAL *v)
     { return LOGICAL(VAL_FUNC_DISPATCHER(v) == &Hijacker_Dispatcher); }
 
-inline static REBRIN *VAL_FUNC_ROUTINE(const RELVAL *v) {
-    return VAL_ARRAY(VAL_FUNC_BODY(v));
-}
-
-
-// !!! At the moment functions are "all durable" or "none durable" w.r.t. the
-// survival of their arguments and locals after the call.
-//
-inline static REBOOL IS_FUNC_DURABLE(REBFUN *f) {
-    return LOGICAL(
-        FUNC_NUM_PARAMS(f) != 0
-        && GET_VAL_FLAG(FUNC_PARAM(f, 1), TYPESET_FLAG_DURABLE)
-    );
-}
 
 // Native values are stored in an array at boot time.  This is a convenience
 // accessor for getting the "FUNC" portion of the native--e.g. the paramlist.

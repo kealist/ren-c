@@ -720,7 +720,7 @@ ConversionResult ConvertUTF8toUTF32 (
 // present it is to be considered part of the in-band data stream...so that
 // reading and writing back out will preserve the input.
 //
-REBINT What_UTF(REBYTE *bp, REBCNT len)
+REBINT What_UTF(const REBYTE *bp, REBCNT len)
 {
     if (len >= 3 && bp[0] == 0xef && bp[1] == 0xbb && bp[2] == 0xbf)
         return 8; // UTF8 (endian agnostic)
@@ -933,7 +933,7 @@ REBOOL Decode_UTF8_Maybe_Astral_Throws(
 ) {
     TRASH_CELL_IF_DEBUG(out_if_thrown);
 
-    assert(SER_WIDE(dst) == sizeof(REBUNI)); // Append_Codepoint_Raw is used
+    assert(SER_WIDE(dst) == sizeof(REBUNI)); // Append_Codepoint is used
 
     UTF32 ch;
 
@@ -968,7 +968,7 @@ REBOOL Decode_UTF8_Maybe_Astral_Throws(
                     break; // tolerate void or blank as meaning nothing
 
                 case REB_CHAR:
-                    Append_Codepoint_Raw(dst, VAL_CHAR(item));
+                    Append_Codepoint(dst, VAL_CHAR(item));
                     break;
 
                 case REB_STRING:
@@ -991,7 +991,7 @@ REBOOL Decode_UTF8_Maybe_Astral_Throws(
             if (src[1] == LF) continue;
             ch = LF;
         }
-        Append_Codepoint_Raw(dst, ch);
+        Append_Codepoint(dst, ch);
     }
 
     return FALSE; // no throw
@@ -1067,7 +1067,7 @@ int Decode_UTF16(
 //
 // Returns the decoded string or NULL for unsupported encodings.
 //
-REBSER *Decode_UTF_String(REBYTE *bp, REBCNT len, REBINT utf)
+REBSER *Decode_UTF_String(const REBYTE *bp, REBCNT len, REBINT utf)
 {
     REBSER *ser = BUF_UTF8; // buffer is Unicode width
     REBSER *dst;

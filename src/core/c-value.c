@@ -53,7 +53,7 @@ ATTRIBUTE_NO_RETURN void Panic_Value_Debug(const RELVAL *v) {
     fflush(stdout);
     fflush(stderr);
 
-    REBSER *containing = Try_Find_Containing_Series_Debug(v);
+    REBNOD *containing = Try_Find_Containing_Node_Debug(v);
 
     switch (VAL_TYPE_RAW(v)) {
     case REB_MAX_VOID:
@@ -62,8 +62,8 @@ ATTRIBUTE_NO_RETURN void Panic_Value_Debug(const RELVAL *v) {
     case REB_BAR:
         printf(
             "REBVAL init on tick #%d at %s:%d\n",
-            cast(unsigned int, v->extra.do_count),
-            v->payload.track.filename,
+            cast(unsigned int, v->extra.tick),
+            v->payload.track.file,
             v->payload.track.line
         );
         fflush(stdout);
@@ -76,9 +76,14 @@ ATTRIBUTE_NO_RETURN void Panic_Value_Debug(const RELVAL *v) {
     printf("Kind=%d\n", cast(int, VAL_TYPE_RAW(v)));
     fflush(stdout);
 
-    if (containing != NULL) {
+    if (containing != NULL && NOT(containing->header.bits & NODE_FLAG_CELL)) {
         printf("Containing series for value pointer found, panicking it:\n");
-        Panic_Series_Debug(containing);
+        Panic_Series_Debug(SER(containing));
+    }
+
+    if (containing != NULL) {
+        printf("Containing pairing for value pointer found, panicking it:\n");
+        Panic_Series_Debug(cast(REBSER*, containing)); // won't pass SER()
     }
 
     printf("No containing series for value...panicking to make stack dump:\n");
@@ -91,9 +96,9 @@ ATTRIBUTE_NO_RETURN void Panic_Value_Debug(const RELVAL *v) {
 //
 REBCTX *VAL_SPECIFIC_Debug(const REBVAL *v)
 {
-    assert(NOT_VAL_FLAG(v, VALUE_FLAG_RELATIVE));
     assert(
-        ANY_WORD(v)
+        VAL_TYPE(v) == REB_0_REFERENCE
+        || ANY_WORD(v)
         || ANY_ARRAY(v)
         || IS_VARARGS(v)
         || IS_FUNCTION(v)
@@ -102,7 +107,7 @@ REBCTX *VAL_SPECIFIC_Debug(const REBVAL *v)
 
     REBCTX *specific = VAL_SPECIFIC_COMMON(v);
 
-    if (specific != SPECIFIED) {
+    if (AS_SPECIFIER(specific) != SPECIFIED) {
         //
         // Basic sanity check: make sure it's a context at all
         //
@@ -124,6 +129,24 @@ REBCTX *VAL_SPECIFIC_Debug(const REBVAL *v)
 }
 
 
+#ifdef CPLUSPLUS_11
+//
+// This destructor checks to make sure that any cell that was created via
+// DECLARE_LOCAL got properly initialized.
+//
+Reb_Specific_Value::~Reb_Specific_Value ()
+{
+    assert(header.bits & NODE_FLAG_CELL);
+
+    enum Reb_Kind kind = VAL_TYPE_RAW(this);
+    assert(
+        header.bits & NODE_FLAG_FREE
+            ? kind == REB_MAX_PLUS_ONE_TRASH
+            : kind <= REB_MAX_VOID
+    );
+}
+#endif
+
 //
 //  Assert_No_Relative: C
 //
@@ -135,17 +158,18 @@ REBCTX *VAL_SPECIFIC_Debug(const REBVAL *v)
 // checks the whole array...which is more conservative (asserts on more
 // cases).  But should there be a flag to ask to honor the index?
 //
-void Assert_No_Relative(REBARR *array, REBOOL deep)
+void Assert_No_Relative(REBARR *array, REBU64 types)
 {
-    RELVAL *item = ARR_HEAD(array);
-    while (NOT_END(item)) {
-        if (IS_RELATIVE(item)) {
+    RELVAL *v;
+    for (v = ARR_HEAD(array); NOT_END(v); ++v) {
+        if (IS_RELATIVE(v)) {
             printf("Array contained relative item and wasn't supposed to\n");
-            panic (item);
+            panic (v);
         }
-        if (!IS_UNREADABLE_IF_DEBUG(item) && ANY_ARRAY(item) && deep)
-             Assert_No_Relative(VAL_ARRAY(item), deep);
-        ++item;
+        if (IS_UNREADABLE_IF_DEBUG(v))
+            continue;
+        if (types & FLAGIT_KIND(VAL_TYPE(v)) & TS_ARRAYS_OBJ)
+             Assert_No_Relative(VAL_ARRAY(v), types);
     }
 }
 
@@ -153,7 +177,9 @@ void Assert_No_Relative(REBARR *array, REBOOL deep)
 //
 //  Probe_Core_Debug: C
 //
-void Probe_Core_Debug(
+// Use PROBE() to invoke, see notes there.
+//
+void* Probe_Core_Debug(
     const void *p,
     const char *file,
     int line
@@ -161,7 +187,7 @@ void Probe_Core_Debug(
     const struct Reb_Header *h = cast(const struct Reb_Header*, p);
 
     printf("\n** PROBE() ");
-    printf("tick %d %s:%d\n", cast(int, TG_Do_Count), file, line);
+    printf("tick %d %s:%d\n", cast(int, TG_Tick), file, line);
 
     fflush(stdout);
     fflush(stderr);
@@ -179,19 +205,8 @@ void Probe_Core_Debug(
         //
         ASSERT_SERIES(s);
 
-        if (GET_SER_FLAG(s, ARRAY_FLAG_VARLIST)) {
-            REBCTX *c = CTX(s);
-
-            // Don't use Init_Any_Context, because that can implicitly manage
-            // the context...which we don't want a debug dump routine to do.
-            //
-            DECLARE_LOCAL (temp);
-            VAL_RESET_HEADER(temp, CTX_TYPE(c));
-            temp->extra.binding = NULL;
-            temp->payload.any_context.varlist = CTX_VARLIST(c);
-            temp->payload.any_context.phase = NULL;
-            Debug_Fmt("%r\n", temp);
-        }
+        if (GET_SER_FLAG(s, ARRAY_FLAG_VARLIST))
+            Debug_Fmt("%r\n", CTX_VALUE(CTX(s)));
         else {
             REBOOL disabled = GC_Disabled;
             GC_Disabled = TRUE;
@@ -232,6 +247,8 @@ void Probe_Core_Debug(
             GC_Disabled = disabled;
         }
     }
+
+    return m_cast(void*, p); // must be cast back to const if source was const
 }
 
 #endif

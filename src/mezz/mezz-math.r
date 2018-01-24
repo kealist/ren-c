@@ -17,24 +17,30 @@ pi: 3.14159265358979323846
 ; ++ and -- were previously used to take a quoted word and increment
 ; it.  They were ordinary prefix operations
 
-++: func [
-    {Increment an integer or series index. Return its prior value.}
-    'word [word!] "Integer or series variable"
-    <local> prior
+++: enfix func [
+    {Set variable to the result of incrementing itself using the + operator}
+
+    return: [any-value!]
+        "The new state of the variable"
+    'var [set-word! set-path!]
+        "Variable to update"
+    n
+        "Amount to increment by"
 ][
-    also (prior: get word) (
-        set word either series? prior [next prior] [prior + 1]
-    )
+    set var (get var) + n
 ]
 
---: func [
-    {Decrement an integer or series index. Return its prior value.}
-    'word [word!] "Integer or series variable"
-    <local> prior
+--: enfix func [
+    {Set variable to the result of decrementing itself using the - operator}
+
+    return: [any-value!]
+        "The new state of the variable"
+    'var [set-word! set-path!]
+        "Variable to update"
+    n
+        "Amount to decrement or skip backwards by"
 ][
-    also (prior: get word) (
-        set word either series? prior [back prior] [prior - 1]
-    )
+    set var (get var) - n
 ]
 
 
@@ -84,7 +90,7 @@ sign-of: func [
     case [
         positive? number [1]
         negative? number [-1]
-    ] else 0
+    ] else [0]
 ]
 
 
@@ -155,7 +161,7 @@ math: function [
     ; binding information into something that's not the function body itself
     ; isn't implemented.
 
-    <has>
+    <static>
 
     slash (to-lit-word first [ / ])
 
@@ -255,11 +261,12 @@ math: function [
     either only [res] [
         ret: reduce res
         unless all [
-            1 = length-of ret
+            1 = length of ret
             any-number? ret/1
         ][
-            fail unspaced [
-                "Cannot be REDUCED to a number(" mold ret ") :" mold res
+            fail [
+                unspaced ["Cannot be REDUCED to a number(" mold ret ")"]
+                ":" mold res
             ]
         ]
         ret/1

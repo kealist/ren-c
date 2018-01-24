@@ -74,18 +74,20 @@ REBNATIVE(mold)
 {
     INCLUDE_PARAMS_OF_MOLD;
 
-    REB_MOLD mo;
-    CLEARS(&mo);
-    if (REF(all)) SET_FLAG(mo.opts, MOPT_MOLD_ALL);
-    if (REF(flat)) SET_FLAG(mo.opts, MOPT_INDENT);
+    DECLARE_MOLD (mo);
+    if (REF(all))
+        SET_MOLD_FLAG(mo, MOLD_FLAG_ALL);
+    if (REF(flat))
+        SET_MOLD_FLAG(mo, MOLD_FLAG_INDENT);
 
-    Push_Mold(&mo);
+    Push_Mold(mo);
 
-    if (REF(only) && IS_BLOCK(ARG(value))) SET_FLAG(mo.opts, MOPT_ONLY);
+    if (REF(only) && IS_BLOCK(ARG(value)))
+        SET_MOLD_FLAG(mo, MOLD_FLAG_ONLY);
 
-    Mold_Value(&mo, ARG(value), TRUE);
+    Mold_Value(mo, ARG(value));
 
-    Init_String(D_OUT, Pop_Molded_String(&mo));
+    Init_String(D_OUT, Pop_Molded_String(mo));
 
     return R_OUT;
 }
@@ -136,40 +138,55 @@ REBNATIVE(write_stdout)
 //
 //      position [block! group!]
 //          "Position to change marker (modified)"
-//      mark
+//      mark [logic!]
 //          "Set TRUE for newline"
 //      /all
 //          "Set/clear marker to end of series"
 //      /skip
 //          {Set/clear marker periodically to the end of the series}
-//      size [integer!]
+//      count [integer!]
 //  ]
 //
 REBNATIVE(new_line)
 {
     INCLUDE_PARAMS_OF_NEW_LINE;
 
-    RELVAL *value = VAL_ARRAY_AT(ARG(position));
-    REBOOL mark = IS_CONDITIONAL_TRUE(ARG(mark));
-    REBINT skip = 0;
-    REBCNT n;
+    RELVAL *v = VAL_ARRAY_AT(ARG(position));
+    REBOOL mark = VAL_LOGIC(ARG(mark));
 
-    if (REF(all)) skip = 1;
+    // Are we at the tail?
+    // Given that VALUE_FLAG_LINE means "put a newline *before* this value is
+    // output", there's no value cell on which to put an end-of-line marker
+    // at the tail of an array.  Red and R3-Alpha ignore this.  It would be
+    // mechanically possible to add an ARRAY_FLAG_XXX for this case.
+    // Previously an alternate strategy was tried where an error was raised
+    // for this case but it meant that client code had to test for tail? in
+    // order to avoid the error.
+    //
 
-    if (REF(skip)) {
-        skip = Int32s(ARG(size), 1);
-        if (skip < 1) skip = 1;
+    REBINT skip;
+    if (REF(all))
+        skip = 1;
+    else if (REF(skip)) {
+        skip = Int32s(ARG(count), 1);
+        if (skip < 1)
+            skip = 1;
     }
+    else
+        skip = 0;
 
-    for (n = 0; NOT_END(value); n++, value++) {
-        if ((skip != 0) && (n % skip != 0)) continue;
+    REBCNT n;
+    for (n = 0; NOT_END(v); ++n, ++v) {
+        if ((skip != 0) && (n % skip != 0))
+            continue;
 
         if (mark)
-            SET_VAL_FLAG(value, VALUE_FLAG_LINE);
+            SET_VAL_FLAG(v, VALUE_FLAG_LINE);
         else
-            CLEAR_VAL_FLAG(value, VALUE_FLAG_LINE);
+            CLEAR_VAL_FLAG(v, VALUE_FLAG_LINE);
 
-        if (skip == 0) break;
+        if (skip == 0)
+            break;
     }
 
     Move_Value(D_OUT, ARG(position));
@@ -220,7 +237,9 @@ REBNATIVE(new_line_q)
 //      /precise
 //          "High precision time"
 //      /utc
-//          "Universal time (no zone)"
+//          "Universal time (zone +0:00)"
+//      /local
+//          "Give time in current zone without including the time zone"
 //  ]
 //
 REBNATIVE(now)
@@ -229,6 +248,13 @@ REBNATIVE(now)
 
     REBVAL *ret = D_OUT;
     OS_GET_TIME(D_OUT);
+
+    // However OS-level date and time is plugged into the system, it needs to
+    // have enough granularity to give back date, time, and time zone.
+    //
+    assert(IS_DATE(D_OUT));
+    assert(GET_VAL_FLAG(D_OUT, DATE_FLAG_HAS_TIME));
+    assert(GET_VAL_FLAG(D_OUT, DATE_FLAG_HAS_ZONE));
 
     if (NOT(REF(precise))) {
         //
@@ -241,7 +267,16 @@ REBNATIVE(now)
     }
 
     if (REF(utc)) {
-        VAL_ZONE(ret) = 0;
+        //
+        // Say it has a time zone component, but it's 0:00 (as opposed
+        // to saying it has no time zone component at all?)
+        //
+        INIT_VAL_ZONE(ret, 0);
+    }
+    else if (REF(local)) {
+        // Clear out the time zone flag
+        //
+        CLEAR_VAL_FLAG(ret, DATE_FLAG_HAS_ZONE);
     }
     else {
         if (
@@ -260,15 +295,14 @@ REBNATIVE(now)
     REBINT n = -1;
 
     if (REF(date)) {
-        VAL_NANO(ret) = NO_TIME;
-        VAL_ZONE(ret) = 0;
+        CLEAR_VAL_FLAGS(ret, DATE_FLAG_HAS_TIME | DATE_FLAG_HAS_ZONE);
     }
     else if (REF(time)) {
-        VAL_RESET_HEADER(ret, REB_TIME);
+        VAL_RESET_HEADER(ret, REB_TIME); // reset clears date flags
     }
     else if (REF(zone)) {
-        VAL_RESET_HEADER(ret, REB_TIME);
         VAL_NANO(ret) = VAL_ZONE(ret) * ZONE_MINS * MIN_SEC;
+        VAL_RESET_HEADER(ret, REB_TIME); // reset clears date flags
     }
     else if (REF(weekday))
         n = Week_Day(VAL_DATE(ret));
@@ -445,7 +479,7 @@ REBNATIVE(wake_up)
         // We don't pass `actor` or `event` in, because we just pass the
         // current call info.  The port action can re-read the arguments.
         //
-        Do_Port_Action(frame_, port, SYM_UPDATE);
+        Do_Port_Action(frame_, port, SYM_ON_WAKE_UP);
     }
 
     REBOOL woke_up = TRUE; // start by assuming success
@@ -466,18 +500,37 @@ REBNATIVE(wake_up)
 
 
 //
-//  to-rebol-file: native [
+//  local-to-file: native [
 //
-//  {Converts a local system file path to a REBOL file path.}
+//  {Converts a local system file path STRING! to a Rebol FILE! path.}
 //
-//      path [file! string!]
+//      return: [file!]
+//          {The returned value should be a valid natural FILE! literal}
+//      path [string! file!]
+//          {Path to convert (by default, only STRING! for type safety)}
+//      /only
+//          {Convert STRING!s, but copy FILE!s to pass through unmodified}
 //  ]
 //
-REBNATIVE(to_rebol_file)
+REBNATIVE(local_to_file)
 {
-    INCLUDE_PARAMS_OF_TO_REBOL_FILE;
+    INCLUDE_PARAMS_OF_LOCAL_TO_FILE;
 
     REBVAL *arg = ARG(path);
+    if (IS_FILE(arg)) {
+        if (NOT(REF(only)))
+            fail ("LOCAL-TO-FILE only passes through FILE! if /ONLY used");
+
+        Init_File(
+            D_OUT,
+            Copy_Sequence_At_Len( // Copy (callers frequently modify result)
+                VAL_SERIES(arg),
+                VAL_INDEX(arg),
+                VAL_LEN_AT(arg)
+            )
+        );
+        return R_OUT;
+    }
 
     REBSER *ser = Value_To_REBOL_Path(arg, FALSE);
     if (ser == NULL)
@@ -489,20 +542,39 @@ REBNATIVE(to_rebol_file)
 
 
 //
-//  to-local-file: native [
+//  file-to-local: native [
 //
-//  {Converts a REBOL file path to the local system file path.}
+//  {Converts a Rebol FILE! path to a STRING! of the local system file path.}
 //
+//      return: [string!]
+//          {A STRING! like "\foo\bar" is not a "natural" FILE! %\foo\bar}
 //      path [file! string!]
+//          {Path to convert (by default, only FILE! for type safety)}
+//      /only
+//          {Convert FILE!s, but copy STRING!s to pass through unmodified}
 //      /full
-//          {Prepends current dir for full path (for relative paths only)}
+//          {For relative paths, prepends current dir for full path}
 //  ]
 //
-REBNATIVE(to_local_file)
+REBNATIVE(file_to_local)
 {
-    INCLUDE_PARAMS_OF_TO_LOCAL_FILE;
+    INCLUDE_PARAMS_OF_FILE_TO_LOCAL;
 
     REBVAL *arg = ARG(path);
+    if (IS_STRING(arg)) {
+        if (NOT(REF(only)))
+            fail ("FILE-TO-LOCAL only passes through STRING! if /ONLY used");
+
+        Init_String(
+            D_OUT,
+            Copy_Sequence_At_Len( // Copy (callers frequently modify result)
+                VAL_SERIES(arg),
+                VAL_INDEX(arg),
+                VAL_LEN_AT(arg)
+            )
+        );
+        return R_OUT;
+    }
 
     REBSER *ser = Value_To_Local_Path(arg, REF(full));
     if (ser == NULL)
@@ -610,321 +682,3 @@ REBNATIVE(change_dir)
     Move_Value(D_OUT, ARG(path));
     return R_OUT;
 }
-
-
-//
-//  String_List_To_Array: C
-//
-// Convert a series of null terminated strings to an array of strings
-// separated with '='.
-//
-static REBARR *String_List_To_Array(REBCHR *str)
-{
-    REBCNT n;
-    REBCNT len = 0;
-    REBCHR *start = str;
-    REBCHR *eq;
-    REBARR *array;
-
-    while ((n = OS_STRLEN(str))) {
-        len++;
-        str += n + 1; // next
-    }
-
-    array = Make_Array(len * 2);
-
-    str = start;
-    while ((eq = OS_STRCHR(str+1, '=')) && (n = OS_STRLEN(str))) {
-        Init_String(Alloc_Tail_Array(array), Copy_OS_Str(str, eq - str));
-        Init_String(
-            Alloc_Tail_Array(array), Copy_OS_Str(eq + 1, n - (eq - str) - 1)
-        );
-        str += n + 1; // next
-    }
-
-    return array;
-}
-
-
-//
-//  Block_To_String_List: C
-//
-// Convert block of values to a string that holds
-// a series of null terminated strings, followed
-// by a final terminating string.
-//
-REBSER *Block_To_String_List(REBVAL *blk)
-{
-    RELVAL *value;
-
-    REB_MOLD mo;
-    CLEARS(&mo);
-
-    Push_Mold(&mo);
-
-    for (value = VAL_ARRAY_AT(blk); NOT_END(value); value++) {
-        Mold_Value(&mo, value, FALSE);
-        Append_Codepoint_Raw(mo.series, '\0');
-    }
-    Append_Codepoint_Raw(mo.series, '\0');
-
-    return Pop_Molded_String(&mo);
-}
-
-
-//
-//  File_List_To_Array: C
-//
-// Convert file directory and file name list to block.
-//
-static REBARR *File_List_To_Array(const REBCHR *str)
-{
-    REBCNT n;
-    REBCNT len = 0;
-    const REBCHR *start = str;
-    REBARR *blk;
-    REBSER *dir;
-
-    while ((n = OS_STRLEN(str))) {
-        len++;
-        str += n + 1; // next
-    }
-
-    blk = Make_Array(len);
-
-    // First is a dir path or full file path:
-    str = start;
-    n = OS_STRLEN(str);
-
-    if (len == 1) {  // First is full file path
-        dir = To_REBOL_Path(str, n, (OS_WIDE ? PATH_OPT_UNI_SRC : 0));
-        Init_File(Alloc_Tail_Array(blk), dir);
-    }
-    else {  // First is dir path for the rest of the files
-#ifdef TO_WINDOWS /* directory followed by files */
-        assert(sizeof(wchar_t) == sizeof(REBCHR));
-        dir = To_REBOL_Path(
-            str,
-            n,
-            PATH_OPT_UNI_SRC | PATH_OPT_FORCE_UNI_DEST | PATH_OPT_SRC_IS_DIR
-        );
-        str += n + 1; // next
-        len = SER_LEN(dir);
-        while ((n = OS_STRLEN(str))) {
-            SET_SERIES_LEN(dir, len);
-            Append_Uni_Uni(dir, cast(const REBUNI*, str), n);
-            Init_File(Alloc_Tail_Array(blk), Copy_String_Slimming(dir, 0, -1));
-            str += n + 1; // next
-        }
-#else /* absolute pathes already */
-        str += n + 1;
-        while ((n = OS_STRLEN(str))) {
-            dir = To_REBOL_Path(str, n, (OS_WIDE ? PATH_OPT_UNI_SRC : 0));
-            Init_File(Alloc_Tail_Array(blk), Copy_String_Slimming(dir, 0, -1));
-            str += n + 1; // next
-        }
-#endif
-    }
-
-    return blk;
-}
-
-
-//
-//  request-file: native [
-//
-//  {Asks user to select a file and returns full file path (or block of paths).}
-//
-//      /save
-//          "File save mode"
-//      /multi
-//          {Allows multiple file selection, returned as a block}
-//      /file
-//      name [file!]
-//          "Default file name or directory"
-//      /title
-//      text [string!]
-//          "Window title"
-//      /filter
-//      list [block!]
-//          "Block of filters (filter-name filter)"
-//  ]
-//
-REBNATIVE(request_file)
-{
-    INCLUDE_PARAMS_OF_REQUEST_FILE;
-
-    // !!! This routine used to have an ENABLE_GC and DISABLE_GC
-    // reference.  It is not clear what that was protecting, but
-    // this code should be reviewed with GC "torture mode", and
-    // if any values are being created which cannot be GC'd then
-    // they should be created without handing them over to GC with
-    // MANAGE_SERIES() instead.
-
-    REBRFR fr;
-    CLEARS(&fr);
-    fr.files = OS_ALLOC_N(REBCHR, MAX_FILE_REQ_BUF);
-    fr.len = MAX_FILE_REQ_BUF/sizeof(REBCHR) - 2;
-    fr.files[0] = OS_MAKE_CH('\0');
-
-    if (REF(save))
-        SET_FLAG(fr.flags, FRF_SAVE);
-    if (REF(multi))
-        SET_FLAG(fr.flags, FRF_MULTI);
-
-    if (REF(file)) {
-        REBSER *ser = Value_To_OS_Path(ARG(name), TRUE);
-        REBINT n = SER_LEN(ser);
-
-        fr.dir = SER_HEAD(REBCHR, ser);
-
-        if (OS_CH_VALUE(fr.dir[n - 1]) != OS_DIR_SEP) {
-            if (n + 2 > fr.len)
-                n = fr.len - 2;
-            OS_STRNCPY(
-                cast(REBCHR*, fr.files),
-                SER_HEAD(REBCHR, ser),
-                n
-            );
-            fr.files[n] = OS_MAKE_CH('\0');
-        }
-    }
-
-    if (REF(filter)) {
-        REBSER *ser = Block_To_String_List(ARG(list));
-        fr.filter = SER_HEAD(REBCHR, ser);
-    }
-
-    if (REF(title)) {
-        // !!! By passing NULL we don't get backing series to protect!
-        fr.title = Val_Str_To_OS_Managed(NULL, ARG(text));
-    }
-
-    if (OS_REQUEST_FILE(&fr)) {
-        if (GET_FLAG(fr.flags, FRF_MULTI)) {
-            REBARR *array = File_List_To_Array(fr.files);
-            Init_Block(D_OUT, array);
-        }
-        else {
-            REBSER *ser = To_REBOL_Path(
-                fr.files, OS_STRLEN(fr.files), (OS_WIDE ? PATH_OPT_UNI_SRC : 0)
-            );
-            Init_File(D_OUT, ser);
-        }
-    } else
-        Init_Blank(D_OUT);
-
-    OS_FREE(fr.files);
-
-    return R_OUT;
-}
-
-
-//
-//  get-env: native [
-//
-//  {Returns the value of an OS environment variable (for current process).}
-//
-//      return: [string! blank!]
-//          {The string of the environment variable, or blank if not set}
-//      var [any-string! any-word!]
-//  ]
-//
-REBNATIVE(get_env)
-{
-    INCLUDE_PARAMS_OF_GET_ENV;
-
-    REBVAL *var = ARG(var);
-
-    Check_Security(Canon(SYM_ENVR), POL_READ, var);
-
-    if (ANY_WORD(var)) {
-        REBSER *copy = Copy_Form_Value(var, 0);
-        Init_String(var, copy);
-    }
-
-    // !!! By passing NULL we don't get backing series to protect!
-    REBCHR *os_var = Val_Str_To_OS_Managed(NULL, var);
-
-    REBINT lenplus = OS_GET_ENV(NULL, os_var, 0);
-    if (lenplus < 0)
-        return R_BLANK;
-    if (lenplus == 0) {
-        Init_String(D_OUT, Copy_Sequence(VAL_SERIES(EMPTY_STRING)));
-        return R_OUT;
-    }
-
-    // Two copies...is there a better way?
-    REBCHR *buf = ALLOC_N(REBCHR, lenplus);
-    OS_GET_ENV(buf, os_var, lenplus);
-    Init_String(D_OUT, Copy_OS_Str(buf, lenplus - 1));
-    FREE_N(REBCHR, lenplus, buf);
-
-    return R_OUT;
-}
-
-
-//
-//  set-env: native [
-//
-//  {Sets value of operating system environment variable for current process.}
-//
-//      var [any-string! any-word!]
-//          "Variable to set"
-//      value [string! blank!]
-//          "Value to set, or a BLANK! to unset it"
-//  ]
-//
-REBNATIVE(set_env)
-{
-    INCLUDE_PARAMS_OF_SET_ENV;
-
-    REBVAL *var = ARG(var);
-    REBVAL *value = ARG(value);
-
-    Check_Security(Canon(SYM_ENVR), POL_WRITE, var);
-
-    if (ANY_WORD(var)) {
-        REBSER *copy = Copy_Form_Value(var, 0);
-        Init_String(var, copy);
-    }
-
-    // !!! By passing NULL we don't get backing series to protect!
-    REBCHR *os_var = Val_Str_To_OS_Managed(NULL, var);
-
-    if (ANY_STRING(value)) {
-        // !!! By passing NULL we don't get backing series to protect!
-        REBCHR *os_value = Val_Str_To_OS_Managed(NULL, value);
-        if (OS_SET_ENV(os_var, os_value)) {
-            // What function could reuse arg2 as-is?
-            Init_String(D_OUT, Copy_OS_Str(os_value, OS_STRLEN(os_value)));
-            return R_OUT;
-        }
-        return R_VOID;
-    }
-
-    assert(IS_BLANK(value));
-
-    if (OS_SET_ENV(os_var, NULL))
-        return R_BLANK;
-    return R_VOID;
-}
-
-
-//
-//  list-env: native [
-//
-//  {Returns a map of OS environment variables (for current process).}
-//
-//      ; No arguments
-//  ]
-//
-REBNATIVE(list_env)
-{
-    REBARR *array = String_List_To_Array(OS_LIST_ENV());
-    REBMAP *map = Mutate_Array_Into_Map(array);
-    Init_Map(D_OUT, map);
-
-    return R_OUT;
-}
-

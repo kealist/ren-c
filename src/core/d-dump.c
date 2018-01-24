@@ -248,14 +248,14 @@ void Dump_Stack(REBFRM *f, REBCNT level)
         return;
     }
 
-   printf(
+    printf(
         "STACK[%d](%s) - %d\n",
         cast(int, level),
-        STR_HEAD(FRM_LABEL(f)),
+        Frame_Label_Or_Anonymous_UTF8(f),
         f->eval_type // note: this is now an ordinary Reb_Kind, stringify it
     );
 
-    if (NOT(Is_Any_Function_Frame(f))) {
+    if (NOT(Is_Function_Frame(f))) {
         printf("(no function call pending or in progress)\n");
         fflush(stdout);
         return;
@@ -273,11 +273,17 @@ void Dump_Stack(REBFRM *f, REBCNT level)
     REBVAL *param = FUNC_PARAMS_HEAD(f->phase);
 
     for (; NOT_END(param); ++param, ++arg, ++n) {
-        Debug_Fmt(
-            "    %s: %72r",
-            STR_HEAD(VAL_PARAM_SPELLING(param)),
-            arg
-        );
+        if (IS_VOID(arg))
+            Debug_Fmt(
+                "    %s:",
+                STR_HEAD(VAL_PARAM_SPELLING(param))
+            );
+        else
+            Debug_Fmt(
+                "    %s: %72r",
+                STR_HEAD(VAL_PARAM_SPELLING(param)),
+                arg
+            );
     }
 
     if (f->prior)

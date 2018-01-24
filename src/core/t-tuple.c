@@ -245,49 +245,54 @@ void Poke_Tuple_Immediate(
 //
 //  PD_Tuple: C
 //
-REBINT PD_Tuple(REBPVS *pvs)
+REB_R PD_Tuple(REBPVS *pvs, const REBVAL *picker, const REBVAL *opt_setval)
 {
-    if (pvs->opt_setval) {
+    if (opt_setval != NULL) {
         //
-        // !!! Is this a good idea?  It means `x: 10.10.10 | y: (x/2: 20)` does
-        // result in y being 10.20.10, but x is unchanged.
+        // Returning R_IMMEDIATE means it is up to the caller to decide if
+        // they can meaningfully find a variable to store any updates to.
         //
-        Poke_Tuple_Immediate(
-            KNOWN(pvs->value), pvs->picker, pvs->opt_setval
-        );
-        return PE_OK;
+        Poke_Tuple_Immediate(pvs->out, picker, opt_setval);
+        return R_IMMEDIATE;
     }
 
-    Pick_Tuple(pvs->store, KNOWN(pvs->value), pvs->picker);
-    return PE_USE_STORE;
+    Pick_Tuple(pvs->out, pvs->out, picker);
+    return R_OUT;
 }
 
 
 //
-//  Emit_Tuple: C
+//  MF_Tuple: C
 //
-// The out array must be large enough to hold longest tuple.
-// Longest is: (3 digits + '.') * 11 nums + 1 term => 45
-//
-REBINT Emit_Tuple(const REBVAL *value, REBYTE *out)
+void MF_Tuple(REB_MOLD *mo, const RELVAL *v, REBOOL form)
 {
-    REBCNT len = VAL_TUPLE_LEN(value);
-    const REBYTE *tp = cast(const REBYTE *, VAL_TUPLE(value));
-    REBYTE *start = out;
+    UNUSED(form);
+
+    // "Buffer must be large enough to hold longest tuple.
+    //  Longest is: (3 digits + '.') * 11 nums + 1 term => 45"
+    //
+    // !!! ^-- Out of date comments; TUPLE! needs review and replacement.
+    //
+    REBYTE buf[60];
+
+    REBCNT len = VAL_TUPLE_LEN(v);
+    const REBYTE *tp = cast(const REBYTE *, VAL_TUPLE(v));
+
+    REBYTE *out = buf;
 
     for (; len > 0; len--, tp++) {
         out = Form_Int(out, *tp);
         *out++ = '.';
     }
 
-    len = VAL_TUPLE_LEN(value);
+    len = VAL_TUPLE_LEN(v);
     while (len++ < 3) {
         *out++ = '0';
         *out++ = '.';
     }
     *--out = 0;
 
-    return out-start;
+    Append_Unencoded_Len(mo->series, s_cast(buf), out - buf);
 }
 
 
@@ -323,9 +328,9 @@ REBTYPE(Tuple)
         || action == SYM_MULTIPLY
         || action == SYM_DIVIDE
         || action == SYM_REMAINDER
-        || action == SYM_AND_T
-        || action == SYM_OR_T
-        || action == SYM_XOR_T
+        || action == SYM_INTERSECT
+        || action == SYM_UNION
+        || action == SYM_DIFFERENCE
     ){
         assert(vp);
 
@@ -387,15 +392,15 @@ REBTYPE(Tuple)
                 v %= a;
                 break;
 
-            case SYM_AND_T:
+            case SYM_INTERSECT:
                 v &= a;
                 break;
 
-            case SYM_OR_T:
+            case SYM_UNION:
                 v |= a;
                 break;
 
-            case SYM_XOR_T:
+            case SYM_DIFFERENCE:
                 v ^= a;
                 break;
 
@@ -434,10 +439,25 @@ REBTYPE(Tuple)
     }
 
     switch (action) {
-    case SYM_LENGTH_OF:
-        len = MAX(len, 3);
-        Init_Integer(D_OUT, len);
-        return R_OUT;
+
+    case SYM_REFLECT: {
+        INCLUDE_PARAMS_OF_REFLECT;
+
+        UNUSED(ARG(value));
+        REBSYM property = VAL_WORD_SYM(ARG(property));
+        assert(property != SYM_0);
+
+        switch (property) {
+        case SYM_LENGTH:
+            len = MAX(len, 3);
+            Init_Integer(D_OUT, len);
+            return R_OUT;
+
+        default:
+            break;
+        }
+
+        break; }
 
     case SYM_REVERSE: {
         INCLUDE_PARAMS_OF_REVERSE;
@@ -479,9 +499,7 @@ REBTYPE(Tuple)
             v = 255;
         vp[a-1] = v;
         goto ret_value;
-
 */
-        fail (Error_Bad_Make(REB_TUPLE, arg));
 
     default:
         break;

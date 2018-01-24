@@ -37,13 +37,25 @@
         #undef IS_ERROR //winerror.h defines, Rebol has a different meaning
     #endif
 #else
-    #if !defined( __cplusplus) && defined(TO_LINUX)
+    #if !defined(__cplusplus) && defined(TO_LINUX)
         //
         // See feature_test_macros(7), this definition is redundant under C++
         //
         #define _GNU_SOURCE // Needed for pipe2 when #including <unistd.h>
     #endif
     #include <unistd.h>
+    #include <stdlib.h>
+
+    // The location of "environ" (environment variables inventory that you
+    // can walk on POSIX) can vary.  Some put it in stdlib, some put it
+    // in <unistd.h>.  And OS X doesn't define it in a header at all, you
+    // just have to declare it yourself.  :-/
+    //
+    // https://stackoverflow.com/a/31347357/211160
+    //
+    #if defined(TO_OSX)
+        extern char **environ;
+    #endif
 
     #include <errno.h>
     #include <fcntl.h>
@@ -62,6 +74,127 @@
 #include "sys-ext.h"
 
 #include "tmp-mod-process-first.h"
+
+
+#define MAX_POSIX_ERROR_LEN 1024
+
+//
+//  Error_OS: C
+//
+// Produce an error from an OS error code, by asking the OS for textual
+// information it knows internally from its database of error strings.
+//
+// !!! This is a generally useful error generator which one might be tempted
+// to use in many different extensions.  Yet because it is sensitive to the
+// details of the OS, it's considered to be poor practice to put it in the
+// core--which is supposed to be platform agnostic.  There's no really known
+// good way to share C code across extensions at this moment in time--it used
+// to be by making it a service of the "host"--but that is going away.
+// Perhaps sharing by an .inc file or similar would be better.
+//
+REBCTX *Error_OS(int errnum)
+{
+#ifdef TO_WINDOWS
+    if (errnum == 0)
+        errnum = GetLastError();
+
+    wchar_t *lpMsgBuf; // FormatMessage writes allocated buffer address here
+
+     // Specific errors have %1 %2 slots, and if you know the error ID and
+     // that it's one of those then this lets you pass arguments to fill
+     // those in.  But since this is a generic error, we have no more
+     // parameterization (hence FORMAT_MESSAGE_IGNORE_INSERTS)
+     //
+    va_list *Arguments = NULL;
+
+    // Apparently FormatMessage can find its error strings in a variety of
+    // DLLs, but we don't have any context here so just use the default.
+    //
+    LPCVOID lpSource = NULL;
+
+    DWORD ok = FormatMessage(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER // see lpMsgBuf
+            | FORMAT_MESSAGE_FROM_SYSTEM // e.g. ignore lpSource
+            | FORMAT_MESSAGE_IGNORE_INSERTS, // see Arguments
+        lpSource,
+        errnum, // message identifier
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // default language
+        cast(wchar_t*, &lpMsgBuf), // allocated buffer address written here
+        0, // buffer size (not used since FORMAT_MESSAGE_ALLOCATE_BUFFER)
+        Arguments
+    );
+
+    if (ok == 0) {
+        //
+        // Might want to show the value of GetLastError() in this message,
+        // but trying to FormatMessage() on *that* would be excessive.
+        //
+        return Error_User("FormatMessage() failed to give error description");
+    }
+
+    DECLARE_LOCAL (message);
+    Init_String(message, Copy_Wide_Str(lpMsgBuf, wcslen(lpMsgBuf)));
+    LocalFree(lpMsgBuf);
+
+    return Error(RE_USER, message, END);
+#else
+    // strerror() is not thread-safe, but strerror_r is. Unfortunately, at
+    // least in glibc, there are two different protocols for strerror_r(),
+    // depending on whether you are using the POSIX-compliant implementation
+    // or the GNU implementation.
+    //
+    // The convoluted test below is the inversion of the actual test glibc
+    // suggests to discern the version of strerror_r() provided. As other,
+    // non-glibc implementations (such as OS X's libSystem) also provide the
+    // POSIX-compliant version, we invert the test: explicitly use the
+    // older GNU implementation when we are sure about it, and use the
+    // more modern POSIX-compliant version otherwise. Finally, we only
+    // attempt this feature detection when using glibc (__GNU_LIBRARY__),
+    // as this particular combination of the (more widely standardised)
+    // _POSIX_C_SOURCE and _XOPEN_SOURCE defines might mean something
+    // completely different on non-glibc implementations.
+    //
+    // (Note that undefined pre-processor names arithmetically compare as 0,
+    // which is used in the original glibc test; we are more explicit.)
+
+    #ifdef USE_STRERROR_NOT_STRERROR_R
+        char *shared = strerror(errnum);
+        return Error_User(shared);
+    #elif defined(__GNU_LIBRARY__) \
+            && (defined(_GNU_SOURCE) \
+                || ((!defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 200112L) \
+                    && (!defined(_XOPEN_SOURCE) || _XOPEN_SOURCE < 600)))
+
+        // May return an immutable string instead of filling the buffer
+
+        char buffer[MAX_POSIX_ERROR_LEN];
+        char *maybe_str = strerror_r(errnum, buffer, MAX_POSIX_ERROR_LEN);
+        if (maybe_str != buffer)
+            strncpy(buffer, maybe_str, MAX_POSIX_ERROR_LEN);
+        return Error_User(buffer);
+    #else
+        // Quoting glibc's strerror_r manpage: "The XSI-compliant strerror_r()
+        // function returns 0 on success. On error, a (positive) error number
+        // is returned (since glibc 2.13), or -1 is returned and errno is set
+        // to indicate the error (glibc versions before 2.13)."
+
+        char buffer[MAX_POSIX_ERROR_LEN];
+        int result = strerror_r(errnum, buffer, MAX_POSIX_ERROR_LEN);
+
+        // Alert us to any problems in a debug build.
+        assert(result == 0);
+
+        if (result == 0)
+            return Error_User(buffer);
+        else if (result == EINVAL)
+            return Error_User("EINVAL: bad error num passed to strerror_r()");
+        else if (result == ERANGE)
+            return Error_User("ERANGE: insufficient buffer size for error");
+        else
+            return Error_User("Unknown problem getting strerror_r() message");
+    #endif
+#endif
+}
 
 
 // !!! The original implementation of CALL from Atronix had to communicate
@@ -1546,11 +1679,13 @@ REBNATIVE(call)
     // full data, which is then appended after the operation is finished.
     // With CALL now an extension where all parts have access to the internal
     // API, it could be added directly to the binary or string as it goes.
+
+    // These are initialized to avoid a "possibly uninitialized" warning.
     //
-    char *os_output;
-    REBCNT output_len;
-    char *os_err;
-    REBCNT err_len;
+    char *os_output = NULL;
+    REBCNT output_len = 0;
+    char *os_err = NULL;
+    REBCNT err_len = 0;
 
     REBINT r = OS_Create_Process(
         frame_,
@@ -1643,10 +1778,8 @@ REBNATIVE(call)
         return R_OUT;
     }
 
-    if (r != 0) {
-        Make_OS_Error(D_OUT, r);
-        fail (Error_Call_Fail_Raw(D_OUT));
-    }
+    if (r != 0)
+        fail (Error_OS(r));
 
     // We may have waited even if they didn't ask us to explicitly, but
     // we only return a process ID if /WAIT was not explicitly used
@@ -1740,16 +1873,16 @@ REBNATIVE(get_os_browsers)
     // Caller should try xdg-open first, then try x-www-browser otherwise
     //
     DS_PUSH_TRASH;
-    Init_String(DS_TOP, Make_UTF8_May_Fail("xdg-open %1"));
+    Init_String(DS_TOP, Make_UTF8_May_Fail(cb_cast("xdg-open %1")));
     DS_PUSH_TRASH;
-    Init_String(DS_TOP, Make_UTF8_May_Fail("x-www-browser %1"));
+    Init_String(DS_TOP, Make_UTF8_May_Fail(cb_cast("x-www-browser %1")));
 
 #else // Just try /usr/bin/open on POSIX, OS X, Haiku, etc.
 
     // Just use /usr/bin/open
     //
     DS_PUSH_TRASH;
-    Init_String(DS_TOP, Make_UTF8_May_Fail("/usr/bin/open %1"));
+    Init_String(DS_TOP, Make_UTF8_May_Fail(cb_cast("/usr/bin/open %1")));
 
 #endif
 
@@ -1759,7 +1892,7 @@ REBNATIVE(get_os_browsers)
 
 
 //
-//  sleep: native [
+//  sleep: native/export [
 //
 //  "Use system sleep to wait a certain amount of time (doesn't use PORT!s)."
 //
@@ -1818,29 +1951,31 @@ static REBNATIVE(terminate)
     INCLUDE_PARAMS_OF_TERMINATE;
 
 #ifdef TO_WINDOWS
-    if (GetCurrentProcessId() == cast(DWORD, VAL_INT32(ARG(pid)))) {
+    if (GetCurrentProcessId() == cast(DWORD, VAL_INT32(ARG(pid))))
         fail ("Use QUIT or EXIT-REBOL to terminate current process, instead");
-    }
+
     REBINT err = 0;
     HANDLE ph = OpenProcess(PROCESS_TERMINATE, FALSE, VAL_INT32(ARG(pid)));
     if (ph == NULL) {
         err = GetLastError();
         switch (err) {
-            case ERROR_ACCESS_DENIED:
-                fail (Error(RE_EXT_PROCESS_PERMISSION_DENIED, END));
-            case ERROR_INVALID_PARAMETER:
-                fail (Error(RE_EXT_PROCESS_NO_PROCESS, ARG(pid), END));
-            default: {
-                DECLARE_LOCAL(val);
-                Init_Integer(val, err);
-                fail (Error(RE_EXT_PROCESS_TERMINATE_FAILED, val, END));
-             }
+        case ERROR_ACCESS_DENIED:
+            fail (Error(RE_EXT_PROCESS_PERMISSION_DENIED, END));
+        case ERROR_INVALID_PARAMETER:
+            fail (Error(RE_EXT_PROCESS_NO_PROCESS, ARG(pid), END));
+        default: {
+            DECLARE_LOCAL(val);
+            Init_Integer(val, err);
+            fail (Error(RE_EXT_PROCESS_TERMINATE_FAILED, val, END));
+            }
         }
     }
+
     if (TerminateProcess(ph, 0)) {
         CloseHandle(ph);
         return R_VOID;
     }
+
     err = GetLastError();
     CloseHandle(ph);
     switch (err) {
@@ -1859,14 +1994,335 @@ static REBNATIVE(terminate)
         fail ("Use QUIT or EXIT-REBOL to terminate current process, instead");
     }
     kill_process(VAL_INT32(ARG(pid)), SIGTERM);
+    return R_VOID;
 #else
     UNUSED(frame_);
     fail ("terminate is not implemented for this platform");
 #endif
+}
+
+
+//
+//  get-env: native/export [
+//
+//  {Returns the value of an OS environment variable (for current process).}
+//
+//      return: [string! blank!]
+//          {The string of the environment variable, or blank if not set}
+//      variable [string! word!]
+//          {Name of variable to get (case-insensitive in Windows)}
+//  ]
+//
+static REBNATIVE(get_env)
+{
+    INCLUDE_PARAMS_OF_GET_ENV;
+
+    REBVAL *variable = ARG(variable);
+
+    Check_Security(Canon(SYM_ENVR), POL_READ, variable);
+
+    if (ANY_WORD(variable)) {
+        REBSER *copy = Copy_Form_Value(variable, 0);
+        Init_String(variable, copy);
+    }
+
+    REBCTX *error = NULL;
+
+#ifdef TO_WINDOWS
+    // Note: The Windows variant of this API is NOT case-sensitive
+
+    wchar_t *key = rebSpellingOfAllocW(NULL, variable);
+
+    DWORD val_len_plus_one = GetEnvironmentVariable(key, NULL, 0);
+    if (val_len_plus_one == 0) { // some failure...
+        if (GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+            Init_Blank(D_OUT);
+        else
+            error = Error_User("Unknown error when requesting variable size");
+    }
+    else {
+        wchar_t *val = OS_ALLOC_N(wchar_t, val_len_plus_one);
+        DWORD result = GetEnvironmentVariable(key, val, val_len_plus_one);
+        if (result == 0)
+            error = Error_User("Unknown error fetching variable to buffer");
+        else
+            Init_String(D_OUT, Copy_Wide_Str(val, val_len_plus_one - 1));
+        OS_FREE(val);
+    }
+
+    OS_FREE(key);
+#else
+    // Note: The Posix variant of this API is case-sensitive
+
+    char *key = rebSpellingOfAlloc(NULL, variable);
+
+    const char* val = getenv(key);
+    if (val == NULL) // key not present in environment
+        Init_Blank(D_OUT);
+    else {
+        REBCNT len_bytes = strlen(val);
+
+        /* assert(len != 0); */ // Is this true?  Should it return BLANK!?
+
+        Init_String(D_OUT, Decode_UTF_String(cb_cast(val), len_bytes, 8));
+    }
+
+    OS_FREE(key);
+#endif
+
+    // Error is broken out like this so that the proper freeing can be done
+    // without leaking temporary buffers.
+    //
+    if (error != NULL)
+        fail (error);
+
+    return R_OUT;
+}
+
+
+//
+//  set-env: native/export [
+//
+//  {Sets value of operating system environment variable for current process.}
+//
+//      return: [<opt>]
+//      variable [string! word!]
+//          "Variable to set (case-insensitive in Windows)"
+//      value [string! blank!]
+//          "Value to set the variable to, or a BLANK! to unset it"
+//  ]
+//
+static REBNATIVE(set_env)
+{
+    INCLUDE_PARAMS_OF_SET_ENV;
+
+    REBVAL *variable = ARG(variable);
+    REBVAL *value = ARG(value);
+
+    Check_Security(Canon(SYM_ENVR), POL_WRITE, variable);
+
+    if (IS_WORD(variable)) {
+        REBSER *copy = Copy_Form_Value(variable, 0);
+        Init_String(variable, copy);
+    }
+
+    REBCTX *error = NULL;
+
+#ifdef TO_WINDOWS
+    wchar_t *key = rebSpellingOfAllocW(NULL, variable);
+
+    REBOOL success;
+
+    if (IS_BLANK(value)) {
+        success = SetEnvironmentVariable(key, NULL);
+    }
+    else {
+        assert(IS_STRING(value));
+        
+        wchar_t *val = rebSpellingOfAllocW(NULL, value);
+        success = SetEnvironmentVariable(key, val);
+        OS_FREE(val);
+    }
+
+    OS_FREE(key);
+
+    if (NOT(success)) // make better error with GetLastError + variable name
+        error = Error_User("environment variable couldn't be modified");
+#else
+
+    REBCNT key_len;
+    char *key = rebSpellingOfAlloc(&key_len, variable);
+
+    REBOOL success;
+
+    if (IS_BLANK(value)) {
+        UNUSED(key_len);
+
+    #ifdef unsetenv
+        if (unsetenv(key) == -1)
+            success = FALSE;
+    #else
+        // WARNING: KNOWN PORTABILITY ISSUE
+        //
+        // Simply saying putenv("FOO") will delete FOO from the environment,
+        // but it's not consistent...does nothing on NetBSD for instance.  But
+        // not all other systems have unsetenv...
+        //
+        // http://julipedia.meroh.net/2004/10/portability-unsetenvfoo-vs-putenvfoo.html
+        //
+        // going to hope this case doesn't hold onto the string...
+        //
+        if (putenv(key) == -1) // !!! Why mutable?
+            success = FALSE;
+    #endif
+    }
+    else {
+        assert(IS_STRING(value));
+
+    #ifdef setenv
+        UNUSED(key_len);
+
+        char *val = rebSpellingOfAlloc(NULL, value);
+
+        // we pass 1 for overwrite (make call to OS_Get_Env if you
+        // want to check if already exists)
+
+        if (setenv(key, val, 1) == -1)
+            success = FALSE;
+
+        OS_FREE(val);
+    #else
+        // WARNING: KNOWN MEMORY LEAK!
+        //
+        // putenv takes its argument as a single "key=val" string.  It is
+        // *fatally flawed*, and obsoleted by setenv and unsetenv in System V:
+        //
+        // http://stackoverflow.com/a/5876818/211160
+        //
+        // Once you have passed a string to it you never know when that string
+        // will no longer be needed.  Thus it may either not be dynamic or you
+        // must leak it, or track a local copy of the environment yourself.
+        //
+        // If you're stuck without setenv on some old platform, but really
+        // need to set an environment variable, here's a way that just leaks a
+        // string each time you call.  The code would have to keep track of
+        // each string added in some sort of a map...which is currently deemed
+        // not worth the work.
+
+        REBCNT val_len_bytes = rebSpellingOf(NULL, 0, value);
+
+        char *key_equals_val = OS_ALLOC_N(char,
+            key_len + 1 + val_len_bytes + 1
+        );
+
+        rebSpellingOf(key_equals_val, key_len, variable);
+        key_equals_val[key_len] = '=';
+        rebSpellingOf(key_equals_val + key_len + 1, val_len_bytes, value);
+
+        if (putenv(key_equals_val) == -1) // !!! why mutable?  :-/
+            success = FALSE;
+
+        /* OS_FREE(key_equals_val); */ // !!! Can't do this, crashes getenv()
+#endif
+    }
+
+    OS_FREE(key);
+
+    if (NOT(success)) // make better error if more information is known
+        error = Error_User("environment variable couldn't be modified");
+#endif
+
+    // Don't do the fail() in mid-environment work, as it will leak memory
+    // if the OS strings aren't freed up.  Done like this so that the error
+    // messages could be OS-specific.
+    //
+    if (error != NULL)
+        fail (error);
 
     return R_VOID;
 }
 
+
+//
+//  list-env: native/export [
+//
+//  {Returns a map of OS environment variables (for current process).}
+//
+//      ; No arguments
+//  ]
+//
+static REBNATIVE(list_env)
+{
+#ifdef TO_WINDOWS
+    //
+    // Windows environment strings are sequential null-terminated strings,
+    // with a 0-length string signaling end ("keyA=valueA\0keyB=valueB\0\0")
+    // We count the strings to know how big an array to make, and then
+    // convert the array into a MAP!.
+    //
+    // !!! Adding to a map as we go along would probably be better.
+
+    wchar_t *env = GetEnvironmentStrings();
+
+    REBCNT num_pairs = 0;
+    const wchar_t *key_equals_val = env;
+    REBCNT len;
+    while ((len = wcslen(key_equals_val)) != 0) {
+        ++num_pairs;
+        key_equals_val += len + 1; // next
+    }
+
+    REBARR *array = Make_Array(num_pairs * 2); // we split the keys and values
+
+    key_equals_val = env;
+    while ((len = wcslen(key_equals_val)) != 0) {
+        const wchar_t *eq = wcschr(key_equals_val, '=');
+
+        Init_String(
+            Alloc_Tail_Array(array),
+            Copy_Wide_Str(key_equals_val, eq - key_equals_val)
+        );
+        Init_String(
+            Alloc_Tail_Array(array),
+            Copy_Wide_Str(eq + 1, len - (eq - key_equals_val) - 1)
+        );
+
+        key_equals_val += len + 1; // next
+    }
+
+    FreeEnvironmentStrings(env);
+
+    REBMAP *map = Mutate_Array_Into_Map(array);
+    Init_Map(D_OUT, map);
+
+    return R_OUT;
+#else
+    // Note: 'environ' is an extern of a global found in <unistd.h>, and each
+    // entry contains a `key=value` formatted string.
+    //
+    // https://stackoverflow.com/q/3473692/
+    //
+    REBCNT num_pairs = 0;
+    REBCNT n;
+    for (n = 0; environ[n] != NULL; ++n)
+        ++num_pairs;
+
+    REBARR *array = Make_Array(num_pairs * 2); // we split the keys and values
+
+    for (n = 0; environ[n] != NULL; ++n) {
+        //
+        // Note: it's safe to search for just a `=` byte, since the high bit
+        // isn't set...and even if the key contains UTF-8 characters, there
+        // won't be any occurrences of such bytes in multi-byte-characters.
+        //
+        const char *key_equals_val = environ[n];
+        const char *eq_pos = strchr(key_equals_val, '=');
+
+        REBCNT len_bytes = strlen(key_equals_val);
+        Init_String(
+            Alloc_Tail_Array(array),
+            Decode_UTF_String(
+                cb_cast(key_equals_val),
+                eq_pos - key_equals_val,
+                8
+            )
+        );
+        Init_String(
+            Alloc_Tail_Array(array),
+            Decode_UTF_String(
+                cb_cast(eq_pos + 1),
+                len_bytes - (eq_pos - key_equals_val) - 1,
+                8
+            )
+        );
+    }
+
+    REBMAP *map = Mutate_Array_Into_Map(array);
+    Init_Map(D_OUT, map);
+
+    return R_OUT;
+#endif
+}
 
 
 #if defined(TO_LINUX) || defined(TO_ANDROID) || defined(TO_POSIX) || defined(TO_OSX)

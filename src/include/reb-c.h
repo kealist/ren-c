@@ -44,13 +44,52 @@
 //
 
 
+//=////////////////////////////////////////////////////////////////////////=//
 //
-// FEATURE TESTING MACROS
+// CPLUSPLUS_11
 //
-// Feature testing macros were a Clang extension, but GCC added support for
-// them.  If compiler doesn't have them, default all features unavailable.
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// Because the goal of Ren-C is ultimately to be built with C, the C++ build
+// is just for static analysis and debug checks.  This means there's not much
+// value in trying to tailor reduced versions of the checks to old ANSI C++98
+// compilers, so the "C++ build" is an "at least C++11 build".
+//
+// Besides being a little less verbose to use, it allows override when using
+// with Microsoft Visual Studio via a command line definition.  For some
+// reason they didn't bump the version number from 1997, even by MSVC 2017!!!
+//
+#if defined(__cplusplus) && __cplusplus >= 201103L
+    #define CPLUSPLUS_11
+#endif
+
+
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// FEATURE TESTING AND ATTRIBUTE MACROS
+//
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// Feature testing macros __has_builtin() and __has_feature() were originally
+// a Clang extension, but GCC added support for them.  If compiler doesn't
+// have them, default all features unavailable.
 //
 // http://clang.llvm.org/docs/LanguageExtensions.html#feature-checking-macros
+//
+// Similarly, the __attribute__ feature is not in the C++ standard and only
+// available in some compilers.  Even compilers that have __attribute__ may
+// have different individual attributes available on a case-by-case basis.
+//
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// Note: Placing the attribute after the prototype seems to lead to
+// complaints, and technically there is a suggestion you may only define
+// attributes on prototypes--not definitions:
+//
+// http://stackoverflow.com/q/23917031/211160
+//
+// Putting the attribute *before* the prototype seems to allow it on both the
+// prototype and definition in gcc, however.
 //
 
 #ifndef __has_builtin
@@ -69,8 +108,11 @@
 #endif
 
 
+//=////////////////////////////////////////////////////////////////////////=//
 //
-// TYPE TRAITS
+// INCLUDE TYPE_TRAITS IN C++11 AND ABOVE
+//
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // One of the most powerful tools you can get from allowing a C codebase to
 // compile as C++ comes from type_traits:
@@ -84,13 +126,16 @@
 // and compilers that implement it make it a perfect tool for checking a C
 // codebase on the fly to see if it follows certain rules.
 //
-#if defined(__cplusplus) && __cplusplus >= 201103L
+#ifdef CPLUSPLUS_11
     #include <type_traits>
 #endif
 
 
+//=////////////////////////////////////////////////////////////////////////=//
 //
-// STATIC ASSERT
+// STATIC ASSERT FOR CHECKING COMPILE-TIME CONDITIONS IN C
+//
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // Some conditions can be checked at compile-time, instead of deferred to a
 // runtime assert.  This macro triggers an error message at compile time.
@@ -102,13 +147,22 @@
 // !!! This was the one being used, but review if it's the best choice:
 //
 // http://stackoverflow.com/questions/3385515/static-assert-in-c
+// or http://stackoverflow.com/a/809465/211160
 //
-#define static_assert_c(e) \
-    do {(void)sizeof(char[1 - 2*!(e)]);} while(0)
+#ifdef CPLUSPLUS_11
+    #define static_assert_c(e) \
+        static_assert((e), "compile-time static assert failure")
+#else
+    #define static_assert_c(e) \
+        do {(void)sizeof(char[1 - 2*!(e)]);} while(0)
+#endif
 
 
+//=////////////////////////////////////////////////////////////////////////=//
 //
-// CONDITIONAL C++ NAME MANGLING MACRO
+// CONDITIONAL C++ NAME MANGLING MACROS
+//
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // When linking C++ code, different functions with the same name need to be
 // discerned by the types of their parameters.  This means their name is
@@ -116,28 +170,59 @@
 // a C function.
 //
 // https://en.wikipedia.org/wiki/Name_mangling
+// http://en.cppreference.com/w/cpp/language/language_linkage
 //
-// When built as C++, Ren-C needs to inform the compiler that the functions
+// This also applies to global variables in some compilers (e.g. MSVC), and
+// must be taken into account:
+//
+// https://stackoverflow.com/a/27939238/211160
+//
+// When built as C++, Ren-C must tell the compiler that functions/variables
 // it exports to the outside world should *not* use C++ name mangling, so that
-// they can be called sensibly from C.  This conditional macro avoids needing
-// to put #ifdefs around those prototypes.
+// they can be used sensibly from C.  But the instructions to tell it that
+// are not legal in C.  This conditional macro avoids needing to put #ifdefs
+// around those prototypes.
 //
 #if defined(__cplusplus)
     #define EXTERN_C extern "C"
 #else
+    // !!! There is some controversy on whether EXTERN_C should be a no-op in
+    // a C build, or decay to the meaning of C's `extern`.  Notably, WinSock
+    // headers from Microsoft use this "decays to extern" form:
+    //
+    // https://stackoverflow.com/q/47027062/
+    //
+    // Review if this should be changed to use an EXTERN_C_BEGIN and an
+    // EXTERN_C_END style macro--which would be a no-op in the C build and
+    // require manual labeling of `extern` on any exported variables.
+    //
     #define EXTERN_C extern
 #endif
 
 
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // CASTING MACROS
+//
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // The following code and explanation is from "Casts for the Masses (in C)":
 //
 // http://blog.hostilefork.com/c-casts-for-the-masses/
 //
+// But debug builds don't inline functions--not even no-op ones whose sole
+// purpose is static analysis.  This means the cast macros add a headache when
+// stepping through the debugger, and also they consume a measurable amount
+// of runtime.  Hence we sacrifice cast checking in the debug builds...and the
+// release C++ builds on Travis are relied upon to do the proper optimizations
+// as well as report any static analysis errors.
+//
+// !!! C++14 gcc release builds seem to trigger bad behavior on cast() to
+// a CFUNC*, and non-C++14 builds are allowing cast of `const void*` to
+// non-const `char` with plain `cast()`.  Investigate as time allows, but
+// in the meantime SYM_FUNC() uses a plain C-style cast.
 
-#if !defined(__cplusplus)
+#if !defined(CPLUSPLUS_11) || !defined(NDEBUG)
     /* These macros are easier-to-spot variants of the parentheses cast.
      * The 'm_cast' is when getting [M]utablity on a const is okay (RARELY!)
      * Plain 'cast' can do everything else (except remove volatile)
@@ -205,36 +290,13 @@
     #define cast(t, v)      cast_helper<t>(v)
     #define c_cast(t, v)    c_cast_helper<t>(v)
 #endif
-#if defined(NDEBUG) || !defined(REB_DEF)
-    /* These [S]tring and [B]inary casts are for "flips" between a 'char *'
-     * and 'unsigned char *' (or 'const char *' and 'const unsigned char *').
-     * Being single-arity with no type passed in, they are succinct to use:
-     */
-    #define s_cast(b)       ((char *)(b))
-    #define cs_cast(b)      ((const char *)(b))
-    #define b_cast(s)       ((unsigned char *)(s))
-    #define cb_cast(s)      ((const unsigned char *)(s))
-    /*
-     * In C++ (or C with '-Wpointer-sign') this is powerful.  'char *' can
-     * be used with string functions like strlen().  Then 'unsigned char *'
-     * can be saved for things you shouldn't _accidentally_ pass to functions
-     * like strlen().  (One GREAT example: encoded UTF-8 byte strings.)
-     */
-#else
-    /* We want to ensure the input type is what we thought we were flipping,
-     * particularly not the already-flipped type.  Instead of type_traits, 4
-     * functions check in both C and C++ (here only during Debug builds):
-     * (Definitions are in n-strings.c w/prototypes built by make-headers.r)
-     */
-    #define s_cast(b)       s_cast_(b)
-    #define cs_cast(b)      cs_cast_(b)
-    #define b_cast(s)       b_cast_(s)
-    #define cb_cast(s)      cb_cast_(s)
-#endif
 
 
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // NOOP a.k.a. VOID GENERATOR
+//
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // Creating a void value conveniently is useful for a few reasons.  One is
 // that it can serve as a NO-OP and suppress a compiler warning you might
@@ -349,9 +411,21 @@ typedef unsigned long   REBUPT;     // unsigned counterpart of void*
 #define MAX_U32 U32_C(0xffffffff)
 #define MAX_U64 U64_C(0xffffffffffffffff)
 
+// Used for cases where we need 64 bits, even in 32 bit mode.
+// (Note: compatible with FILETIME used in Windows)
+#pragma pack(4)
+typedef struct sInt64 {
+    i32 l;
+    i32 h;
+} I64;
+#pragma pack()
 
+
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // BOOLEAN DEFINITION
+//
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // The C language defines the value 0 as false, while all non-zero things are
 // considered logically true.  Yet the language standard mandates that the
@@ -429,6 +503,39 @@ typedef unsigned long   REBUPT;     // unsigned counterpart of void*
     #define REBOOL DUMMYBOOL
     #define FALSE cast(struct Bool_Dummy*, 0x6466AE99)
     #define TRUE cast(struct Bool_Dummy*, 0x0421BD75)
+
+    #ifdef CPLUSPLUS_11
+        //
+        // In the C++ build, we can help reduce confusion by making sure that
+        // LOGICAL and NOT are only applied to integral types.  Using it on
+        // pointers to test for NULL is somewhat unclear for readability
+        // at the callsite, and one doesn't want it on floating point.
+        //
+        // Note: This winds up taking a significant percentage of the time
+        // if used in all C++ debug builds, so only enforce it when doing the
+        // full STRICT_BOOL_COMPILER_TEST
+        //
+        template <typename T>
+        inline static REBOOL LOGICAL(T x) {
+            static_assert(
+                std::is_same<T, REBOOL>::value || std::is_integral<T>::value,
+                "LOGICAL(x) can only be used on integral types"
+            );
+            return x ? TRUE : FALSE;
+        }
+        template <typename T>
+        inline static REBOOL NOT(T x) {
+            static_assert(
+                std::is_same<T, REBOOL>::value || std::is_integral<T>::value,
+                "NOT(x) can only be used on integral types"
+            );
+            return x ? FALSE : TRUE;
+        }
+    #else
+        // dummy substitutions
+        #define LOGICAL(x) cast(struct Bool_Dummy*, 0x10200304)
+        #define NOT(x) cast(struct Bool_Dummy*, 0x03041020)
+    #endif
 #else
     #if (defined(FALSE) && (!FALSE)) && (defined(TRUE) && TRUE)
 
@@ -475,110 +582,19 @@ typedef unsigned long   REBUPT;     // unsigned counterpart of void*
         //
         #error "Bad TRUE and FALSE definitions in compiler environment"
     #endif
-#endif
 
-#if defined(__cplusplus) && __cplusplus >= 201103L
-    //
-    // In the C++ build, we can help reduce confusion by making sure that
-    // LOGICAL and NOT are only applied to integral types.  Using it on
-    // pointers to test if they are NULL is somewhat unclear for readability
-    // at the callsite, and one certainly doesn't want it on floating point.
-    //
-    template <typename T>
-    inline static REBOOL LOGICAL(T x) {
-        static_assert(
-            std::is_same<T, REBOOL>::value || std::is_integral<T>::value,
-            "LOGICAL(x) can only be used on integral types"
-        );
-        return x ? TRUE : FALSE;
-    }
-    template <typename T>
-    inline static REBOOL NOT(T x) {
-        static_assert(
-            std::is_same<T, REBOOL>::value || std::is_integral<T>::value,
-            "NOT(x) can only be used on integral types"
-        );
-        return x ? FALSE : TRUE;
-    }
-#else
     #define LOGICAL(x) \
         ((x) ? TRUE : FALSE)
     #define NOT(x) \
         ((x) ? FALSE : TRUE)
 #endif
 
-typedef i8 REBOOL8; // Small for struct packing (memory optimization vs CPU)
 
-
-
-// Used for cases where we need 64 bits, even in 32 bit mode.
-// (Note: compatible with FILETIME used in Windows)
-#pragma pack(4)
-typedef struct sInt64 {
-    i32 l;
-    i32 h;
-} I64;
-#pragma pack()
-
-/***********************************************************************
-**
-**  REBOL Code Types
-**
-***********************************************************************/
-
-typedef i32             REBINT;     // 32 bit (64 bit defined below)
-typedef u32             REBCNT;     // 32 bit (counting number)
-typedef i64             REBI64;     // 64 bit integer
-typedef u64             REBU64;     // 64 bit unsigned integer
-typedef float           REBD32;     // 32 bit decimal
-typedef double          REBDEC;     // 64 bit decimal
-
-typedef unsigned char   REBYTE;     // unsigned byte data
-
-#define MIN_D64 ((double)-9.2233720368547758e18)
-#define MAX_D64 ((double) 9.2233720368547758e18)
-
-// Useful char constants:
-enum {
-    BEL =   7,
-    BS  =   8,
-    LF  =  10,
-    CR  =  13,
-    ESC =  27,
-    DEL = 127
-};
-
-// Used for MOLDing:
-#define MAX_DIGITS 17   // number of digits
-#define MAX_NUMCHR 32   // space for digits and -.e+000%
-
-/***********************************************************************
-**
-**  64 Bit Integers - Now supported in REBOL 3.0
-**
-***********************************************************************/
-
-#define MAX_INT_LEN     21
-#define MAX_HEX_LEN     16
-
-#ifdef ITOA64           // Integer to ascii conversion
-#define INT_TO_STR(n,s) _i64toa(n, s_cast(s), 10)
-#else
-#define INT_TO_STR(n,s) Form_Int_Len(s, n, MAX_INT_LEN)
-#endif
-
-#ifdef ATOI64           // Ascii to integer conversion
-#define CHR_TO_INT(s)   _atoi64(cs_cast(s))
-#else
-#define CHR_TO_INT(s)   strtoll(cs_cast(s), 0, 10)
-#endif
-
-#define LDIV            lldiv
-#define LDIV_T          lldiv_t
-
-
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // C FUNCTION TYPE (__cdecl)
+//
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // Note that you *CANNOT* cast something like a `void *` to (or from) a
 // function pointer.  Pointers to functions are not guaranteed to be the same
@@ -604,8 +620,68 @@ enum {
 #endif
 
 
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// UNREACHABLE CODE ANNOTATIONS
+//
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// Because Rebol uses `longjmp` and `exit` there are cases where a function
+// might look like not all paths return a value, when those paths actually
+// aren't supposed to return at all.  For instance:
+//
+//     int foo(int x) {
+//         if (x < 1020)
+//             return x + 304;
+//         fail ("x is too big"); // compiler may warn about no return value
+//     }
+//
+// One way of annotating to say this is okay is on the caller, with DEAD_END:
+//
+//     int foo(int x) {
+//         if (x < 1020)
+//             return x + 304;
+//         fail ("x is too big");
+//         DEAD_END; // our warning-suppression macro for applicable compilers
+//     }
+//
+// DEAD_END is just a no-op in compilers that don't have the feature of
+// suppressing the warning--which can often mean they don't have the warning
+// in the first place.
+//
+// Another macro we define is ATTRIBUTE_NO_RETURN.  This can be put on the
+// declaration site of a function like `fail()` itself, so the callsites don't
+// need to be changed.  As with DEAD_END it degrades into a no-op in compilers
+// that don't support it.
+//
+
+#if defined(__clang__) || GCC_VERSION_AT_LEAST(2, 5)
+    #define ATTRIBUTE_NO_RETURN __attribute__ ((noreturn))
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+    #define ATTRIBUTE_NO_RETURN _Noreturn
+#elif defined(_MSC_VER)
+    #define ATTRIBUTE_NO_RETURN __declspec(noreturn)
+#else
+    #define ATTRIBUTE_NO_RETURN
+#endif
+
+#if __has_builtin(__builtin_unreachable) || GCC_VERSION_AT_LEAST(4, 5)
+    #define DEAD_END __builtin_unreachable()
+#elif defined(_MSC_VER)
+    __declspec(noreturn) static inline void msvc_unreachable(void) {
+        while (TRUE) { }
+    }
+    #define DEAD_END msvc_unreachable()
+#else
+    #define DEAD_END
+#endif
+
+
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // TESTING IF A NUMBER IS FINITE
+//
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // C89 and C++98 had no standard way of testing for if a number was finite or
 // not.  Windows and POSIX came up with their own methods.  Finally it was
@@ -621,7 +697,7 @@ enum {
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
     // C99 or later
     #define FINITE isfinite
-#elif defined(__cplusplus) && __cplusplus >= 199711L
+#elif defined(CPLUSPLUS_11)
     // C++11 or later
     #define FINITE isfinite
 #else
@@ -634,43 +710,11 @@ enum {
 #endif
 
 
-//
-// UNICODE CHARACTER TYPE
-//
-// REBUNI is a two-byte UCS-2 representation of a Unicode codepoint.  Some
-// routines once errantly conflated wchar_t with REBUNI, but a wchar_t is not
-// 2 bytes on all platforms (it's 4 on GCC in 64-bit Linux, for instance).
-// Routines for handling UCS-2 must be custom-coded or come from a library.
-// (For example: you can't use wcslen() so Strlen_Uni() is implemented inside
-// of Rebol.)
-//
-// Rebol is able to have its strings start out as UCS-1, with a single byte
-// per character.  For that it uses REBYTEs.  But when you insert something
-// requiring a higher codepoint, it goes to UCS-2 with REBUNI and will not go
-// back (at time of writing).
-//
-// !!! BEWARE that several lower level routines don't do this widening, so be
-// sure that you check which are which.
-//
-// Longer term, the growth of emoji usage in Internet communication has led
-// to supporting higher "astral" codepoints as being a priority.  This means
-// either being able to "double-widen" to UCS-4, as is Red's strategy:
-//
-// http://www.red-lang.org/2012/09/plan-for-unicode-support.html
-//
-// Or it could also mean shifting to "UTF-8 everywhere":
-//
-// http://utf8everywhere.org
-//
-
-typedef u16 REBUNI;
-
-#define MAX_UNI \
-    ((1 << (8 * sizeof(REBUNI))) - 1)
-
-
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // MEMORY POISONING and POINTER TRASHING
+//
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // If one wishes to indicate a region of memory as being "off-limits", modern
 // tools like Address Sanitizer allow instrumented builds to augment reads
@@ -723,7 +767,7 @@ typedef u16 REBUNI;
     #define TRASH_CFUNC_IF_DEBUG(p) \
         NOOP
 #else
-    #if defined(__cplusplus)
+    #if defined(__cplusplus) // needed even if not C++11
         template<class T>
         inline static void TRASH_POINTER_IF_DEBUG(T* &p) {
             p = reinterpret_cast<T*>(static_cast<REBUPT>(0xDECAFBAD));
@@ -763,8 +807,11 @@ typedef u16 REBUNI;
 #endif
 
 
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // MARK UNUSED VARIABLES
+//
+//=////////////////////////////////////////////////////////////////////////=//
 //
 // Used in coordination with the `-Wunused-variable` setting of the compiler.
 // While a simple cast to void is what people usually use for this purpose,
@@ -781,7 +828,7 @@ typedef u16 REBUNI;
 // Though the version here is more verbose, it uses the specializations to
 // avoid excessive calls to memset() in the debug build.
 //
-#if defined(NDEBUG) || !defined(__cplusplus) || __cplusplus < 201103L
+#if defined(NDEBUG) || !defined(CPLUSPLUS_11)
     #define UNUSED(x) \
         ((void)(x))
 #else
@@ -870,86 +917,6 @@ typedef u16 REBUNI;
 #endif
 
 
-/***********************************************************************
-**
-**  ATTRIBUTES
-**
-**      The __attribute__ feature is non-standard and only available
-**      in some compilers.  Individual attributes themselves are
-**      also available on a case-by-case basis.
-**
-**      Note: Placing the attribute after the prototype seems to lead
-**      to complaints, and technically there is a suggestion you may
-**      only define attributes on prototypes--not definitions:
-**
-**          http://stackoverflow.com/q/23917031/211160
-**
-**      Putting the attribute *before* the prototype seems to allow
-**      it on both the prototype and definition in gcc, however.
-**
-***********************************************************************/
-
-#if defined(__clang__) || GCC_VERSION_AT_LEAST(2, 5)
-    #define ATTRIBUTE_NO_RETURN __attribute__ ((noreturn))
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-    #define ATTRIBUTE_NO_RETURN _Noreturn
-#elif defined(_MSC_VER)
-    #define ATTRIBUTE_NO_RETURN __declspec(noreturn)
-#else
-    #define ATTRIBUTE_NO_RETURN
-#endif
-
-#if __has_builtin(__builtin_unreachable) || GCC_VERSION_AT_LEAST(4, 5)
-    #define DEAD_END __builtin_unreachable()
-#elif defined(_MSC_VER)
-    __declspec(noreturn) static inline void msvc_unreachable() {
-        while (TRUE) { }
-    }
-    #define DEAD_END msvc_unreachable()
-#else
-    #define DEAD_END
-#endif
-
-
-
-//=////////////////////////////////////////////////////////////////////////=//
-//
-// BIT FLAGS & MASKING
-//
-//=////////////////////////////////////////////////////////////////////////=//
-//
-// When flags are needed, the platform-natural unsigned integer is used
-// (REBUPT, a `uintptr_t` equivalent).
-//
-// The 64-bit macro is used to get a 64-bit flag even on 32-bit platforms.
-// Hence it should be stored in a REBU64 and not in a REBFLGS.
-//
-
-typedef REBUPT REBFLGS;
-
-#define FLAGIT(f) \
-    ((REBUPT)1 << (f))
-
- // !!! These are leftovers from old code which used integers instead of
-// masks to indicate flags.  Using masks then it's easy enough to read using
-// C's plain bit masking operators.
-//
-#define GET_FLAG(v,f) \
-    LOGICAL((v) & (cast(REBUPT, 1) << (f)))
-
-#define GET_FLAGS(v,f,g) \
-    LOGICAL((v) & ((cast(REBUPT, 1) << (f)) | (cast(REBUPT, 1) << (g))))
-
-#define SET_FLAG(v,f) \
-    cast(void, (v) |= (cast(REBUPT, 1) << (f)))
-
-#define CLR_FLAG(v,f) \
-    cast(void, (v) &= ~(cast(REBUPT, 1) << (f)))
-
-#define CLR_FLAGS(v,f,g) \
-    cast(void, (v) &= ~((cast(REBUPT, 1) << (f)) | (cast(REBUPT, 1) << (g))))
-
-
 //=////////////////////////////////////////////////////////////////////////=//
 //
 // BYTE-ORDER SENSITIVE BIT FLAGS & MASKING
@@ -957,9 +924,10 @@ typedef REBUPT REBFLGS;
 //=////////////////////////////////////////////////////////////////////////=//
 //
 // These macros are for purposefully arranging bit flags with respect to the
-// "leftmost" and "rightmost" bytes of the underlying platform:
+// "leftmost" and "rightmost" bytes of the underlying platform, when encoding
+// them into an unsigned integer the size of a platform pointer:
 //
-//     REBFLGS flags = FLAGIT_LEFT(0);
+//     uintptr_t flags = FLAGIT_LEFT(0);
 //     unsigned char *ch = (unsigned char*)&flags;
 //
 // In the code above, the leftmost bit of the flags has been set to 1,
@@ -969,10 +937,10 @@ typedef REBUPT REBFLGS;
 // from the left.  These form single optimized constants, which can be
 // assigned to an integer.  They can be masked or shifted out efficiently:
 //
-//    REBFLGS flags = FLAGIT_LEFT(0) | FLAGIT_LEFT(1) | FLAGBYTE_RIGHT(13);
+//    uintptr_t flags = FLAGIT_LEFT(0) | FLAGIT_LEFT(1) | FLAGBYTE_RIGHT(13);
 //
-//    REBCNT left = LEFT_N_BITS(flags, 3); // == 6 (binary `110`)
-//    REBCNT right = RIGHT_N_BITS(flags, 3); // == 5 (binary `101`)
+//    unsigned int left = LEFT_N_BITS(flags, 3); // == 6 (binary `110`)
+//    unsigned int right = RIGHT_N_BITS(flags, 3); // == 5 (binary `101`)
 //
 // `left` gets `110` because it asked for the left 3 bits, of which only
 // the first and the second had been set.
@@ -1062,85 +1030,89 @@ typedef REBUPT REBFLGS;
 //
 
 #define LEFT_8_BITS(flags) \
-    (((const REBYTE*)&flags)[0]) // reminds that 8 is faster
+    (((const u8*)&flags)[0]) // reminds that 8 is faster
 
 #define LEFT_N_BITS(flags,n) \
-    (((const REBYTE*)&flags)[0] >> (8 - (n))) // n <= 8
+    (((const u8*)&flags)[0] >> (8 - (n))) // n <= 8
 
 #define RIGHT_N_BITS(flags,n) \
-    (((const REBYTE*)&flags)[sizeof(REBUPT) - 1] & ((1 << (n)) - 1)) // n <= 8
+    (((const u8*)&flags)[sizeof(REBUPT) - 1] & ((1 << (n)) - 1)) // n <= 8
 
 #define RIGHT_8_BITS(flags) \
-    (((const REBYTE*)&flags)[sizeof(REBUPT) - 1]) // reminds that 8 is faster
+    (((const u8*)&flags)[sizeof(REBUPT) - 1]) // reminds that 8 is faster
 
 #define CLEAR_N_RIGHT_BITS(flags,n) \
-    (((REBYTE*)&flags)[sizeof(REBUPT) - 1] &= ~((1 << (n)) - 1)) // n <= 8
+    (((u8*)&flags)[sizeof(REBUPT) - 1] &= ~((1 << (n)) - 1)) // n <= 8
 
 #define CLEAR_8_RIGHT_BITS(flags) \
-    (((REBYTE*)&flags)[sizeof(REBUPT) - 1] = 0) // reminds that 8 is faster
+    (((u8*)&flags)[sizeof(REBUPT) - 1] = 0) // reminds that 8 is faster
 
 #define MID_N_BITS(flags,n) \
-    (((const REBYTE*)&flags)[sizeof(REBUPT) - 2] & ((1 << (n)) - 1)) // n <= 8
+    (((const u8*)&flags)[sizeof(REBUPT) - 2] & ((1 << (n)) - 1)) // n <= 8
 
 #define MID_8_BITS(flags) \
-    (((const REBYTE*)&flags)[sizeof(REBUPT) - 2]) // reminds that 8 is faster
+    (((const u8*)&flags)[sizeof(REBUPT) - 2]) // reminds that 8 is faster
 
 #define CLEAR_N_MID_BITS(flags,n) \
-    (((REBYTE*)&flags)[sizeof(REBUPT) - 2] &= ~((1 << (n)) - 1)) // n <= 8
+    (((u8*)&flags)[sizeof(REBUPT) - 2] &= ~((1 << (n)) - 1)) // n <= 8
 
 #define CLEAR_8_MID_BITS(flags) \
-    (((REBYTE*)&flags)[sizeof(REBUPT) - 2] = 0) // reminds that 8 is faster
+    (((u8*)&flags)[sizeof(REBUPT) - 2] = 0) // reminds that 8 is faster
 
 #define CLEAR_16_RIGHT_BITS(flags) \
-    (((REBYTE*)&flags)[sizeof(REBUPT) - 1] = \
-        ((REBYTE*)&flags)[sizeof(REBUPT) - 2] = 0)
+    (((u8*)&flags)[sizeof(REBUPT) - 1] = \
+        ((u8*)&flags)[sizeof(REBUPT) - 2] = 0)
 
 
-
-/***********************************************************************
-**
-**  Useful Macros
-**
-***********************************************************************/
-
-// Skip to the specified byte but not past the provided end
-// pointer of the byte string.  Return NULL if byte is not found.
+//=////////////////////////////////////////////////////////////////////////=//
 //
-inline static const REBYTE *Skip_To_Byte(
-    const REBYTE *cp,
-    const REBYTE *ep,
-    REBYTE b
-) {
-    while (cp != ep && *cp != b) cp++;
-    if (*cp == b) return cp;
-    return 0;
-}
-
-
+// MIN AND MAX
+//
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// The standard definition in C for MIN and MAX uses preprocessor macros, and
+// this has fairly notorious problems of double-evaluating anything with
+// side-effects:
+//
+// https://stackoverflow.com/a/3437484/211160
+//
 // It is common for MIN and MAX to be defined in C to macros; and equally
 // common to assume that undefining them and redefining them to something
-// that acts like one would expect is "probably ok".  :-/
+// that acts as it does in most codebases is "probably ok".  :-/
 //
 #undef MIN
 #undef MAX
-#ifdef min
-    #define MIN(a,b) min(a,b)
-    #define MAX(a,b) max(a,b)
-#else
-    #define MIN(a,b) (((a) < (b)) ? (a) : (b))
-    #define MAX(a,b) (((a) > (b)) ? (a) : (b))
-#endif
+#define MIN(a,b) (((a) < (b)) ? (a) : (b))
+#define MAX(a,b) (((a) > (b)) ? (a) : (b))
 
 
-// Byte string functions:
-// Use these when you semantically are talking about unsigned REBYTEs
+//=////////////////////////////////////////////////////////////////////////=//
 //
-// (e.g. if you want to count unencoded chars in 'char *' use strlen(), and
-// the reader will know that is a count of letters.  If you have something
-// like UTF-8 with more than one byte per character, use LEN_BYTES.)
+// BYTE STRINGS VS UNENCODED CHARACTER STRINGS
+//
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// Use these when you semantically are talking about unsigned characters as
+// bytes.  For instance: if you want to count unencoded chars in 'char *' us
+// strlen(), and the reader will know that is a count of letters.  If you have
+// something like UTF-8 with more than one byte per character, use LEN_BYTES.
+// The casting macros are derived from "Casts for the Masses (in C)":
+//
+// http://blog.hostilefork.com/c-casts-for-the-masses/
 //
 // For APPEND_BYTES_LIMIT, m is the max-size allocated for d (dest)
-#if defined(NDEBUG) || !defined(REB_DEF)
+//
+#include <string.h> // for strlen() etc, but also defines `size_t`
+#if defined(NDEBUG)
+    /* These [S]tring and [B]inary casts are for "flips" between a 'char *'
+     * and 'unsigned char *' (or 'const char *' and 'const unsigned char *').
+     * Being single-arity with no type passed in, they are succinct to use:
+     */
+    #define s_cast(b)       ((char *)(b))
+    #define cs_cast(b)      ((const char *)(b))
+    #define b_cast(s)       ((unsigned char *)(s))
+    #define cb_cast(s)      ((const unsigned char *)(s))
+
     #define LEN_BYTES(s) \
         strlen((const char*)(s))
     #define COPY_BYTES(d,s,n) \
@@ -1150,19 +1122,34 @@ inline static const REBYTE *Skip_To_Byte(
     #define APPEND_BYTES_LIMIT(d,s,m) \
         strncat((char*)d, (const char*)s, MAX((m) - strlen((char*)d) - 1, 0))
 #else
-    // Debug build uses function stubs to ensure you pass in REBYTE *
-    // (But only if building in Rebol Core, host doesn't get the exports)
-    #define LEN_BYTES(s) \
-        LEN_BYTES_(s)
-    #define COPY_BYTES(d,s,n) \
-        COPY_BYTES_((d), (s), (n))
-    #define COMPARE_BYTES(l,r) \
-        COMPARE_BYTES_((l), (r))
-    #define APPEND_BYTES_LIMIT(d,s,m) \
-        APPEND_BYTES_LIMIT_((d), (s), (m))
+    /* We want to ensure the input type is what we thought we were flipping,
+     * particularly not the already-flipped type.  Instead of type_traits, 4
+     * functions check in both C and C++ (here only during Debug builds):
+     */
+    inline static u8 *b_cast(char *s) { return (u8*)s; }
+    inline static const u8 *cb_cast(const char *s) { return (const u8*)s; }
+    inline static char *s_cast(u8 *s) { return (char*)s; }
+    inline static const char *cs_cast(const u8 *s) { return (const char*)s; }
+
+    // Debug build uses inline function stubs to ensure you pass in u8 *
+    //
+    inline static u8 *COPY_BYTES(u8 *dest, const u8 *src, size_t count)
+        { return b_cast(strncpy(s_cast(dest), cs_cast(src), count)); }
+
+    inline static size_t LEN_BYTES(const u8 *str)
+        { return strlen(cs_cast(str)); }
+
+    inline static int COMPARE_BYTES(const u8 *lhs, const u8 *rhs)
+        { return strcmp(cs_cast(lhs), cs_cast(rhs)); }
+
+    inline static u8 *APPEND_BYTES_LIMIT(u8 *dest, const u8 *src, size_t max)
+    {
+        return b_cast(strncat(
+            s_cast(dest), cs_cast(src), MAX(max - LEN_BYTES(dest) - 1, 0)
+        ));
+    }
 #endif
 
-#define ROUND_TO_INT(d) (REBINT)(floor((MAX(MIN_I32, MIN(MAX_I32, d))) + 0.5))
 
 // Global pixel format setup for REBOL image!, image loaders, color handling,
 // tuple! conversions etc.  The graphics compositor code should rely on this
@@ -1179,10 +1166,10 @@ inline static const REBYTE *Skip_To_Byte(
 
 #ifdef ENDIAN_BIG // ARGB pixel format on big endian systems
     #define TO_RGBA_COLOR(r,g,b,a) \
-        (cast(REBCNT, (r)) << 24 \
-        | cast(REBCNT, (g)) << 16 \
-        | cast(REBCNT, (b)) << 8 \
-        | cast(REBCNT, (a)))
+        (cast(u32, (r)) << 24 \
+        | cast(u32, (g)) << 16 \
+        | cast(u32, (b)) << 8 \
+        | cast(u32, (a)))
 
     #define C_A 0
     #define C_R 1
@@ -1190,16 +1177,16 @@ inline static const REBYTE *Skip_To_Byte(
     #define C_B 3
 
     #define TO_PIXEL_COLOR(r,g,b,a) \
-        (cast(REBCNT, (a)) << 24 \
-        | cast(REBCNT, (r)) << 16 \
-        | cast(REBCNT, (g)) << 8 \
-        | cast(REBCNT, (b)))
+        (cast(u32, (a)) << 24 \
+        | cast(u32, (r)) << 16 \
+        | cast(u32, (g)) << 8 \
+        | cast(u32, (b)))
 #else
     #define TO_RGBA_COLOR(r,g,b,a) \
-        (cast(REBCNT, (a)) << 24 \
-        | cast(REBCNT, (b)) << 16 \
-        | cast(REBCNT, (g)) << 8 \
-        | cast(REBCNT, (r)))
+        (cast(u32, (a)) << 24 \
+        | cast(u32, (b)) << 16 \
+        | cast(u32, (g)) << 8 \
+        | cast(u32, (r)))
 
     #ifdef TO_ANDROID_ARM // RGBA pixel format on Android
         #define C_R 0
@@ -1208,10 +1195,10 @@ inline static const REBYTE *Skip_To_Byte(
         #define C_A 3
 
         #define TO_PIXEL_COLOR(r,g,b,a) \
-            (cast(REBCNT, (a)) << 24 \
-            | cast(REBCNT, (b)) << 16 \
-            | cast(REBCNT, (g)) << 8 \
-            | cast(REBCNT, (r)))
+            (cast(u32, (a)) << 24 \
+            | cast(u32, (b)) << 16 \
+            | cast(u32, (g)) << 8 \
+            | cast(u32, (r)))
 
     #else // BGRA pixel format on Windows
         #define C_B 0
@@ -1220,9 +1207,9 @@ inline static const REBYTE *Skip_To_Byte(
         #define C_A 3
 
         #define TO_PIXEL_COLOR(r,g,b,a) \
-            (cast(REBCNT, (a)) << 24 \
-            | cast(REBCNT, (r)) << 16 \
-            | cast(REBCNT, (g)) << 8 \
-            | cast(REBCNT, (b)))
+            (cast(u32, (a)) << 24 \
+            | cast(u32, (r)) << 16 \
+            | cast(u32, (g)) << 8 \
+            | cast(u32, (b)))
     #endif
 #endif

@@ -289,7 +289,7 @@ inline static void DROP_TRAP_SAME_STACKLEVEL_AS_PUSH(struct Reb_State *s) {
     #define fail(error) \
         Fail_Core(error)
 #else
-    #if defined(__cplusplus) && __cplusplus >= 201103L
+    #ifdef CPLUSPLUS_11
         //
         // We can do a bit more checking in the C++ build, for instance to
         // make sure you don't pass a RELVAL* into fail().  This could also
@@ -310,15 +310,11 @@ inline static void DROP_TRAP_SAME_STACKLEVEL_AS_PUSH(struct Reb_State *s) {
 
         #define fail(error) \
             do { \
-                TG_Erroring_C_File = __FILE__; \
-                TG_Erroring_C_Line = __LINE__; \
                 Fail_Core_Cpp(error); \
             } while (0)
     #else
         #define fail(error) \
             do { \
-                TG_Erroring_C_File = __FILE__; \
-                TG_Erroring_C_Line = __LINE__; \
                 Fail_Core(error); \
             } while (0)
     #endif
@@ -368,8 +364,18 @@ inline static void DROP_TRAP_SAME_STACKLEVEL_AS_PUSH(struct Reb_State *s) {
 // NOTE: It's desired that there be a space in `panic (...)` to make it look
 // more "keyword-like" and draw attention to the fact it is a `noreturn` call.
 //
-#define panic(v) \
-    Panic_Core((v), __FILE__, __LINE__);
+#ifdef NDEBUG
+    #define panic(v) \
+        Panic_Core((v), 0, NULL, 0)
 
-#define panic_at(v,file,line) \
-    Panic_Core((v), (file), (line));
+    #define panic_at(v,file,line) \
+        (void)file; \
+        (void)line; \
+        panic(v)
+#else
+    #define panic(v) \
+        Panic_Core((v), TG_Tick, __FILE__, __LINE__)
+
+    #define panic_at(v,file,line) \
+        Panic_Core((v), TG_Tick, (file), (line))
+#endif

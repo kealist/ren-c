@@ -120,12 +120,12 @@ static void Add_Event_XY(REBGOB *gob, REBINT id, REBINT xy, REBINT flags)
 
     memset(&evt, 0, sizeof(evt));
     evt.type  = id;
-    evt.flags = (u8) (flags | (1<<EVF_HAS_XY));
+    evt.flags = cast(u8, flags | EVF_HAS_XY);
     evt.model = EVM_GUI;
     evt.data  = xy;
     evt.eventee.ser = gob;
 
-    RL_Event(&evt); // returns 0 if queue is full
+    rebEvent(&evt); // returns 0 if queue is full
 }
 
 static void Update_Event_XY(REBGOB *gob, REBINT id, REBINT xy, REBINT flags)
@@ -134,12 +134,12 @@ static void Update_Event_XY(REBGOB *gob, REBINT id, REBINT xy, REBINT flags)
 
     memset(&evt, 0, sizeof(evt));
     evt.type  = id;
-    evt.flags = (u8) (flags | (1<<EVF_HAS_XY));
+    evt.flags = cast(u8, flags | EVF_HAS_XY);
     evt.model = EVM_GUI;
     evt.data  = xy;
     evt.eventee.ser = gob;
 
-    RL_Update_Event(&evt);
+    rebUpdateEvent(&evt);
 }
 
 static void Add_Event_Key(REBGOB *gob, REBINT id, REBINT key, REBINT flags)
@@ -153,13 +153,15 @@ static void Add_Event_Key(REBGOB *gob, REBINT id, REBINT key, REBINT flags)
     evt.data  = key;
     evt.eventee.ser = gob;
 
-    RL_Event(&evt); // returns 0 if queue is full
+    rebEvent(&evt); // returns 0 if queue is full
 }
 
 static REBINT Check_Modifiers(REBINT flags, unsigned state)
 {
-    if (state & ShiftMask) flags |= (1<<EVF_SHIFT);
-    if (state & ControlMask) flags |= (1<<EVF_CONTROL);
+    if (state & ShiftMask)
+        flags |= EVF_SHIFT;
+    if (state & ControlMask)
+        flags |= EVF_CONTROL;
     return flags;
 }
 
@@ -657,8 +659,7 @@ static void handle_key(XEvent *ev, REBGOB *gob)
             key = key_string[0]; /* FIXME, key_string could be longer than 1 */
         }
         /* map control characters */
-        if (flags & (1 << EVF_CONTROL)
-            && !(flags & (1 << EVF_SHIFT))) {
+        if (LOGICAL(flags & EVF_CONTROL) && NOT(flags & EVF_SHIFT)) {
             if (key >= 'A' && key <= '_') {
                 key = key - 'A' + 1;
             } else if (key >= 'a' && key <= 'z') {

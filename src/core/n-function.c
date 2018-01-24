@@ -109,11 +109,14 @@ void Make_Thrown_Exit_Value(
     REBVAL *out,
     const REBVAL *level, // FRAME!, FUNCTION! (or INTEGER! relative to frame)
     const REBVAL *value,
-    REBFRM *frame // only required if level is INTEGER!
+    REBFRM *frame // required if level is INTEGER! or FUNCTION!
 ) {
     Move_Value(out, NAT_VALUE(exit));
 
-    if (IS_INTEGER(level)) {
+    if (IS_FRAME(level)) {
+        INIT_BINDING(out, VAL_CONTEXT(level));
+    }
+    else if (IS_INTEGER(level)) {
         REBCNT count = VAL_INT32(level);
         if (count <= 0)
             fail (Error_Invalid_Exit_Raw());
@@ -123,36 +126,38 @@ void Make_Thrown_Exit_Value(
             if (f == NULL)
                 fail (Error_Invalid_Exit_Raw());
 
-            if (NOT(Is_Any_Function_Frame(f))) continue; // only exit functions
+            if (NOT(Is_Function_Frame(f)))
+                continue; // only exit functions
 
-            if (Is_Function_Frame_Fulfilling(f)) continue; // not ready to exit
-
-        #if !defined(NDEBUG)
-            if (LEGACY(OPTIONS_DONT_EXIT_NATIVES))
-                if (NOT(IS_FUNCTION_INTERPRETED(FUNC_VALUE(f->phase))))
-                    continue; // R3-Alpha would exit the first user function
-        #endif
+            if (Is_Function_Frame_Fulfilling(f))
+                continue; // not ready to exit
 
             --count;
-
             if (count == 0) {
-                //
-                // We want the integer-based exits to identify frames uniquely.
-                // Without a context varlist, a frame can't be unique.
-                //
-                Context_For_Frame_May_Reify_Managed(f);
-                assert(f->varlist);
-                out->extra.binding = f->varlist;
+                INIT_BINDING(out, f);
                 break;
             }
         }
     }
-    else if (IS_FRAME(level)) {
-        out->extra.binding = CTX_VARLIST(VAL_CONTEXT(level));
-    }
     else {
         assert(IS_FUNCTION(level));
-        out->extra.binding = VAL_FUNC_PARAMLIST(level);
+
+        REBFRM *f = frame->prior;
+        for (; TRUE; f = f->prior) {
+            if (f == NULL)
+                fail (Error_Invalid_Exit_Raw());
+
+            if (NOT(Is_Function_Frame(f)))
+                continue; // only exit functions
+
+            if (Is_Function_Frame_Fulfilling(f))
+                continue; // not ready to exit
+
+            if (VAL_FUNC(level) == f->original) {
+                INIT_BINDING(out, f);
+                break;
+            }
+        }
     }
 
     CONVERT_NAME_TO_THROWN(out, value);
@@ -208,37 +213,70 @@ REBNATIVE(return)
 {
     INCLUDE_PARAMS_OF_RETURN;
 
-    REBVAL *value = ARG(value);
     REBFRM *f = frame_; // implicit parameter to REBNATIVE()
 
-    if (f->binding == NULL) // raw native, not a variant FUNCTION made
-        fail (Error_Return_Archetype_Raw());
-
     // The frame this RETURN is being called from may well not be the target
-    // function of the return (that's why it's a "definitional return").  So
-    // examine the binding.  Currently it can be either a FRAME!'s varlist or
-    // a FUNCTION! paramlist.
+    // function of the return (that's why it's a "definitional return").  The
+    // binding field of the frame contains a copy of whatever the binding was
+    // in the specific FUNCTION! value that was invoked.
+    //
+    REBFRM *target_frame;
+    if (f->binding->header.bits & NODE_FLAG_CELL) {
+        target_frame = cast(REBFRM*, f->binding);
+    }
+    else if (f->binding->header.bits & ARRAY_FLAG_VARLIST) {
+        target_frame = CTX_FRAME_IF_ON_STACK(CTX(f->binding));
+        if (target_frame == NULL)
+            fail (Error_Frame_Not_On_Stack_Raw());
+    }
+    else {
+        assert(f->binding == UNBOUND);
+        fail (Error_Return_Archetype_Raw());
+    }
 
-    REBFUN *target =
-        IS_FUNCTION(ARR_HEAD(f->binding))
-        ? AS_FUNC(f->binding)
-        : AS_FUNC(CTX_KEYLIST(CTX(f->binding)));
+    // !!! We only have a REBFRM via the binding.  We don't have distinct
+    // knowledge about exactly which "phase" the original RETURN was
+    // connected to.  As a practical matter, it can only return from the
+    // current phase (what other option would it have, any other phase is
+    // either not running yet or has already finished!).  But this means the
+    // `target_frame->phase` may be somewhat incidental to which phase the
+    // RETURN originated from...and if phases were allowed different return
+    // typesets, then that means the typechecking could be somewhat random.
+    //
+    // Without creating a unique tracking entity for which phase was
+    // intended for the return, it's not known which phase the return is
+    // for.  So the return type checking is done on the basis of the
+    // underlying function.  So compositions that share frames cannot expand
+    // the return type set.  The unfortunate upshot of this is--for instance--
+    // that an ENCLOSE'd function can't return any types the original function
+    // could not.  :-(
+    //
+    REBFUN *target_fun = FRM_UNDERLYING(target_frame);
 
-    REBVAL *typeset = FUNC_PARAM(target, FUNC_NUM_PARAMS(target));
+    // If it's a definitional return, the associated function's frame must
+    // have a SYM_RETURN in it, which is also a local.  The trick used is
+    // that the type bits in that local are used to store the legal types
+    // for the return value.
+    //
+    REBVAL *typeset = FUNC_PARAM(target_fun, FUNC_NUM_PARAMS(target_fun));
     assert(VAL_PARAM_SYM(typeset) == SYM_RETURN);
 
-    // Check to make sure the types match.  If it were not done here, then
-    // the error would not point out the bad call...just the function that
-    // wound up catching it.
+    // Check the type *NOW* instead of waiting and letting Do_Core() check it.
+    // The reasoning is that this way, the error will indicate the callsite,
+    // e.g. the point where `return badly-typed-value` happened.
     //
+    // !!! In the userspace formulation of this abstraction, it indicates that
+    // it's not RETURN's type signature that is constrained, as if it were
+    // then RETURN would be implicated in the error.  Instead, RETURN must
+    // take [<opt> any-value!] as its argument, and then do the error report
+    // itself...implicating the frame (in a way parallel to this native).
+    //
+    REBVAL *value = ARG(value);
     if (!TYPE_CHECK(typeset, VAL_TYPE(value)))
-        fail (Error_Bad_Return_Type(
-            f->label, // !!! Should climb stack to get real label?
-            VAL_TYPE(value)
-        ));
+        fail (Error_Bad_Return_Type(target_frame, VAL_TYPE(value)));
 
     Move_Value(D_OUT, NAT_VALUE(exit)); // see also Make_Thrown_Exit_Value
-    D_OUT->extra.binding = f->binding;
+    INIT_BINDING(D_OUT, f->binding);
 
     CONVERT_NAME_TO_THROWN(D_OUT, value);
     return R_OUT_IS_THROWN;
@@ -256,11 +294,11 @@ REBNATIVE(leave)
 //
 // See notes on REBNATIVE(return)
 {
-    if (frame_->binding == NULL) // raw native, not a variant PROCEDURE made
+    if (frame_->binding == UNBOUND) // raw native, not variant PROCEDURE made
         fail (Error_Return_Archetype_Raw());
 
     Move_Value(D_OUT, NAT_VALUE(exit)); // see also Make_Thrown_Exit_Value
-    D_OUT->extra.binding = frame_->binding;
+    INIT_BINDING(D_OUT, frame_->binding);
 
     CONVERT_NAME_TO_THROWN(D_OUT, VOID_CELL);
     return R_OUT_IS_THROWN;
@@ -287,7 +325,7 @@ REBNATIVE(typechecker)
     REBVAL *archetype = Alloc_Tail_Array(paramlist);
     VAL_RESET_HEADER(archetype, REB_FUNCTION);
     archetype->payload.function.paramlist = paramlist;
-    archetype->extra.binding = NULL;
+    INIT_BINDING(archetype, UNBOUND);
 
     REBVAL *param = Alloc_Tail_Array(paramlist);
     Init_Typeset(param, ALL_64, Canon(SYM_VALUE));
@@ -295,20 +333,22 @@ REBNATIVE(typechecker)
 
     MANAGE_ARRAY(paramlist);
 
-    // for now, no help...use REDESCRIBE
+    LINK(paramlist).facade = paramlist;
 
-    SER(paramlist)->link.meta = NULL;
+    // for now, no help...use REDESCRIBE
+    //
+    MISC(paramlist).meta = NULL;
 
     REBFUN *fun = Make_Function(
         paramlist,
         IS_DATATYPE(type)
             ? &Datatype_Checker_Dispatcher
             : &Typeset_Checker_Dispatcher,
-        NULL, // this is fundamental (no distinct underlying function)
-        NULL // not providing a specialization
+        NULL, // no facade (use paramlist)
+        NULL // no specialization exemplar (or inherited exemplar)
     );
 
-    *FUNC_BODY(fun) = *type;
+    Move_Value(FUNC_BODY(fun), type);
 
     Move_Value(D_OUT, FUNC_VALUE(fun));
 
@@ -322,7 +362,7 @@ REBNATIVE(typechecker)
 //  {Create a new function through partial or full specialization of another}
 //
 //      return: [function!]
-//      value [function! any-word! any-path!]
+//      specializee [function! any-word! any-path!]
 //          {Function or specifying word (preserves word name for debug info)}
 //      def [block!]
 //          {Definition for FRAME! fields for args and refinements}
@@ -332,17 +372,13 @@ REBNATIVE(specialize)
 {
     INCLUDE_PARAMS_OF_SPECIALIZE;
 
+    REBVAL *specializee = ARG(specializee);
+
     REBSTR *opt_name;
-
-    // We don't limit to taking a FUNCTION! value directly, because that loses
-    // the symbol (for debugging, errors, etc.)  If caller passes a WORD!
-    // then we lookup the variable to get the function, but save the symbol.
-    //
-    DECLARE_LOCAL (specializee);
-    Get_If_Word_Or_Path_Arg(specializee, &opt_name, ARG(value));
-
-    if (!IS_FUNCTION(specializee))
-        fail (Error_Apply_Non_Function_Raw(ARG(value))); // for APPLY too
+    Get_If_Word_Or_Path_Arg(D_OUT, &opt_name, specializee);
+    if (!IS_FUNCTION(D_OUT))
+        fail (specializee);
+    Move_Value(specializee, D_OUT);
 
     if (Specialize_Function_Throws(D_OUT, specializee, opt_name, ARG(def)))
         return R_OUT_IS_THROWN;
@@ -407,28 +443,29 @@ REBNATIVE(chain)
     SET_SER_FLAG(paramlist, ARRAY_FLAG_PARAMLIST);
     MANAGE_ARRAY(paramlist);
 
+    // Initialize the "meta" information, which is used by HELP.  Because it
+    // has a link to the "chainees", it is not necessary to copy parameter
+    // descriptions...HELP can follow the link and find the information.
+    //
     // See %sysobj.r for `chained-meta:` object template
-
-    REBVAL *std_meta = Get_System(SYS_STANDARD, STD_CHAINED_META);
-    REBCTX *meta = Copy_Context_Shallow(VAL_CONTEXT(std_meta));
-
-    Init_Void(CTX_VAR(meta, STD_CHAINED_META_DESCRIPTION)); // default
-    Init_Block(CTX_VAR(meta, STD_CHAINED_META_CHAINEES), chainees);
     //
     // !!! There could be a system for preserving names in the chain, by
     // accepting lit-words instead of functions--or even by reading the
     // GET-WORD!s in the block.  Consider for the future.
     //
+    REBVAL *std_meta = Get_System(SYS_STANDARD, STD_CHAINED_META);
+    REBCTX *meta = Copy_Context_Shallow(VAL_CONTEXT(std_meta));
+    Init_Void(CTX_VAR(meta, STD_CHAINED_META_DESCRIPTION)); // default
+    Init_Block(CTX_VAR(meta, STD_CHAINED_META_CHAINEES), chainees);
     Init_Void(CTX_VAR(meta, STD_CHAINED_META_CHAINEE_NAMES));
-
     MANAGE_ARRAY(CTX_VARLIST(meta));
-    SER(paramlist)->link.meta = meta;
+    MISC(paramlist).meta = meta; // must initialize before Make_Function
 
     REBFUN *fun = Make_Function(
         paramlist,
         &Chainer_Dispatcher,
-        VAL_FUNC(first), // cache in paramlist
-        NULL // not changing the specialization
+        FUNC_FACADE(VAL_FUNC(first)), // same interface as first function
+        FUNC_EXEMPLAR(VAL_FUNC(first)) // same exemplar as first function
     );
 
     // "body" is the chainees array, available to the dispatcher when called
@@ -436,7 +473,7 @@ REBNATIVE(chain)
     Init_Block(FUNC_BODY(fun), chainees);
 
     Move_Value(D_OUT, FUNC_VALUE(fun));
-    assert(VAL_BINDING(D_OUT) == NULL);
+    assert(VAL_BINDING(D_OUT) == UNBOUND);
 
     return R_OUT;
 }
@@ -463,8 +500,7 @@ REBNATIVE(adapt)
     REBSTR *opt_adaptee_name;
     Get_If_Word_Or_Path_Arg(D_OUT, &opt_adaptee_name, adaptee);
     if (!IS_FUNCTION(D_OUT))
-        fail (Error_Apply_Non_Function_Raw(adaptee));
-
+        fail (adaptee);
     Move_Value(adaptee, D_OUT);
 
     // For the binding to be correct, the indices that the words use must be
@@ -515,13 +551,13 @@ REBNATIVE(adapt)
         );
 
     MANAGE_ARRAY(CTX_VARLIST(meta));
-    SER(paramlist)->link.meta = meta;
+    MISC(paramlist).meta = meta;
 
     REBFUN *fun = Make_Function(
         paramlist,
         &Adapter_Dispatcher,
-        VAL_FUNC(adaptee), // inherit interface/facade from adaptee
-        NULL // not changing the specialization
+        FUNC_FACADE(VAL_FUNC(adaptee)), // same interface as adaptee
+        FUNC_EXEMPLAR(VAL_FUNC(adaptee)) // same exemplar as adaptee
     );
 
     // We need to store the 2 values describing the adaptation so that the
@@ -532,22 +568,115 @@ REBNATIVE(adapt)
     REBARR *adaptation = Make_Array(2);
 
     REBVAL *block = Alloc_Tail_Array(adaptation);
-    VAL_RESET_HEADER_EXTRA(block, REB_BLOCK, VALUE_FLAG_RELATIVE);
+    VAL_RESET_HEADER(block, REB_BLOCK);
     INIT_VAL_ARRAY(block, prelude);
     VAL_INDEX(block) = 0;
-    INIT_RELATIVE(block, underlying);
+    INIT_BINDING(block, underlying); // relative binding
 
     Append_Value(adaptation, adaptee);
 
     RELVAL *body = FUNC_BODY(fun);
-    VAL_RESET_HEADER_EXTRA(body, REB_BLOCK, VALUE_FLAG_RELATIVE);
+    VAL_RESET_HEADER(body, REB_BLOCK);
     INIT_VAL_ARRAY(body, adaptation);
     VAL_INDEX(body) = 0;
-    INIT_RELATIVE(body, underlying);
+    INIT_BINDING(body, underlying); // relative binding
     MANAGE_ARRAY(adaptation);
 
     Move_Value(D_OUT, FUNC_VALUE(fun));
-    assert(VAL_BINDING(D_OUT) == NULL);
+    assert(VAL_BINDING(D_OUT) == UNBOUND);
+
+    return R_OUT;
+}
+
+
+//
+//  enclose: native [
+//
+//  {Wrap code around a FUNCTION! with access to its FRAME! and return value}
+//
+//      return: [function!]
+//      inner [function! any-word! any-path!]
+//          {Function that a FRAME! will be built for (and optionally called)}
+//      outer [function! any-word! any-path!]
+//          {Gets a FRAME! for INNER before invocation, can DO it (or not)}
+//  ]
+//
+REBNATIVE(enclose)
+{
+    INCLUDE_PARAMS_OF_ENCLOSE;
+
+    REBVAL *inner = ARG(inner);
+    REBVAL *outer = ARG(outer);
+
+    REBSTR *opt_inner_name;
+    Get_If_Word_Or_Path_Arg(D_OUT, &opt_inner_name, inner);
+    if (!IS_FUNCTION(D_OUT))
+        fail (inner);
+    Move_Value(inner, D_OUT);
+
+    REBSTR *opt_outer_name;
+    Get_If_Word_Or_Path_Arg(D_OUT, &opt_outer_name, outer);
+    if (!IS_FUNCTION(D_OUT))
+        fail (outer);
+    Move_Value(outer, D_OUT);
+
+    // The paramlist needs to be unique to designate this function, but
+    // will be identical typesets to the inner.  It's [0] element must
+    // identify the function we're creating vs the original, however.
+    //
+    REBARR *paramlist = Copy_Array_Shallow(
+        VAL_FUNC_PARAMLIST(inner), SPECIFIED
+    );
+    ARR_HEAD(paramlist)->payload.function.paramlist = paramlist;
+    SET_SER_FLAG(paramlist, ARRAY_FLAG_PARAMLIST);
+    MANAGE_ARRAY(paramlist);
+
+    // See %sysobj.r for `enclosed-meta:` object template
+
+    REBVAL *example = Get_System(SYS_STANDARD, STD_ENCLOSED_META);
+
+    REBCTX *meta = Copy_Context_Shallow(VAL_CONTEXT(example));
+    Init_Void(CTX_VAR(meta, STD_ENCLOSED_META_DESCRIPTION)); // default
+    Move_Value(CTX_VAR(meta, STD_ENCLOSED_META_INNER), inner);
+    if (opt_inner_name == NULL)
+        Init_Void(CTX_VAR(meta, STD_ENCLOSED_META_INNER_NAME));
+    else
+        Init_Word(
+            CTX_VAR(meta, STD_ENCLOSED_META_INNER_NAME),
+            opt_inner_name
+        );
+    Move_Value(CTX_VAR(meta, STD_ENCLOSED_META_OUTER), outer);
+    if (opt_outer_name == NULL)
+        Init_Void(CTX_VAR(meta, STD_ENCLOSED_META_OUTER_NAME));
+    else
+        Init_Word(
+            CTX_VAR(meta, STD_ENCLOSED_META_OUTER_NAME),
+            opt_outer_name
+        );
+
+    MANAGE_ARRAY(CTX_VARLIST(meta));
+    MISC(paramlist).meta = meta;
+
+    REBFUN *fun = Make_Function(
+        paramlist,
+        &Encloser_Dispatcher,
+        FUNC_FACADE(VAL_FUNC(inner)), // same interface as inner
+        FUNC_EXEMPLAR(VAL_FUNC(inner)) // same exemplar as inner
+    );
+
+    // We need to store the 2 values describing the enclosure so that the
+    // dispatcher knows what to do when it gets called and inspects FUNC_BODY.
+    //
+    // [0] is the inner FUNCTION!, [2] is the outer FUNCTION!
+    //
+    REBARR *enclosure = Make_Array(2);
+    Append_Value(enclosure, inner);
+    Append_Value(enclosure, outer);
+
+    Init_Block(FUNC_BODY(fun), enclosure);
+
+    Move_Value(D_OUT, FUNC_VALUE(fun));
+    assert(VAL_BINDING(D_OUT) == UNBOUND);
 
     return R_OUT;
 }
@@ -616,14 +745,17 @@ REBNATIVE(hijack)
         // directly.  This is a reasonably common case, and especially
         // common when putting the originally hijacked function back.
 
-        SER(victim_paramlist)->misc.facade =
-            SER(hijacker_paramlist)->misc.facade;
-        SER(victim->payload.function.body_holder)->link.exemplar =
-            SER(hijacker->payload.function.body_holder)->link.exemplar;
+        LINK(victim_paramlist).facade = LINK(hijacker_paramlist).facade;
+        LINK(victim->payload.function.body_holder).exemplar =
+            LINK(hijacker->payload.function.body_holder).exemplar;
 
-        *VAL_FUNC_BODY(victim) = *VAL_FUNC_BODY(hijacker);
-        SER(victim->payload.function.body_holder)->misc.dispatcher =
-            SER(hijacker->payload.function.body_holder)->misc.dispatcher;
+        // All function bodies should live in cells with the same underlying
+        // formatting.  Blit_Cell ensures that's the case.
+        //
+        Blit_Cell(VAL_FUNC_BODY(victim), VAL_FUNC_BODY(hijacker));
+
+        MISC(victim->payload.function.body_holder).dispatcher =
+            MISC(hijacker->payload.function.body_holder).dispatcher;
     }
     else {
         // A mismatch means there could be someone out there pointing at this
@@ -637,19 +769,15 @@ REBNATIVE(hijack)
         // needs to do a new function call.
         //
         Move_Value(VAL_FUNC_BODY(victim), hijacker);
-        SER(victim->payload.function.body_holder)->misc.dispatcher =
+        MISC(victim->payload.function.body_holder).dispatcher =
             &Hijacker_Dispatcher;
     }
 
-    // Proxy the meta information from the hijacker onto the paramlist
-    //
-    // !!! Should this add a note about the hijacking?
-    //
-    SER(victim_paramlist)->link.meta =
-        SER(hijacker_paramlist)->link.meta;
+    // !!! What should be done about MISC(victim_paramlist).meta?  Leave it
+    // alone?  Add a note about the hijacking?
 
     Move_Value(D_OUT, victim);
-    D_OUT->extra.binding = hijacker->extra.binding;
+    INIT_BINDING(D_OUT, VAL_BINDING(hijacker));
 
     return R_OUT;
 }
@@ -722,27 +850,15 @@ REBNATIVE(tighten)
     RELVAL *rootparam = ARR_HEAD(paramlist);
     CLEAR_VAL_FLAGS(rootparam, FUNC_FLAG_CACHED_MASK);
     rootparam->payload.function.paramlist = paramlist;
-    rootparam->extra.binding = NULL;
+    INIT_BINDING(rootparam, UNBOUND);
 
     // !!! This does not make a unique copy of the meta information context.
     // Hence updates to the title/parameter-descriptions/etc. of the tightened
     // function will affect the original, and vice-versa.
     //
-    SER(paramlist)->link.meta = FUNC_META(original);
+    MISC(paramlist).meta = FUNC_META(original);
 
     MANAGE_ARRAY(paramlist);
-
-    REBFUN *fun = Make_Function(
-        paramlist,
-        FUNC_DISPATCHER(original),
-        original, // used to set the initial facade (overridden below)
-        NULL // don't add any specialization beyond the original
-    );
-
-    // We're reusing the original dispatcher, so we also reuse the original
-    // function body.
-    //
-    *FUNC_BODY(fun) = *FUNC_BODY(original);
 
     // Our function has a new identity, but we don't want to be using that
     // identity for the pushed frame.  If we did that, then if the underlying
@@ -755,7 +871,13 @@ REBNATIVE(tighten)
     // which is an array compatible with the original underlying function,
     // but with stricter parameter types and different parameter classes.
     // So just as the paramlist got transformed, transform the facade.
-
+    //
+    // Note: Do NOT set the ARRAY_FLAG_PARAMLIST on this facade.  It holds
+    // whatever function value in the [0] slot the original had, and that is
+    // used for the identity of the "underlying function".  (In order to make
+    // this a real FUNCTION!'s paramlist, the paramlist in the [0] slot would
+    // have to be equal to the facade's pointer.)
+    //
     REBARR *facade = Copy_Array_Shallow(
         FUNC_FACADE(original),
         SPECIFIED // no relative values in facades, either
@@ -776,13 +898,19 @@ REBNATIVE(tighten)
 
     MANAGE_ARRAY(facade);
 
-    // Note: Do NOT set the ARRAY_FLAG_PARAMLIST on this facade.  It holds
-    // whatever function value in the [0] slot the original had, and that is
-    // used for the identity of the "underlying function".  (In order to make
-    // this a real FUNCTION!'s paramlist, the paramlist in the [0] slot would
-    // have to be equal to the facade's pointer.)
+    REBFUN *fun = Make_Function(
+        paramlist,
+        FUNC_DISPATCHER(original),
+        facade, // use the new, tightened facade
+        FUNC_EXEMPLAR(original) // don't add to the original's specialization
+    );
+
+    // We're reusing the original dispatcher, so we also reuse the original
+    // function body.  Note that Blit_Cell ensures that the cell formatting
+    // on the source and target are the same, and it preserves relative
+    // value information (rarely what you meant, but it's meant here).
     //
-    SER(paramlist)->misc.facade = facade;
+    Blit_Cell(FUNC_BODY(fun), FUNC_BODY(original));
 
     Move_Value(D_OUT, FUNC_VALUE(fun));
 
@@ -791,7 +919,7 @@ REBNATIVE(tighten)
     // preserve the binding of the incoming value, which is never present in
     // the canon value of the function.
     //
-    D_OUT->extra.binding = ARG(action)->extra.binding;
+    INIT_BINDING(D_OUT, VAL_BINDING(ARG(action)));
 
     return R_OUT;
 }

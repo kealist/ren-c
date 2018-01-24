@@ -135,6 +135,51 @@ void TO_Word(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
 
 
 //
+//  MF_Word: C
+//
+void MF_Word(REB_MOLD *mo, const RELVAL *v, REBOOL form) {
+    UNUSED(form); // no difference between MOLD and FORM at this time
+
+    REBSTR *spelling = VAL_WORD_SPELLING(v);
+    REBSER *s = mo->series;
+
+    switch (VAL_TYPE(v)) {
+    case REB_WORD: {
+        Append_UTF8_May_Fail(s, STR_HEAD(spelling), STR_NUM_BYTES(spelling));
+        break; }
+
+    case REB_SET_WORD:
+        Append_UTF8_May_Fail(s, STR_HEAD(spelling), STR_NUM_BYTES(spelling));
+        Append_Codepoint(s, ':');
+        break;
+
+    case REB_GET_WORD:
+        Append_Codepoint(s, ':');
+        Append_UTF8_May_Fail(s, STR_HEAD(spelling), STR_NUM_BYTES(spelling));
+        break;
+
+    case REB_LIT_WORD:
+        Append_Codepoint(s, '\'');
+        Append_UTF8_May_Fail(s, STR_HEAD(spelling), STR_NUM_BYTES(spelling));
+        break;
+
+    case REB_REFINEMENT:
+        Append_Codepoint(s, '/');
+        Append_UTF8_May_Fail(s, STR_HEAD(spelling), STR_NUM_BYTES(spelling));
+        break;
+
+    case REB_ISSUE:
+        Append_Codepoint(s, '#');
+        Append_UTF8_May_Fail(s, STR_HEAD(spelling), STR_NUM_BYTES(spelling));
+        break;
+
+    default:
+        panic (v);
+    }
+}
+
+
+//
 //  REBTYPE: C
 //
 // The future plan for WORD! types is that they will be unified somewhat with
@@ -145,25 +190,44 @@ void TO_Word(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg)
 REBTYPE(Word)
 {
     REBVAL *val = D_ARG(1);
+    assert(ANY_WORD(val));
 
     switch (action) {
-    case SYM_LENGTH_OF: {
-        const REBYTE *bp = STR_HEAD(VAL_WORD_SPELLING(val));
-        REBCNT len = 0;
-        while (TRUE) {
-            REBUNI ch;
-            if (!(bp = Back_Scan_UTF8_Char(&ch, bp, &len)))
-                fail (Error_Bad_Utf8_Raw());
-            if (ch == 0)
-                break;
+    case SYM_REFLECT: {
+        INCLUDE_PARAMS_OF_REFLECT;
+
+        UNUSED(ARG(value));
+        REBSYM property = VAL_WORD_SYM(ARG(property));
+        assert(property != SYM_0);
+
+        switch (property) {
+        case SYM_LENGTH: {
+            const REBYTE *bp = STR_HEAD(VAL_WORD_SPELLING(val));
+            REBCNT len = 0;
+            while (TRUE) {
+                REBUNI ch;
+                if ((bp = Back_Scan_UTF8_Char(&ch, bp, &len)) == NULL)
+                    fail (Error_Bad_Utf8_Raw());
+                if (ch == 0)
+                    break;
+            }
+            Init_Integer(D_OUT, len);
+            return R_OUT; }
+
+        case SYM_CONTEXT: {
+            if (Get_Context_Of(D_OUT, val))
+                return R_OUT;
+            return R_BLANK; }
+
+        default:
+            break;
         }
-        Init_Integer(D_OUT, len);
-        return R_OUT; }
+
+        break; }
 
     default:
-        assert(ANY_WORD(val));
-        fail (Error_Illegal_Action(VAL_TYPE(val), action));
+        break;
     }
 
-    return R_OUT;
+    fail (Error_Illegal_Action(VAL_TYPE(val), action));
 }

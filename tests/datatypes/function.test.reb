@@ -1,7 +1,7 @@
 ; datatypes/function.r
 [function? does ["OK"]]
 [not function? 1]
-[function! = type-of does ["OK"]]
+[function! = type of does ["OK"]]
 ; minimum
 [function? does []]
 ; literal form
@@ -69,7 +69,7 @@
 [
     a-value: first [:a]
     f: does [:a-value]
-    (same? :a-value f) and* (:a-value == f)
+    (same? :a-value f) and (:a-value == f)
 ]
 [
     f: does [#"^@"]
@@ -115,8 +115,8 @@
     $1 == f
 ]
 [
-    f: does [:type-of]
-    same? :type-of f
+    f: does [:append]
+    same? :append f
 ]
 [
     f: does [_]
@@ -270,7 +270,12 @@
 [lf: func ['x] [:x] 30 == lf (10 + 20)]
 [lf: func ['x] [:x] o: context [f: 10] 10 == lf :o/f]
 ; basic test for recursive function! invocation
-[i: 0 countdown: proc [n] [if n > 0 [++ i countdown n - 1]] countdown 10 i = 10]
+[
+    i: 0
+    countdown: proc [n] [if n > 0 [i: ++ 1 | countdown n - 1]]
+    countdown 10
+    i = 10
+]
 
 ; In Ren-C's specific binding, a function-local word that escapes the
 ; function's extent cannot be used when re-entering the same function later
@@ -291,7 +296,7 @@
     error? trap [2 == f/r/r 1 2]
 ]
 ; bug#27
-[error? try [(type-of) 1]]
+[error? try [(type of) 1]]
 ; bug#1659
 ; inline function test
 [
@@ -342,7 +347,7 @@
         n (2)
         <in> o1 o1/o2
         <with> outer
-        <has> static (10 + n)
+        <static> static (10 + n)
     ][
         data: reduce [n x y outer static]
         return case [

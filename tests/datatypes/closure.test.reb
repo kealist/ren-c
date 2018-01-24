@@ -1,7 +1,7 @@
 ; datatypes/closure.r
 [closure? closure [] ["OK"]]
 [not closure? 1]
-[closure! = type-of closure [] ["OK"]]
+[closure! = type of closure [] ["OK"]]
 ; minimum
 [closure? closure [] []]
 ; return-less return value tests
@@ -67,7 +67,7 @@
 [
     a-value: first [:a]
     f: closure [] [:a-value]
-    (same? :a-value f) and* (:a-value == f)
+    (same? :a-value f) and (:a-value == f)
 ]
 [
     f: closure [] [#"^@"]
@@ -113,8 +113,8 @@
     $1 == f
 ]
 [
-    f: closure [] [:type-of]
-    same? :type-of f
+    f: closure [] [:append]
+    same? :append f
 ]
 [
     f: closure [] [_]
@@ -189,7 +189,12 @@
     'a == f
 ]
 ; basic test for recursive closure! invocation
-[i: 0 countdown: closure [n] [if n > 0 [++ i countdown n - 1]] countdown 10 i = 10]
+[
+    i: 0
+    countdown: clos [n] [if n > 0 [i: ++ 1 | countdown n - 1]]
+    countdown 10
+    i = 10
+]
 ; bug#21
 [
     c: closure [a] [return a]
@@ -287,4 +292,51 @@
     ; original series would mean that the original formation would always
     ; drop the index position (there is no index slot in the body series).
     ; A copy must be made -or- series forced to be at their head.
+]
+
+; TESTS THAT CAME FROM OTHER FILES THAT STILL USED CLOSURE
+
+; object cloning
+; bug#2049
+[
+    o: make object! [n: 'o f: closure [] [n]]
+    p: make o [n: 'p]
+    'p = p/f
+]
+
+; reflexivity test for closure!
+; Uses CLOSURE to make the test compatible.
+[equal? a-value: closure [] [] :a-value]
+
+; No structural equivalence for closure!
+; Uses CLOSURE to make the test compatible.
+[not equal? closure [] [] closure [] []]
+
+; reflexivity test for closure!
+[
+    a-value: closure [] []
+    same? :a-value :a-value
+]
+
+; no structural equality for closure!
+[not same? closure [] [] closure [] []]
+
+; reflexivity test for closure!
+[
+    a-value: closure [] []
+    strict-equal? :a-value :a-value
+]
+
+; no structural equality for closure!
+[not strict-equal? closure [] [] closure [] []]
+
+; bug#1549
+; BIND works 'as expected' in closure body
+[
+    b1: [self]
+    f: closure [/local b2] [
+        b2: [self]
+        same? first b2 first bind/copy b1 'b2
+    ]
+    f
 ]

@@ -187,13 +187,13 @@ void TO_Array(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg) {
         // used with the scanner.
         //
         REBCNT index;
-        REBSER *utf8 = Temp_Bin_Str_Managed(arg, &index, NULL);
+        REBSER *utf8 = Temp_UTF8_At_Managed(arg, &index, NULL);
         PUSH_GUARD_SERIES(utf8);
         REBSTR * const filename = Canon(SYM___ANONYMOUS__);
         Init_Any_Array(
             out,
             kind,
-            Scan_UTF8_Managed(BIN_HEAD(utf8), BIN_LEN(utf8), filename)
+            Scan_UTF8_Managed(filename, BIN_HEAD(utf8), BIN_LEN(utf8))
         );
         DROP_GUARD_SERIES(utf8);
     }
@@ -206,7 +206,7 @@ void TO_Array(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg) {
         Init_Any_Array(
             out,
             kind,
-            Scan_UTF8_Managed(VAL_BIN_AT(arg), VAL_LEN_AT(arg), filename)
+            Scan_UTF8_Managed(filename, VAL_BIN_AT(arg), VAL_LEN_AT(arg))
         );
     }
     else if (IS_MAP(arg)) {
@@ -232,114 +232,125 @@ void TO_Array(REBVAL *out, enum Reb_Kind kind, const REBVAL *arg) {
 //
 //  Find_In_Array: C
 //
-// Flags are set according to: ALL_FIND_REFS
-//
-// Main Parameters:
-// start - index to start search
-// end   - ending position
-// len   - length of target
-// skip  - skip factor
-// dir   - direction
-//
-// Comparison Parameters:
-// case  - case sensitivity
-// wild  - wild cards/keys
-//
-// Final Parmameters:
-// tail  - tail position
-// match - sequence
-// SELECT - (value that follows)
+// !!! Comment said "Final Parameters: tail - tail position, match - sequence,
+// SELECT - (value that follows)".  It's not clear what this meant.
 //
 REBCNT Find_In_Array(
     REBARR *array,
-    REBCNT index,
-    REBCNT end,
+    REBCNT index, // index to start search
+    REBCNT end, // ending position
     const RELVAL *target,
-    REBCNT len,
-    REBFLGS flags,
-    REBINT skip
-) {
-    RELVAL *value;
-    RELVAL *val;
-    REBCNT cnt;
+    REBCNT len, // length of target
+    REBFLGS flags, // see AM_FIND_XXX
+    REBINT skip // skip factor
+){
     REBCNT start = index;
 
     if (flags & (AM_FIND_REVERSE | AM_FIND_LAST)) {
         skip = -1;
         start = 0;
-        if (flags & AM_FIND_LAST) index = end - len;
-        else index--;
+        if (flags & AM_FIND_LAST)
+            index = end - len;
+        else
+            --index;
     }
 
-    // Optimized find word in block:
+    // Optimized find word in block
+    //
     if (ANY_WORD(target)) {
         for (; index >= start && index < end; index += skip) {
-            value = ARR_AT(array, index);
-            if (ANY_WORD(value)) {
-                cnt = (VAL_WORD_SPELLING(value) == VAL_WORD_SPELLING(target));
-                if (flags & AM_FIND_CASE) {
-                    // Must be same type and spelling:
-                    if (cnt && VAL_TYPE(value) == VAL_TYPE(target)) return index;
+            RELVAL *item = ARR_AT(array, index);
+            REBSTR *target_canon = VAL_WORD_CANON(target); // canonize once
+            if (ANY_WORD(item)) {
+                if (flags & AM_FIND_CASE) { // Must be same type and spelling
+                    if (
+                        VAL_WORD_SPELLING(item) == VAL_WORD_SPELLING(target)
+                        && VAL_TYPE(item) == VAL_TYPE(target)
+                    ){
+                        return index;
+                    }
                 }
-                else {
-                    // Can be different type or alias:
-                    if (cnt || VAL_WORD_CANON(value) == VAL_WORD_CANON(target)) return index;
+                else { // Can be different type or differently cased spelling
+                    if (VAL_WORD_CANON(item) == target_canon)
+                        return index;
                 }
             }
-            if (flags & AM_FIND_MATCH) break;
+            if (flags & AM_FIND_MATCH)
+                break;
         }
         return NOT_FOUND;
     }
-    // Match a block against a block:
-    else if (ANY_ARRAY(target) && !(flags & AM_FIND_ONLY)) {
+
+    // Match a block against a block
+    //
+    if (ANY_ARRAY(target) && NOT(flags & AM_FIND_ONLY)) {
         for (; index >= start && index < end; index += skip) {
-            cnt = 0;
-            value = ARR_AT(array, index);
-            for (val = VAL_ARRAY_AT(target); NOT_END(val); val++, value++) {
-                if (0 != Cmp_Value(value, val, LOGICAL(flags & AM_FIND_CASE)))
+            RELVAL *item = ARR_AT(array, index);
+
+            REBCNT count = 0;
+            RELVAL *other = VAL_ARRAY_AT(target);
+            for (; NOT_END(other); ++other, ++item) {
+                if (
+                    IS_END(item) ||
+                    0 != Cmp_Value(item, other, LOGICAL(flags & AM_FIND_CASE))
+                ){
                     break;
-                if (++cnt >= len) {
+                }
+                if (++count >= len)
+                    return index;
+            }
+            if (flags & AM_FIND_MATCH)
+                break;
+        }
+        return NOT_FOUND;
+    }
+
+    // Find a datatype in block
+    //
+    if (IS_DATATYPE(target) || IS_TYPESET(target)) {
+        for (; index >= start && index < end; index += skip) {
+            RELVAL *item = ARR_AT(array, index);
+
+            if (IS_DATATYPE(target)) {
+                if (VAL_TYPE(item) == VAL_TYPE_KIND(target))
+                    return index;
+                if (
+                    IS_DATATYPE(item)
+                    && VAL_TYPE_KIND(item) == VAL_TYPE_KIND(target)
+                ){
                     return index;
                 }
             }
-            if (flags & AM_FIND_MATCH) break;
+            else if (IS_TYPESET(target)) {
+                if (TYPE_CHECK(target, VAL_TYPE(item)))
+                    return index;
+                if (
+                    IS_DATATYPE(item)
+                    && TYPE_CHECK(target, VAL_TYPE_KIND(item))
+                ){
+                    return index;
+                }
+                if (IS_TYPESET(item) && EQUAL_TYPESET(item, target))
+                    return index;
+            }
+            if (flags & AM_FIND_MATCH)
+                break;
         }
         return NOT_FOUND;
     }
-    // Find a datatype in block:
-    else if (IS_DATATYPE(target) || IS_TYPESET(target)) {
-        for (; index >= start && index < end; index += skip) {
-            value = ARR_AT(array, index);
-            // Used if's so we can trace it...
-            if (IS_DATATYPE(target)) {
-                if (VAL_TYPE(value) == VAL_TYPE_KIND(target)) return index;
-                if (IS_DATATYPE(value) && VAL_TYPE_KIND(value) == VAL_TYPE_KIND(target)) return index;
-            }
-            if (IS_TYPESET(target)) {
-                if (TYPE_CHECK(target, VAL_TYPE(value))) return index;
-                if (IS_DATATYPE(value) && TYPE_CHECK(target, VAL_TYPE_KIND(value))) return index;
-                if (IS_TYPESET(value) && EQUAL_TYPESET(value, target)) return index;
-            }
-            if (flags & AM_FIND_MATCH) break;
-        }
-        return NOT_FOUND;
-    }
-    // All other cases:
-    else {
-        for (; index >= start && index < end; index += skip) {
-            value = ARR_AT(array, index);
-            if (
-                0 == Cmp_Value(
-                    value, target, LOGICAL(flags & AM_FIND_CASE)
-                )
-            ) {
-                return index;
-            }
 
-            if (flags & AM_FIND_MATCH) break;
-        }
-        return NOT_FOUND;
+    // All other cases
+
+    for (; index >= start && index < end; index += skip) {
+        RELVAL *item = ARR_AT(array, index);
+        if (0 == Cmp_Value(item, target, LOGICAL(flags & AM_FIND_CASE)))
+            return index;
+
+        if (flags & AM_FIND_MATCH)
+            break;
     }
+
+    return NOT_FOUND;
 }
 
 
@@ -415,7 +426,7 @@ static int Compare_Val_Custom(void *arg, const void *v1, const void *v2)
         else if (VAL_DECIMAL(result) == 0)
             tristate = 0;
     }
-    else if (IS_CONDITIONAL_TRUE(result))
+    else if (IS_TRUTHY(result))
         tristate = 1;
 
     return tristate;
@@ -508,9 +519,17 @@ void Shuffle_Block(REBVAL *value, REBOOL secure)
     for (n = VAL_LEN_AT(value); n > 1;) {
         k = idx + (REBCNT)Random_Int(secure) % n;
         n--;
-        swap = data[k];
-        data[k] = data[n + idx];
-        data[n + idx] = swap;
+
+        // Only do the following block when an actual swap occurs.
+        // Otherwise an assertion will fail when trying to Blit_Cell() a
+    // value to itself.
+        if (k != (n + idx)) {
+            swap.header = data[k].header;
+            swap.payload = data[k].payload;
+            swap.extra = data[k].extra;
+            Blit_Cell(&data[k], &data[n + idx]);
+            Blit_Cell(&data[n + idx], &swap);
+    }
     }
 }
 
@@ -527,9 +546,9 @@ void Shuffle_Block(REBVAL *value, REBOOL secure)
 //     PD_Set_Path
 //     PD_Lit_Path
 //
-REBINT PD_Array(REBPVS *pvs)
+REB_R PD_Array(REBPVS *pvs, const REBVAL *picker, const REBVAL *opt_setval)
 {
-    REBINT n = 0;
+    REBCNT n = NOT_FOUND; // -1
 
     /* Issues!!!
         a/1.3
@@ -537,63 +556,62 @@ REBINT PD_Array(REBPVS *pvs)
         a/not-followed: 10 error or append?
     */
 
-    if (IS_INTEGER(pvs->picker)) {
-        n = Int32(pvs->picker) + VAL_INDEX(pvs->value) - 1;
+    if (IS_INTEGER(picker)) {
+        n = Int32(picker) + VAL_INDEX(pvs->out) - 1;
     }
-    else if (IS_WORD(pvs->picker)) {
-        n = Find_Word_In_Array(
-            VAL_ARRAY(pvs->value),
-            VAL_INDEX(pvs->value),
-            VAL_WORD_CANON(pvs->picker)
-        );
-        if (cast(REBCNT, n) != NOT_FOUND) n++;
+    else if (IS_WORD(picker)) {
+        //
+        // Linear search to find ANY-WORD! matching the canon.
+
+        REBSTR *canon = VAL_WORD_CANON(picker);
+        RELVAL *item = VAL_ARRAY_AT(pvs->out);
+        REBCNT index = VAL_INDEX(pvs->out);
+        for (; NOT_END(item); ++item, ++index) {
+            if (ANY_WORD(item) && canon == VAL_WORD_CANON(item)) {
+                n = index + 1;
+                break;
+            }
+        }
     }
-    else if (IS_LOGIC(pvs->picker)) {
+    else if (IS_LOGIC(picker)) {
         //
         // !!! PICK in R3-Alpha historically would use a logic TRUE to get
         // the first element in an array, and a logic FALSE to get the second.
         // It did this regardless of how many elements were in the array.
-        // (For safety, it has been suggested non-binary arrays should fail).
-        // But path picking would act like you had written SELECT and looked
-        // for the item to come after a TRUE.  With the merging of path
-        // picking and PICK, this changes the behavior.
+        // (For safety, it has been suggested arrays > length 2 should fail).
         //
-        if (VAL_LOGIC(pvs->picker))
-            n = VAL_INDEX(pvs->value);
+        if (VAL_LOGIC(picker))
+            n = VAL_INDEX(pvs->out);
         else
-            n = VAL_INDEX(pvs->value) + 1;
+            n = VAL_INDEX(pvs->out) + 1;
     }
     else {
         // other values:
         n = 1 + Find_In_Array_Simple(
-            VAL_ARRAY(pvs->value),
-            VAL_INDEX(pvs->value),
-            pvs->picker
+            VAL_ARRAY(pvs->out),
+            VAL_INDEX(pvs->out),
+            picker
         );
     }
 
-    if (n < 0 || cast(REBCNT, n) >= VAL_LEN_HEAD(pvs->value)) {
-        if (pvs->opt_setval)
-            fail (Error_Bad_Path_Select(pvs));
+    if (n == NOT_FOUND || n >= VAL_LEN_HEAD(pvs->out)) {
+        if (opt_setval != NULL)
+            return R_UNHANDLED;
 
-        Init_Void(pvs->store);
-        return PE_USE_STORE;
+        Init_Void(pvs->out);
+        return R_OUT;
     }
 
-    if (pvs->opt_setval)
-        FAIL_IF_READ_ONLY_SERIES(VAL_SERIES(pvs->value));
+    if (opt_setval != NULL)
+        FAIL_IF_READ_ONLY_SERIES(VAL_SERIES(pvs->out));
 
-    pvs->value_specifier = Derive_Specifier(pvs->value_specifier, pvs->value);
-    pvs->value = VAL_ARRAY_AT_HEAD(pvs->value, n);
+    Init_Reference(
+        pvs->out,
+        VAL_ARRAY_AT_HEAD(pvs->out, n),
+        VAL_SPECIFIER(pvs->out)
+    );
 
-#if !defined(NDEBUG)
-    if (pvs->value_specifier == SPECIFIED && IS_RELATIVE(pvs->value)) {
-        printf("Relative value found in PD_Array with no specifier\n");
-        panic (pvs->value);
-    }
-#endif
-
-    return PE_SET_IF_END;
+    return R_REFERENCE;
 }
 
 
@@ -614,6 +632,90 @@ RELVAL *Pick_Block(REBVAL *out, const REBVAL *block, const REBVAL *picker)
     RELVAL *slot = VAL_ARRAY_AT_HEAD(block, n);
     Derelativize(out, slot, VAL_SPECIFIER(block));
     return slot;
+}
+
+
+//
+//  MF_Array: C
+//
+void MF_Array(REB_MOLD *mo, const RELVAL *v, REBOOL form)
+{
+    if (form && (IS_BLOCK(v) || IS_GROUP(v))) {
+        Form_Array_At(mo, VAL_ARRAY(v), VAL_INDEX(v), 0);
+        return;
+    }
+
+    REBOOL all;
+    if (VAL_INDEX(v) == 0) { // "&& VAL_TYPE(v) <= REB_LIT_PATH" commented out
+        //
+        // Optimize when no index needed
+        //
+        all = FALSE;
+    }
+    else
+        all = GET_MOLD_FLAG(mo, MOLD_FLAG_ALL);
+
+    REBOOL over;
+    if (VAL_INDEX(v) >= VAL_LEN_HEAD(v)) {
+        //
+        // If out of range, do not cause error to avoid error looping.
+        //
+        over = TRUE; // Force it into []
+    }
+    else
+        over = FALSE;
+
+    if (all || (over && !IS_BLOCK(v) && !IS_GROUP(v))) {
+        SET_MOLD_FLAG(mo, MOLD_FLAG_ALL);
+        Pre_Mold(mo, v); // #[block! part
+
+        Append_Codepoint(mo->series, '[');
+        Mold_Array_At(mo, VAL_ARRAY(v), 0, 0);
+        Post_Mold(mo, v);
+        Append_Codepoint(mo->series, ']');
+    }
+    else {
+        const char *sep;
+
+        switch(VAL_TYPE(v)) {
+        case REB_BLOCK:
+            if (GET_MOLD_FLAG(mo, MOLD_FLAG_ONLY)) {
+                CLEAR_MOLD_FLAG(mo, MOLD_FLAG_ONLY); // only top level
+                sep = "\000\000";
+            }
+            else
+                sep = 0;
+            break;
+
+        case REB_GROUP:
+            sep = "()";
+            break;
+
+        case REB_GET_PATH:
+            Append_Codepoint(mo->series, ':');
+            sep = "/";
+            break;
+
+        case REB_LIT_PATH:
+            Append_Codepoint(mo->series, '\'');
+            // fall through
+        case REB_PATH:
+        case REB_SET_PATH:
+            sep = "/";
+            break;
+
+        default:
+            sep = NULL;
+        }
+
+        if (over)
+            Append_Unencoded(mo->series, sep ? sep : "[]");
+        else
+            Mold_Array_At(mo, VAL_ARRAY(v), VAL_INDEX(v), sep);
+
+        if (VAL_TYPE(v) == REB_SET_PATH)
+            Append_Codepoint(mo->series, ':');
+    }
 }
 
 
@@ -837,8 +939,8 @@ REBTYPE(Array)
             specifier,
             tail, // tail
             0, // extra
-            REF(deep), // deep
-            types // types
+            SERIES_FLAG_FILE_LINE, // flags
+            types // types to copy deeply
         );
         Init_Any_Array(D_OUT, VAL_TYPE(value), copy);
         return R_OUT;
@@ -867,7 +969,7 @@ REBTYPE(Array)
 
         if (REF(tail)) {
             for (; end >= cast(REBINT, index + 1); end--) {
-                if (VAL_TYPE(head + end - 1) != REB_BLANK)
+                if (NOT(IS_BLANK(head + end - 1)))
                     break;
             }
             Remove_Series(SER(array), end, ARR_LEN(array) - end);
@@ -877,19 +979,28 @@ REBTYPE(Array)
 
         if (REF(head)) {
             for (; cast(REBINT, index) < end; index++) {
-                if (VAL_TYPE(head + index) != REB_BLANK) break;
+                if (NOT(IS_BLANK((head + index))))
+                    break;
             }
             Remove_Series(SER(array), out, index - out);
         }
 
         if (NOT(REF(head) || REF(tail))) {
+            //
+            // Make the invariant for the next loop that we've passed all
+            // the non-blanks, to avoid blitting cells over themselves.
+            //
+            while (cast(REBINT, index) < end && NOT(IS_BLANK(head + index))) {
+                ++out;
+                ++index;
+            }
             for (; cast(REBINT, index) < end; index++) {
-                if (VAL_TYPE(head + index) != REB_BLANK) {
+                if (NOT(IS_BLANK(head + index))) {
                     //
                     // Rare case of legal RELVAL bit copying... from one slot
                     // in an array to another in that same array.
                     //
-                    *ARR_AT(array, out) = head[index];
+                    Blit_Cell(ARR_AT(array, out), &head[index]);
                     out++;
                 }
             }
@@ -910,12 +1021,16 @@ REBTYPE(Array)
         if (
             index < VAL_LEN_HEAD(value)
             && VAL_INDEX(arg) < VAL_LEN_HEAD(arg)
-        ) {
+        ){
             // RELVAL bits can be copied within the same array
             //
-            RELVAL temp = *VAL_ARRAY_AT(value);
-            *VAL_ARRAY_AT(value) = *VAL_ARRAY_AT(arg);
-            *VAL_ARRAY_AT(arg) = temp;
+            RELVAL *a = VAL_ARRAY_AT(value);
+            RELVAL temp;
+            temp.header = a->header;
+            temp.payload = a->payload;
+            temp.extra = a->extra;
+            Blit_Cell(VAL_ARRAY_AT(value), VAL_ARRAY_AT(arg));
+            Blit_Cell(VAL_ARRAY_AT(arg), &temp);
         }
         Move_Value(D_OUT, D_ARG(1));
         return R_OUT;
@@ -933,10 +1048,13 @@ REBTYPE(Array)
             //
             RELVAL *front = VAL_ARRAY_AT(value);
             RELVAL *back = front + len - 1;
-            for (len /= 2; len > 0; len--) {
-                RELVAL temp = *front;
-                *front++ = *back;
-                *back-- = temp;
+            for (len /= 2; len > 0; --len, ++front, --back) {
+                RELVAL temp;
+                temp.header = front->header;
+                temp.payload = front->payload;
+                temp.extra = front->extra;
+                Blit_Cell(front, back);
+                Blit_Cell(back, &temp);
             }
         }
         Move_Value(D_OUT, D_ARG(1));
@@ -1031,7 +1149,7 @@ void Assert_Array_Core(REBARR *a)
     //
     Assert_Series_Core(SER(a));
 
-    if (NOT(GET_SER_FLAG(a, SERIES_FLAG_ARRAY)))
+    if (NOT_SER_FLAG(a, SERIES_FLAG_ARRAY))
         panic (a);
 
     RELVAL *item = ARR_HEAD(a);

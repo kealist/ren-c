@@ -99,37 +99,48 @@
 // cast in the C build.)
 //
 
-#if !defined(NDEBUG) && defined(__cplusplus) && __cplusplus >= 201103L
+#if !defined(NDEBUG) && defined(CPLUSPLUS_11)
     template <class T>
     inline REBSER *SER(T *p) {
         static_assert(
             // see specializations for void* and REBNOD*, which do more checks
             std::is_same<T, REBSTR>::value
-            || std::is_same<T, REBARR>::value,
+            || std::is_same<T, REBARR>::value
+            || std::is_same<T, REBNOD>::value,
             "SER works on: void*, REBNOD*, REBSTR*, REBARR*"
         );
-        return cast(REBSER*, p);
+
+        return reinterpret_cast<REBSER*>(p);
     }
 
+    // Specialize the template with extra checks for cases that aren't assumed
+    // correct by virtue of the type system (REBNOD* and void*).  Can be
+    // costly, so reduce that cost in unoptimized builds by avoiding local
+    // variables, using plain reinterpret_cast vs. cast(), and being clever
+    // about the bitwise math.
+   
     template <>
     inline REBSER *SER(void *p) {
-        REBNOD *n = NOD(p); // ensures NOT(NODE_FLAG_FREE)
         assert(
-            NOT(n->header.bits & NODE_FLAG_CELL)
-            && NOT(n->header.bits & NODE_FLAG_END)
+            NODE_FLAG_NODE == (
+                reinterpret_cast<REBSER*>(p)->header.bits &
+                (NODE_FLAG_NODE // good!
+                | NODE_FLAG_FREE | NODE_FLAG_CELL | NODE_FLAG_END) // bad!
+            )
         );
-        return cast(REBSER*, n);
+        return reinterpret_cast<REBSER*>(p);
     }
 
     template <>
-    inline REBSER *SER(REBNOD *n) {
+    inline REBSER *SER(REBNOD *p) {
         assert(
-            (n->header.bits & NODE_FLAG_NODE)
-            && NOT(n->header.bits & NODE_FLAG_FREE) // GET_SER_FLAG recurses!
-            && NOT(n->header.bits & NODE_FLAG_CELL)
-            && NOT(n->header.bits & NODE_FLAG_END)
+            NODE_FLAG_NODE == (
+                reinterpret_cast<REBSER*>(p)->header.bits &
+                (NODE_FLAG_NODE // good!
+                | NODE_FLAG_FREE | NODE_FLAG_CELL | NODE_FLAG_END) // bad!
+            )
         );
-        return cast(REBSER*, n);
+        return reinterpret_cast<REBSER*>(p);
     }
 #else
     #define SER(p) \
@@ -222,7 +233,7 @@
     RIGHT_8_BITS((s)->info.bits) // inlining unnecessary
 
 inline static REBCNT SER_LEN(REBSER *s) {
-    return GET_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC)
+    return (s->info.bits & SERIES_INFO_HAS_DYNAMIC)
         ? s->content.dynamic.len
         : MID_8_BITS(s->info.bits);
 }
@@ -230,7 +241,7 @@ inline static REBCNT SER_LEN(REBSER *s) {
 inline static void SET_SERIES_LEN(REBSER *s, REBCNT len) {
     assert(NOT_SER_INFO(s, CONTEXT_INFO_STACK));
 
-    if (GET_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC)) {
+    if (s->info.bits & SERIES_INFO_HAS_DYNAMIC) {
         s->content.dynamic.len = len;
     }
     else {
@@ -242,10 +253,10 @@ inline static void SET_SERIES_LEN(REBSER *s, REBCNT len) {
 }
 
 inline static REBCNT SER_REST(REBSER *s) {
-    if (GET_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC))
+    if (s->info.bits & SERIES_INFO_HAS_DYNAMIC)
         return s->content.dynamic.rest;
 
-    if (GET_SER_FLAG(s, SERIES_FLAG_ARRAY))
+    if (s->header.bits & SERIES_FLAG_ARRAY)
         return 2; // includes info bits acting as trick "terminator"
 
     assert(sizeof(s->content) % SER_WIDE(s) == 0);
@@ -258,9 +269,9 @@ inline static REBCNT SER_REST(REBSER *s) {
 //
 inline static REBYTE *SER_DATA_RAW(REBSER *s) {
     // if updating, also update manual inlining in SER_AT_RAW
-    return GET_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC)
+    return (s->info.bits & SERIES_INFO_HAS_DYNAMIC)
         ? s->content.dynamic.data
-        : cast(REBYTE*, &s->content);
+        : (REBYTE*)(&s->content);
 }
 
 inline static REBYTE *SER_AT_RAW(REBYTE w, REBSER *s, REBCNT i) {
@@ -277,9 +288,9 @@ inline static REBYTE *SER_AT_RAW(REBYTE w, REBSER *s, REBCNT i) {
 #endif
 
     return ((w) * (i)) + ( // v-- inlining of SER_DATA_RAW
-        GET_SER_INFO(s, SERIES_INFO_HAS_DYNAMIC)
+        (s->info.bits & SERIES_INFO_HAS_DYNAMIC)
             ? s->content.dynamic.data
-            : cast(REBYTE*, &s->content)
+            : (REBYTE*)(&s->content)
         );
 }
 
@@ -292,9 +303,11 @@ inline static REBYTE *SER_AT_RAW(REBYTE w, REBSER *s, REBCNT i) {
 // Note that series indexing in C is zero based.  So as far as SERIES is
 // concerned, `SER_HEAD(t, s)` is the same as `SER_AT(t, s, 0)`
 //
+// Use C-style cast instead of cast() macro, as it will always be safe and
+// this is used very frequently.
 
 #define SER_AT(t,s,i) \
-    cast(t*, SER_AT_RAW(sizeof(t), (s), (i)))
+    ((t*)SER_AT_RAW(sizeof(t), (s), (i)))
 
 #define SER_HEAD(t,s) \
     SER_AT(t, (s), 0)
@@ -304,7 +317,7 @@ inline static REBYTE *SER_TAIL_RAW(size_t w, REBSER *s) {
 }
 
 #define SER_TAIL(t,s) \
-    cast(t*, SER_TAIL_RAW(sizeof(t), (s)))
+    ((t*)SER_TAIL_RAW(sizeof(t), (s)))
 
 inline static REBYTE *SER_LAST_RAW(size_t w, REBSER *s) {
     assert(SER_LEN(s) != 0);
@@ -312,7 +325,7 @@ inline static REBYTE *SER_LAST_RAW(size_t w, REBSER *s) {
 }
 
 #define SER_LAST(t,s) \
-    cast(t*, SER_LAST_RAW(sizeof(t), (s)))
+    ((t*)SER_LAST_RAW(sizeof(t), (s)))
 
 
 #define SER_FULL(s) \
@@ -487,7 +500,7 @@ inline static REBOOL Is_Series_Frozen(REBSER *s) {
 
 inline static REBOOL Is_Series_Read_Only(REBSER *s) { // may be temporary...
     return ANY_SER_INFOS(
-        s, SERIES_INFO_FROZEN | SERIES_INFO_RUNNING | SERIES_INFO_PROTECTED
+        s, SERIES_INFO_FROZEN | SERIES_INFO_HOLD | SERIES_INFO_PROTECTED
     );
 }
 
@@ -500,8 +513,8 @@ inline static REBOOL Is_Series_Read_Only(REBSER *s) { // may be temporary...
 //
 inline static void FAIL_IF_READ_ONLY_SERIES(REBSER *s) {
     if (Is_Series_Read_Only(s)) {
-        if (GET_SER_INFO(s, SERIES_INFO_RUNNING))
-            fail (Error_Series_Running_Raw());
+        if (GET_SER_INFO(s, SERIES_INFO_HOLD))
+            fail (Error_Series_Held_Raw());
 
         if (GET_SER_INFO(s, SERIES_INFO_FROZEN))
             fail (Error_Series_Frozen_Raw());
@@ -628,7 +641,7 @@ inline static void INIT_VAL_SERIES(RELVAL *v, REBSER *s) {
     v->payload.any_series.series = s;
 }
 
-#if defined(NDEBUG) || !defined(__cplusplus)
+#if defined(NDEBUG) || !defined(CPLUSPLUS_11)
     #define VAL_INDEX(v) \
         ((v)->payload.any_series.index)
 #else
@@ -658,7 +671,7 @@ inline static REBYTE *VAL_RAW_DATA_AT(const RELVAL *v) {
 }
 
 #define Init_Any_Series_At(v,t,s,i) \
-    Init_Any_Series_At_Core((v), (t), (s), (i), SPECIFIED)
+    Init_Any_Series_At_Core((v), (t), (s), (i), UNBOUND)
 
 #define Init_Any_Series(v,t,s) \
     Init_Any_Series_At((v), (t), (s), 0)

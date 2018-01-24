@@ -20,13 +20,31 @@
 ; the state of variables, that is what NONE! (blank) is for...to serve as
 ; a reified value placeholder when you don't have a value.
 
-[a: 1 set [a] reduce [2 ()] a = 2]
-[x: construct [a: 1] set x reduce [2 ()] x/a = 2]
-[a: 1 set/opt [a] reduce [()] void? get/opt 'a]
-[a: 1 b: 2 set/opt [a b] reduce [3 ()] all [a = 3 void? get/opt 'b]]
-[x: construct [a: 1] set/opt x reduce [()] void? get/opt in x 'a]
-[x: construct [a: 1 b: 2] set/opt x reduce [3 ()] all [a = 3 void? get/opt in x 'b]]
 [
+    a: 1
+    set [a] reduce [2 ()]
+    a = 2
+][
+    x: construct [a: 1]
+    set x reduce [2 ()]
+    x/a = 2
+][
+    a: 1
+    set/only [a] reduce [()]
+    void? get/only 'a
+][
+    a: 1 b: 2
+    set/only [a b] reduce [3 ()]
+    all [a = 3 | void? get/only 'b]
+][
+    x: construct [a: 1]
+    set/only x reduce [()]
+    void? get/only in x 'a
+][
+    x: construct [a: 1 b: 2]
+    set/only x reduce [3 ()]
+    all [a = 3 | void? get/only in x 'b]
+][
     blk: reduce [()]
     blk = compose blk
 ]
@@ -35,18 +53,6 @@
 ; see if that is still relevant.
 ;
 [typeset? complement make typeset! [unset!]]
-
-; There is an issue with doing a MAKE FRAME! for a definitional return and
-; then DOing that frame.  The problem is that while the behavior of each
-; RETURN looks like a unique function, it isn't.  So if you try to execute
-; the frame to call the "Unique" function, there is no way to target that
-; instance.  So the `exit_from` frame inside the definitional return has
-; to get tunneled in somehow as the "function" of the definitional return
-; to know where to make the call.
-;
-; Technically possible.  Just not on the priority list ATM.
-;
-[1 == eval does [r3-alpha-apply :return [1] 2]]
 
 ; For bridging purposes, MAKE is currently a "sniffing" variadic.  These are
 ; evil, but helpful because it wants to examine its arguments before deciding
@@ -113,13 +119,13 @@
 ;; rid of /local on all the internal generators.
 ; bug#2076
 [
-    o: context-of use [x] ['x]
-    3 == length? words-of append o 'self ; !!! weird test, includes /local
+    o: context of use [x] ['x]
+    3 == length of words of append o 'self ; !!! weird test, includes /local
 ]
 ; bug#2076
 [
-    o: context-of use [x] ['x]
-    3 == length? words-of append o [self: 1] ; weird test, includes /local
+    o: context of use [x] ['x]
+    3 == length of words of append o [self: 1] ; weird test, includes /local
 ]
 
 [equal? mold/all #[email! ""] {#[email! ""]}]
@@ -431,7 +437,7 @@
 
 [
     o: make object! [a: _]
-    same? context-of in o 'self context-of in o 'a
+    same? context of in o 'self context-of in o 'a
 ]
 
 ; bug#1745
@@ -525,7 +531,7 @@
 ; bug#1613
 [exists? http://www.rebol.com/index.html]
 
-[0 = sign? USD$0]
+[0 = sign-of USD$0]
 
 ; bug#1894
 [
@@ -534,7 +540,7 @@
 ]
 
 #64bit
-[[1] = copy/part tail [1] -9223372036854775808]
+[[1] = copy/part tail of [1] -9223372036854775808]
 
 #64bit
 [[] = copy/part [] 9223372036854775807]

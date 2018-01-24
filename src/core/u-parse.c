@@ -92,13 +92,13 @@
 
 #define P_OUT (f->out)
 
-#define P_CELL (&f->cell)
+#define P_CELL KNOWN(&f->cell)
 
 #define FETCH_NEXT_RULE_MAYBE_END(f) \
     Fetch_Next_In_Frame(f)
 
 #define FETCH_TO_BAR_MAYBE_END(f) \
-    while (NOT_END(P_RULE) && !IS_BAR(P_RULE)) \
+    while (FRM_HAS_MORE(f) && !IS_BAR(P_RULE)) \
         { FETCH_NEXT_RULE_MAYBE_END(f); }
 
 
@@ -111,7 +111,7 @@ enum parse_flags {
     PF_NOT = 1 << 2,
     PF_NOT2 = 1 << 3,
     PF_THEN = 1 << 4,
-    PF_AND = 1 << 5,
+    PF_AHEAD = 1 << 5,
     PF_REMOVE = 1 << 6,
     PF_INSERT = 1 << 7,
     PF_CHANGE = 1 << 8,
@@ -156,11 +156,7 @@ static REBOOL Subparse_Throws(
     const RELVAL *rules,
     REBSPC *rules_specifier,
     REBCNT find_flags
-) {
-    DECLARE_FRAME (f);
-
-    SET_END(out);
-
+){
     assert(ANY_ARRAY(rules));
     assert(ANY_SERIES(input));
 
@@ -180,57 +176,67 @@ static REBOOL Subparse_Throws(
         return FALSE;
     }
 
+    DECLARE_FRAME (f);
+
+    SET_END(out);
     f->out = out;
 
-    SET_FRAME_VALUE(f, VAL_ARRAY_AT(rules));
+    f->gotten = END;
+    SET_FRAME_VALUE(f, VAL_ARRAY_AT(rules)); // not an END due to test above
     f->specifier = Derive_Specifier(rules_specifier, rules);
 
+    f->source.vaptr = NULL;
     f->source.array = VAL_ARRAY(rules);
-    f->index = VAL_INDEX(rules) + 1;
+    f->source.index = VAL_INDEX(rules) + 1;
+    f->source.pending = f->value + 1;
 
-    f->pending = NULL;
-    f->gotten = END;
+    Init_Endlike_Header(&f->flags, 0); // implicitly terminate f->cell
+
+    Push_Frame_Core(f); // checks for C stack overflow
+    Push_Function(
+        f,
+        Canon(SYM_SUBPARSE),
+        NAT_FUNC(subparse),
+        UNBOUND
+    );
+
+    f->param = END; // informs infix lookahead
+    f->arg = m_cast(REBVAL*, END);
+    f->refine = NULL;
+    f->special = NULL;
 
 #if defined(NDEBUG)
-    f->args_head = Push_Value_Chunk_Of_Length(2);
+    assert(FUNC_NUM_PARAMS(NAT_FUNC(subparse)) == 2); // elides RETURN:
 #else
-    f->args_head = Push_Value_Chunk_Of_Length(3); // real RETURN: for natives
+    assert(FUNC_NUM_PARAMS(NAT_FUNC(subparse)) == 3); // checks RETURN:
+    Prep_Stack_Cell(&f->args_head[2]);
     Init_Void(&f->args_head[2]);
 #endif
 
-    f->varlist = NULL;
-
+    Prep_Stack_Cell(&f->args_head[0]);
     Derelativize(&f->args_head[0], input, input_specifier);
 
     // We always want "case-sensitivity" on binary bytes, vs. treating as
     // case-insensitive bytes for ASCII characters.
     //
+    Prep_Stack_Cell(&f->args_head[1]);
     Init_Integer(&f->args_head[1], find_flags);
 
-    f->label = Canon(SYM_SUBPARSE);
-    f->eval_type = REB_FUNCTION;
-    f->original = f->phase = NAT_FUNC(subparse);
+    f->varlist = NULL;
 
-    Init_Endlike_Header(&f->flags, 0); // implicitly terminate f->cell
-
-    f->param = END; // informs infix lookahead
-    f->arg = m_cast(REBVAL*, END);
-    f->refine = m_cast(REBVAL*, END);
-    f->special = m_cast(REBVAL*, END);
-
-    Push_Frame_Core(f); // checks for C stack overflow
-
-    SET_END(&f->cell); // GC requires some initialization of cell
-
+    // !!! By calling the subparse native here directly from its C function
+    // vs. going through the evaluator, we don't get the opportunity to do
+    // things like HIJACK it.  Consider code in Apply_Def_Or_Exemplar().
+    //
     REB_R r = N_subparse(f);
-
     assert(NOT_END(out));
 
     // Can't just drop f->data.stackvars because the debugger may have
     // "reified" the frame into a FRAME!, which means it would now be using
     // the f->data.context field.
     //
-    Drop_Function_Args_For_Frame_Core(f, TRUE);
+    const REBOOL drop_chunks = TRUE;
+    Drop_Function_Core(f, drop_chunks);
 
     Drop_Frame_Core(f);
 
@@ -307,7 +313,7 @@ static void Print_Parse_Index(REBFRM *f) {
     // !!! Or does PARSE adjust to ensure it never is past the end, e.g.
     // when seeking a position given in a variable or modifying?
     //
-    if (IS_END(P_RULE)) {
+    if (FRM_AT_END(f)) {
         if (P_POS >= SER_LEN(P_INPUT))
             Debug_Fmt("[]: ** END **");
         else
@@ -379,8 +385,11 @@ static const RELVAL *Get_Parse_Value(
     if (IS_PATH(rule)) {
         //
         // !!! REVIEW: how should GET-PATH! be handled?
+        //
+        // Should PATH!s be evaluating GROUP!s?  This does, but would need
+        // to route potential thrown values up to do it properly.
 
-        if (Do_Path_Throws_Core(cell, NULL, rule, specifier, NULL))
+        if (Get_Path_Throws_Core(cell, rule, specifier))
             fail (Error_No_Catch_For_Throw(cell));
 
         if (IS_VOID(cell))
@@ -1316,7 +1325,7 @@ REBNATIVE(subparse)
     const REBCNT *pos_debug = &P_POS;
     (void)pos_debug; // UNUSED() forces corruption in C++11 debug builds
 
-    REBUPT do_count = TG_Do_Count; // helpful to cache for visibility also
+    REBUPT tick = TG_Tick; // helpful to cache for visibility also
 #endif
 
     DECLARE_LOCAL (save);
@@ -1343,7 +1352,7 @@ REBNATIVE(subparse)
     REBINT mincount = 1; // min pattern count
     REBINT maxcount = 1; // max pattern count
 
-    while (NOT_END(P_RULE)) {
+    while (FRM_HAS_MORE(f)) {
         //
         // The rule in the block of rules can be literal, while the "real
         // rule" we want to process is the result of a variable fetched from
@@ -1365,9 +1374,9 @@ REBNATIVE(subparse)
         UPDATE_EXPRESSION_START(f);
 
     #if !defined(NDEBUG)
-        ++TG_Do_Count;
-        do_count = TG_Do_Count;
-        cast(void, do_count); // suppress compiler warning about lack of use
+        ++TG_Tick;
+        tick = TG_Tick;
+        cast(void, tick); // suppress compiler warning about lack of use
     #endif
 
     //==////////////////////////////////////////////////////////////////==//
@@ -1414,8 +1423,11 @@ REBNATIVE(subparse)
 
             REBSYM cmd = VAL_CMD(P_RULE);
             if (cmd != SYM_0) {
-                if (!IS_WORD(P_RULE))
-                    fail (Error_Parse_Command_Raw(P_RULE)); // COPY: :THRU ...
+                if (NOT(IS_WORD(P_RULE))) { // COPY: :THRU ...
+                    DECLARE_LOCAL (non_word);
+                    Derelativize(non_word, P_RULE, P_RULE_SPECIFIER);
+                    fail (Error_Parse_Command_Raw(non_word));
+                }
 
                 if (cmd <= SYM_BREAK) { // optimization
 
@@ -1446,11 +1458,17 @@ REBNATIVE(subparse)
                     set_or_copy_pre_rule:
                         FETCH_NEXT_RULE_MAYBE_END(f);
 
-                        if (!(IS_WORD(P_RULE) || IS_SET_WORD(P_RULE)))
-                            fail (Error_Parse_Variable_Raw(P_RULE));
+                        if (NOT(IS_WORD(P_RULE) || IS_SET_WORD(P_RULE))) {
+                            DECLARE_LOCAL (bad_var);
+                            Derelativize(bad_var, P_RULE, P_RULE_SPECIFIER);
+                            fail (Error_Parse_Variable_Raw(bad_var));
+                        }
 
-                        if (VAL_CMD(P_RULE))
-                            fail (Error_Parse_Command_Raw(P_RULE));
+                        if (VAL_CMD(P_RULE)) { // set set [...]
+                            DECLARE_LOCAL (keyword);
+                            Derelativize(keyword, P_RULE, P_RULE_SPECIFIER);
+                            fail (Error_Parse_Command_Raw(keyword));
+                        }
 
                         set_or_copy_word = P_RULE;
                         FETCH_NEXT_RULE_MAYBE_END(f);
@@ -1463,7 +1481,8 @@ REBNATIVE(subparse)
                         continue;
 
                     case SYM_AND:
-                        flags |= PF_AND;
+                    case SYM_AHEAD:
+                        flags |= PF_AHEAD;
                         FETCH_NEXT_RULE_MAYBE_END(f);
                         continue;
 
@@ -1531,6 +1550,15 @@ REBNATIVE(subparse)
                         DECLARE_LOCAL (thrown_arg);
                         Init_Integer(thrown_arg, P_POS);
                         Move_Value(P_OUT, NAT_VALUE(parse_accept));
+
+                        // Unfortunately, when the warnings are set all the
+                        // way high for uninitialized variable use, the
+                        // compiler may think this integer's binding will
+                        // be used by the Move_Value() inlined here.  Get
+                        // past that by initializing it.
+                        //
+                        thrown_arg->extra.binding = UNBOUND; // unused by ints
+
                         CONVERT_NAME_TO_THROWN(P_OUT, thrown_arg);
                         return R_OUT_IS_THROWN;
                     }
@@ -1551,7 +1579,7 @@ REBNATIVE(subparse)
 
                     case SYM_IF: {
                         FETCH_NEXT_RULE_MAYBE_END(f);
-                        if (IS_END(P_RULE))
+                        if (FRM_AT_END(f))
                             fail (Error_Parse_End());
 
                         if (!IS_GROUP(P_RULE))
@@ -1571,7 +1599,7 @@ REBNATIVE(subparse)
 
                         FETCH_NEXT_RULE_MAYBE_END(f);
 
-                        if (IS_CONDITIONAL_TRUE(condition))
+                        if (IS_TRUTHY(condition))
                             continue;
 
                         P_POS = NOT_FOUND;
@@ -1618,8 +1646,11 @@ REBNATIVE(subparse)
                 if (IS_GET_WORD(P_RULE)) {
                     DECLARE_LOCAL (temp);
                     Copy_Opt_Var_May_Fail(temp, P_RULE, P_RULE_SPECIFIER);
-                    if (!ANY_SERIES(temp)) // #1263
-                        fail (Error_Parse_Series_Raw(P_RULE));
+                    if (!ANY_SERIES(temp)) { // #1263
+                        DECLARE_LOCAL (non_series);
+                        Derelativize(non_series, P_RULE, P_RULE_SPECIFIER);
+                        fail (Error_Parse_Series_Raw(non_series));
+                    }
                     Set_Parse_Series(f, temp);
 
                     // !!! `continue` is used here without any post-"match"
@@ -1656,17 +1687,21 @@ REBNATIVE(subparse)
         }
         else if (ANY_PATH(P_RULE)) {
             if (IS_PATH(P_RULE)) {
-                if (Do_Path_Throws_Core(
-                    save, NULL, P_RULE, P_RULE_SPECIFIER, NULL
-                )) {
+                //
+                // !!! This evaluates GROUP!s.  Should it?
+                //
+                if (Get_Path_Throws_Core(save, P_RULE, P_RULE_SPECIFIER))
                     fail (Error_No_Catch_For_Throw(save));
-                }
+
                 rule = save;
             }
             else if (IS_SET_PATH(P_RULE)) {
-                if (Do_Path_Throws_Core(
-                    save, NULL, P_RULE, P_RULE_SPECIFIER, P_INPUT_VALUE
-                )) {
+                //
+                // !!! This evaluates GROUP!s.  Should it?
+                //
+                if (Set_Path_Throws_Core(
+                    save, P_RULE, P_RULE_SPECIFIER, P_INPUT_VALUE
+                )){
                     fail (Error_No_Catch_For_Throw(save));
                 }
 
@@ -1677,18 +1712,17 @@ REBNATIVE(subparse)
                 continue;
             }
             else if (IS_GET_PATH(P_RULE)) {
-
-                if (Do_Path_Throws_Core(
-                    save, NULL, P_RULE, P_RULE_SPECIFIER, NULL
-                )) {
+                //
+                // !!! This evaluates GROUP!s.  Should it?
+                //
+                if (Get_Path_Throws_Core(save, P_RULE, P_RULE_SPECIFIER))
                     fail (Error_No_Catch_For_Throw(save));
-                }
 
                 // !!! This allows the series to be changed, as per #1263,
                 // but note the positions being returned and checked aren't
                 // prepared for this, they only exchange numbers ATM (!!!)
                 //
-                if (!ANY_SERIES(save))
+                if (NOT(ANY_SERIES(save)))
                     fail (Error_Parse_Series_Raw(save));
 
                 Set_Parse_Series(f, save);
@@ -1736,7 +1770,7 @@ REBNATIVE(subparse)
             mincount = maxcount = Int32s(const_KNOWN(rule), 0);
 
             FETCH_NEXT_RULE_MAYBE_END(f);
-            if (IS_END(P_RULE))
+            if (FRM_AT_END(f))
                 fail (Error_Parse_End());
 
             rule = Get_Parse_Value(save, P_RULE, P_RULE_SPECIFIER);
@@ -1745,7 +1779,7 @@ REBNATIVE(subparse)
                 maxcount = Int32s(const_KNOWN(rule), 0);
 
                 FETCH_NEXT_RULE_MAYBE_END(f);
-                if (IS_END(P_RULE))
+                if (FRM_AT_END(f))
                     fail (Error_Parse_End());
 
                 rule = Get_Parse_Value(save, P_RULE, P_RULE_SPECIFIER);
@@ -1796,7 +1830,7 @@ REBNATIVE(subparse)
 
                 case SYM_TO:
                 case SYM_THRU: {
-                    if (IS_END(P_RULE))
+                    if (FRM_AT_END(f))
                         fail (Error_Parse_End());
 
                     if (!subrule) { // capture only on iteration #1
@@ -1818,7 +1852,7 @@ REBNATIVE(subparse)
                     if (NOT_SER_FLAG(P_INPUT, SERIES_FLAG_ARRAY))
                         fail (Error_Parse_Rule()); // see #2253
 
-                    if (IS_END(P_RULE))
+                    if (FRM_AT_END(f))
                         fail (Error_Parse_End());
 
                     if (!subrule) { // capture only on iteration #1
@@ -1838,7 +1872,7 @@ REBNATIVE(subparse)
                 }
 
                 case SYM_INTO: {
-                    if (IS_END(P_RULE))
+                    if (FRM_AT_END(f))
                         fail (Error_Parse_End());
 
                     if (!subrule) {
@@ -1849,6 +1883,12 @@ REBNATIVE(subparse)
                     }
 
                     if (!IS_BLOCK(subrule))
+                        fail (Error_Parse_Rule());
+
+                    // parse ["aa"] [into ["a" "a"]] ; is legal
+                    // parse "aa" [into ["a" "a"]] ; is not...already "into"
+                    //
+                    if (NOT_SER_FLAG(P_INPUT, SERIES_FLAG_ARRAY))
                         fail (Error_Parse_Rule());
 
                     RELVAL *into = ARR_AT(ARR(P_INPUT), P_POS);
@@ -2023,7 +2063,7 @@ REBNATIVE(subparse)
             if (P_POS == NOT_FOUND) {
                 if (flags & PF_THEN) {
                     FETCH_TO_BAR_MAYBE_END(f);
-                    if (NOT_END(P_RULE))
+                    if (FRM_HAS_MORE(f))
                         FETCH_NEXT_RULE_MAYBE_END(f);
                 }
             }
@@ -2113,7 +2153,7 @@ REBNATIVE(subparse)
                     count = (flags & PF_INSERT) ? 0 : count;
                     REBCNT mod_flags = (flags & PF_INSERT) ? 0 : AM_PART;
 
-                    if (IS_END(P_RULE))
+                    if (FRM_AT_END(f))
                         fail (Error_Parse_End());
 
                     if (IS_WORD(P_RULE)) { // check for ONLY flag
@@ -2122,7 +2162,7 @@ REBNATIVE(subparse)
                         case SYM_ONLY:
                             mod_flags |= AM_ONLY;
                             FETCH_NEXT_RULE_MAYBE_END(f);
-                            if (IS_END(P_RULE))
+                            if (FRM_AT_END(f))
                                 fail (Error_Parse_End());
                             break;
 
@@ -2137,6 +2177,27 @@ REBNATIVE(subparse)
                     // new value...comment said "CHECK FOR QUOTE!!"
                     rule = Get_Parse_Value(save, P_RULE, P_RULE_SPECIFIER);
                     FETCH_NEXT_RULE_MAYBE_END(f);
+
+                    // If a GROUP!, then execute it first.  See #1279
+                    //
+                    DECLARE_LOCAL (evaluated);
+                    if (IS_GROUP(rule)) {
+                        REBSPC *derived = Derive_Specifier(
+                            P_RULE_SPECIFIER,
+                            rule
+                        );
+                        if (Do_At_Throws(
+                            evaluated,
+                            VAL_ARRAY(rule),
+                            VAL_INDEX(rule),
+                            derived
+                        )) {
+                            Move_Value(P_OUT, evaluated);
+                            return R_OUT_IS_THROWN;
+                        }
+
+                        rule = evaluated;
+                    }
 
                     if (GET_SER_FLAG(P_INPUT, SERIES_FLAG_ARRAY)) {
                         DECLARE_LOCAL (specified);
@@ -2177,7 +2238,8 @@ REBNATIVE(subparse)
                     }
                 }
 
-                if (flags & PF_AND) P_POS = begin;
+                if (flags & PF_AHEAD)
+                    P_POS = begin;
             }
 
             flags = 0;
@@ -2190,7 +2252,7 @@ REBNATIVE(subparse)
             // options later in the block to consider separated by |.
 
             FETCH_TO_BAR_MAYBE_END(f);
-            if (IS_END(P_RULE)) { // no alternate rule
+            if (FRM_AT_END(f)) { // no alternate rule
                 Init_Blank(P_OUT);
                 return R_OUT;
             }

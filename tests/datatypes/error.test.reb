@@ -1,10 +1,10 @@
 ; datatypes/error.r
 [error? try [1 / 0]]
 [not error? 1]
-[error! = type-of try [1 / 0]]
+[error! = type of try [1 / 0]]
 
 ; error evaluation
-[error? do head insert copy [] try [1 / 0]]
+[error? do head of insert copy [] try [1 / 0]]
 
 ; error that does not exist in the SCRIPT category--all of whose ids are
 ; reserved by the system and must be formed from mezzanine/user code in
@@ -16,7 +16,7 @@
 ;
 [a: 1 error? try [a: 1 / 0] :a =? 1]
 [a: 1 error? try [set 'a 1 / 0] :a =? 1]
-[a: 1 error? try [set/opt 'a 1 / 0] :a =? 1]
+[a: 1 error? try [set/only 'a 1 / 0] :a =? 1]
 
 ; bug#2190
 [127 = catch/quit [attempt [catch/quit [1 / 0]] quit/with 127]]
@@ -55,9 +55,8 @@
 [error? make error! [type: 'script id: 'no-refine]]
 [error? make error! [type: 'script id: 'bad-refines]]
 [error? make error! [type: 'script id: 'bad-refine]]
-[error? make error! [type: 'script id: 'invalid-path]]
-[error? make error! [type: 'script id: 'bad-path-type]]
-[error? make error! [type: 'script id: 'bad-path-set]]
+[error? make error! [type: 'script id: 'bad-path-pick]]
+[error? make error! [type: 'script id: 'bad-path-poke]]
 [error? make error! [type: 'script id: 'bad-field-set]]
 [error? make error! [type: 'script id: 'dup-vars]]
 [error? make error! [type: 'script id: 'past-end]]
@@ -124,7 +123,6 @@
 [error? make error! [type: 'access id: 'no-extension]]
 [error? make error! [type: 'access id: 'bad-extension]]
 [error? make error! [type: 'access id: 'extension-init]]
-[error? make error! [type: 'access id: 'call-fail]]
 
 [error? make error! [type: 'user id: 'message]]
 

@@ -134,7 +134,7 @@ void Convert_Date(REBVAL *out, time_t *stime, long usec)
 
     int zone = Get_Timezone(&utc_tm);
 
-    RL_Init_Date(
+    rebInitDate(
         out,
         utc_tm.tm_year + 1900, // year
         utc_tm.tm_mon + 1, // month
@@ -181,10 +181,8 @@ void OS_Get_Time(REBVAL *out)
 // provide a precise time sampling method. So, if the target
 // posix OS does, add the ifdef code in here.
 //
-i64 OS_Delta_Time(i64 base, int flags)
+i64 OS_Delta_Time(i64 base)
 {
-    UNUSED(flags);
-
     struct timeval tv;
     gettimeofday(&tv,0);
 

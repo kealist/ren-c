@@ -8,25 +8,27 @@ REBOL [
         See: http://www.apache.org/licenses/LICENSE-2.0
     }
     Author: "Brett Handley"
-    Purpose: {Process Rebol C source.}
+    Purpose: {Process the source of Rebol.}
 ]
 
-ren-c-repo: any [
-    if exists? %../src/tools/ [%../]
-    if exists? %../ren-c/src/tools/ [%../ren-c/]
-]
+; Root folder of the repository.
+; This script makes some assumptions about the structure of the repo.
+;
 
-ren-c-repo: clean-path ren-c-repo
+ren-c-repo: clean-path %../
 
-do ren-c-repo/src/tools/common.r
-do ren-c-repo/src/tools/common-parsers.r
+do ren-c-repo/make/common.r
+do ren-c-repo/make/common-parsers.r
 do %lib/text-lines.reb
+do %read-deep.reb
 
+; rebsource is organised along the lines of a context sensitive vocabulary.
+;
 
 rebsource: context [
 
-    src-folder: clean-path ren-c-repo/(%src/)
-    ; Path to src/
+    src-folder: clean-path ren-c-repo
+    ; Path to rebol source files.
 
     logfn: func [message][print mold new-line/all compose/only message false]
     log: :logfn
@@ -48,13 +50,11 @@ rebsource: context [
         function-spacing: [3 eol]
     ]
 
-    fixed-source-paths: [
-        %core/
-        %os/
-        %os/generic/
-        %os/linux/
-        %os/posix/
-        %os/windows/
+    ; Source paths are recursively read.
+    ;
+    source-paths: [
+        %src/
+        %tests/
     ]
 
     extensions: [
@@ -64,14 +64,14 @@ rebsource: context [
     ]
 
     whitelisted: [
-        %core/u-bmp.c
-        %core/u-compress.c
-        %core/u-gif.c
-        %core/u-jpg.c
-        %core/u-md5.c
-        %core/u-png.c
-        %core/u-sha1.c
-        %core/u-zlib.c
+        %src/core/u-bmp.c
+        %src/core/u-compress.c
+        %src/core/u-gif.c
+        %src/core/u-jpg.c
+        %src/core/u-md5.c
+        %src/core/u-png.c
+        %src/core/u-sha1.c
+        %src/core/u-zlib.c
     ] ; Not analysed ...
 
 
@@ -132,7 +132,9 @@ rebsource: context [
                 malloc-found: make block! []
 
                 malloc-check: [
-                    and identifier "malloc" (append malloc-found line-of head position position)
+                    and identifier "malloc" (
+                        append malloc-found line-from-pos head of position position
+                    )
                 ]
 
                 parse/case data [
@@ -155,10 +157,7 @@ rebsource: context [
                 ]
 
                 emit-proto: procedure [proto] [
-                    if all [
-                        'format2015 = proto-parser/style
-                        block? proto-parser/data
-                    ] [
+                    if block? proto-parser/data [
                         do bind [
                             if last-func-end [
                                 if not all [
@@ -169,11 +168,11 @@ rebsource: context [
                                     ]
                                     same? position proto-parser/parse.position
                                 ] [
-                                    line: line-of data proto-parser/parse.position
+                                    line: line-from-pos data proto-parser/parse.position
                                     append any [
                                         non-std-func-space
                                         set 'non-std-func-space copy []
-                                    ] line-of data proto-parser/parse.position
+                                    ] line-from-pos data proto-parser/parse.position
                                 ]
                             ]
                         ] c-parser-extension
@@ -204,7 +203,7 @@ rebsource: context [
                                 proto-parser/proto.id
                                 form to word! proto-parser/data/1
                             ) [
-                                line: line-of data proto-parser/parse.position
+                                line: line-from-pos data proto-parser/parse.position
                                 emit analysis [
                                     id-mismatch
                                     (mold proto-parser/data/1) (file) (line)
@@ -264,7 +263,7 @@ rebsource: context [
 
             either all [
                 position: find data #{0a}
-                1 < index-of position
+                1 < index of position
                 13 = first back position
             ] [
                 set [line-ending alt-ending] reduce [crlf newline]
@@ -274,7 +273,7 @@ rebsource: context [
 
             count-line: [
                 (
-                    line-len: subtract index-of position index-of bol 
+                    line-len: subtract index of position index of bol 
                     if line-len > standard/std-line-length [
                         append over-std-len line
                         if line-len > standard/max-line-length [
@@ -303,7 +302,7 @@ rebsource: context [
                     position:
                     [
                         eol count-line
-                        | #"^-" (append 'tabbed line)
+                        | #"^-" (append tabbed line)
                         | wsp and [line-ending | alt-ending] (append eol-wsp line)
                         | skip
                     ]
@@ -327,7 +326,7 @@ rebsource: context [
                 ]
             ]
 
-            foreach list [tabbed eol-wsp] [
+            for-each list [tabbed eol-wsp] [
                 if not empty? get list [
                     emit analysis [(list) (file) (get list)]
                 ]
@@ -340,8 +339,12 @@ rebsource: context [
             if all [
                 not tail? data
                 not equal? 10 last data ; Check for newline.
-            ] [
-                emit analysis [eof-eol-missing (file) (reduce [line-of data tail data])]
+            ][
+                emit analysis [
+                    eof-eol-missing (file) (
+                        reduce [line-from-pos data tail of data]
+                    )
+                ]
             ]
 
             analysis
@@ -353,22 +356,37 @@ rebsource: context [
         source-files: function [
             {Retrieves a list of source files (relative paths).}
         ][
-            if not src-folder [fail {Configuration required.}]
+            if not src-folder [fail {Configuration of src-folder required.}]
 
-            files: make block! 1 + (2 * length-of fixed-source-paths)
-
-            for-each path fixed-source-paths [
-                for-each file read join-of src-folder path [
-                    if find extensions extension-of file [
-                        append files join-of path file
-                    ]
-                ]
-            ]
+            files: read-deep/full/strategy source-paths :source-files-seq
 
             sort files
             new-line/all files true
 
             files
+        ]
+
+        source-files-seq: function [
+            {Take next file from a sequence that is represented by a queue.}
+            return: [<opt> file!]
+            queue [block!]
+        ][
+            item: take queue
+
+            if equal? #"/" last item [
+                contents: read join-of src-folder item
+                insert queue map-each x contents [join-of item x]
+                unset 'item
+            ] else [
+                if any [
+                    parse second split-path item ["tmp-" to end]
+                    not find? extensions extension-of item
+                ][
+                    unset 'item
+                ]
+            ]
+
+            :item ; Voided items are to be filtered out.
         ]
     ]
 
@@ -388,7 +406,7 @@ rebsource: context [
 
         grammar/function-body: braced
 
-        append grammar/format2015-func-section [
+        append grammar/format-func-section [
             last-func-end:
             any [nl | eol | wsp]
         ]
@@ -400,7 +418,7 @@ rebsource: context [
     ] proto-parser c.lexical/grammar
 
     emit: function [log body] [
-        insert position: tail log new-line/all compose/only body false
+        insert position: tail of log new-line/all compose/only body false
         new-line position true
     ]
 

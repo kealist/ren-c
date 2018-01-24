@@ -29,9 +29,11 @@
 [if #{00} [true]]
 ; bitset
 [if make bitset! "" [true]]
+
 ; literal blocks illegal as condition in Ren-C, but evaluation products ok
 [error? trap [if [] [true]]]
-[if ([]) [true]]
+[if identity [] [true]]
+
 ; datatype
 [if blank! [true]]
 ; typeset
@@ -59,7 +61,7 @@
 [if true [true]]
 [void? if false [true]]
 [if $1 [true]]
-[if :type-of [true]]
+[if (specialize 'of [property: 'type]) [true]]
 [void? if blank [true]]
 [if make object! [] [true]]
 [if get '+ [true]]

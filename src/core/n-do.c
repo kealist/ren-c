@@ -47,6 +47,8 @@
 //
 //      value [<opt> any-value!]
 //          {BLOCK! passes-thru, FUNCTION! runs, SET-WORD! assigns...}
+//      expressions [<opt> any-value! <...>]
+//          {Depending on VALUE, more expressions may be consumed}
 //      /only
 //          {Suppress evaluation on any ensuing arguments value consumes}
 //  ]
@@ -55,32 +57,130 @@ REBNATIVE(eval)
 {
     INCLUDE_PARAMS_OF_EVAL;
 
-    REBFRM *f = frame_; // implicit parameter to every dispatcher/native
+    UNUSED(ARG(expressions)); // EVAL only *acts* variadic, uses R_REEVALUATE
 
-    Move_Value(&f->cell, ARG(value));
-
-    // Save the prefetched f->value for what would be the usual next
-    // item (including if it was an END marker) into f->pending.
-    // Then make f->value the address of the eval result.
+    // The REEVALUATE instructions explicitly understand that the value to
+    // do reevaluation of is held in the frame's f->cell.  (It would be unsafe
+    // to evaluate something held in f->out.)
     //
-    // Since the evaluation result is a REBVAL and not a RELVAL, it
-    // is specific.  This means the `f->specifier` (which can only
-    // specify values from the source array) won't ever be applied
-    // to it, since it only comes into play for IS_RELATIVE values.
-    //
-    f->pending = f->value;
-    SET_FRAME_VALUE(f, &f->cell); // SPECIFIED
-    f->eval_type = VAL_TYPE(f->value);
+    Move_Value(D_CELL, ARG(value));
 
-    // The f->gotten (if any) was the fetch for the f->value we just
-    // put in pending...not the f->value we just set.  Not only is
-    // it more expensive to hold onto that cache than to lose it,
-    // but an eval can do anything...so the f->gotten might wind
-    // up being completely different after the eval.  So forget it.
-    //
-    f->gotten = END;
+    if (REF(only)) {
+        //
+        // We're going to tell the evaluator to switch into a "non-evaluating"
+        // mode.  But we still want the eval cell itself to be treated
+        // evaluatively despite that.  So flip its special evaluator bit.
+        //
+        SET_VAL_FLAG(D_CELL, VALUE_FLAG_EVAL_FLIP);
+        return R_REEVALUATE_CELL_ONLY;
+    }
 
-    return REF(only) ? R_REEVALUATE_ONLY : R_REEVALUATE;
+    return R_REEVALUATE_CELL;
+}
+
+
+//
+//  Do_Or_Dont_Shared_Throws: C
+//
+REBOOL Do_Or_Dont_Shared_Throws(
+    REBVAL *out,
+    const REBVAL *source,
+    REBFLGS flags,
+    const REBVAL *var
+){
+    DECLARE_LOCAL (temp);
+
+    REBVAL *position;
+    if (IS_VARARGS(source)) {
+        if (Is_Block_Style_Varargs(&position, source)) {
+            //
+            // We can execute the array, but we must "consume" elements out
+            // of it (e.g. advance the index shared across all instances)
+            // This is done by the REB_BLOCK case, which we jump to.
+            //
+            // !!! If any VARARGS! op does not honor the "locked" flag on the
+            // array during execution, there will be problems if it is TAKE'n
+            // or DO'd while this operation is in progress.
+            //
+            goto do_and_update_position;
+        }
+
+        REBFRM *f;
+        if (NOT(Is_Frame_Style_Varargs_May_Fail(&f, source)))
+            panic(source); // Frame is the only other type
+
+        // Pretty much by definition, we are in the middle of a function call
+        // in the frame the varargs came from.  It's still on the stack, and
+        // we don't want to disrupt its state.  Use a subframe.
+        //
+        if (FRM_AT_END(f))
+            Init_Void(out);
+        else if (Do_Next_In_Subframe_Throws(out, f, flags))
+            return TRUE;
+
+        // The variable passed in /NEXT is just set to the vararg itself,
+        // which has its positioning updated automatically by virtue of the
+        // evaluation performing a "consumption" of VARARGS! content.
+        //
+        if (NOT(IS_BLANK(var)))
+            Move_Value(Sink_Var_May_Fail(var, SPECIFIED), source);
+
+        return FALSE;
+    }
+    else {
+        Move_Value(temp, source);
+        position = temp;
+    }
+
+do_and_update_position:
+    assert(IS_BLOCK(position) || IS_GROUP(position));
+
+    REBIXO indexor = Do_Array_At_Core(
+        out,
+        NULL, // no opt_head, start with value at array index
+        VAL_ARRAY(position),
+        VAL_INDEX(position),
+        VAL_SPECIFIER(position),
+        flags // may have FRAME_FLAG_NEUTRAL or FRAME_FLAG_TO_END set
+    );
+
+    if (indexor == THROWN_FLAG) {
+        //
+        // !!! The relationship between throwing and erroring and VARARGS!
+        // is not totally clear when they originate from a BLOCK!, because
+        // the block isn't tied to any frame lifetime.  But a FRAME!-based
+        // varargs can't be used after a throw or error, so they probably
+        // shouldn't be usable either.
+        //
+        Init_Unreadable_Blank(position);
+        return TRUE;
+    }
+
+    // "continuation" of block...turn END_FLAG into the end so it can test
+    // TAIL? as true to know the evaluation finished.
+    //
+    // !!! Is there merit to setting to BLANK! instead?  Easier to test
+    // and similar to FIND.  On the downside, "lossy" in that after the
+    // DOs are finished the var can't be used to recover the series again,
+    // you'd have to save it.
+    //
+    // Note: While `source` is a local by default, if we jump here via
+    // `goto do_block_source`, it will be a singular array inside a varargs,
+    // whose position being updated after evaluation is important.
+    //
+    if (indexor == END_FLAG)
+        VAL_INDEX(position) = VAL_LEN_HEAD(position);
+    else
+        VAL_INDEX(position) = cast(REBCNT, indexor) - 1; // one past
+
+    if (NOT(IS_BLANK(var))) {
+        if (IS_VARARGS(source))
+            Move_Value(Sink_Var_May_Fail(var, SPECIFIED), source); // VARARGS!
+        else
+            Move_Value(Sink_Var_May_Fail(var, SPECIFIED), position); // BLOCK!
+    }
+
+    return FALSE;
 }
 
 
@@ -94,6 +194,7 @@ REBNATIVE(eval)
 //          <opt> ;-- should DO accept an optional argument (chaining?)
 //          blank! ;-- same question... necessary, or not?
 //          block! ;-- source code in block form
+//          group! ;-- same as block (or should it have some other nuance?)
 //          string! ;-- source code in text form
 //          binary! ;-- treated as UTF-8
 //          url! ;-- load code from URL via protocol
@@ -102,6 +203,7 @@ REBNATIVE(eval)
 //          error! ;-- should use FAIL instead
 //          function! ;-- will only run arity 0 functions (avoids DO variadic)
 //          frame! ;-- acts like APPLY (voids are optionals, not unspecialized)
+//          varargs! ;-- simulates as if frame! or block! is being executed
 //      ]
 //      /args
 //          {If value is a script, this will set its system/script/args}
@@ -130,58 +232,17 @@ REBNATIVE(do)
         // useful for `do all ...` types of scenarios
         return R_BLANK;
 
+    case REB_VARARGS:
     case REB_BLOCK:
     case REB_GROUP:
-        if (REF(next)) {
-            REBIXO indexor = DO_NEXT_MAY_THROW(
-                D_OUT,
-                VAL_ARRAY(source),
-                VAL_INDEX(source),
-                VAL_SPECIFIER(source)
-            );
-
-            if (indexor == THROWN_FLAG) {
-                //
-                // the throw should make the value irrelevant, but if caught
-                // then have it indicate the start of the thrown expression
-                //
-                if (!IS_BLANK(ARG(var))) {
-                    Move_Value(
-                        Sink_Var_May_Fail(ARG(var), SPECIFIED),
-                        source
-                    );
-                }
-
-                return R_OUT_IS_THROWN;
-            }
-
-            if (!IS_BLANK(ARG(var))) {
-                //
-                // "continuation" of block...turn END_FLAG into the end so it
-                // can test TAIL? as true to know the evaluation finished.
-                //
-                // !!! Is there merit to setting to NONE! instead?  Easier to
-                // test and similar to FIND.  On the downside, "lossy" in
-                // that after the DOs are finished the var can't be used to
-                // recover the series again...you'd have to save it.
-                //
-                if (indexor == END_FLAG)
-                    VAL_INDEX(source) = VAL_LEN_HEAD(source);
-                else
-                    VAL_INDEX(source) = cast(REBCNT, indexor);
-
-                Move_Value(
-                    Sink_Var_May_Fail(ARG(var), SPECIFIED),
-                    ARG(source)
-                );
-            }
-
-            return R_OUT;
-        }
-
-        if (Do_Any_Array_At_Throws(D_OUT, source))
+        if (Do_Or_Dont_Shared_Throws(
+            D_OUT,
+            source,
+            REF(next) ? DO_FLAG_NORMAL : DO_FLAG_TO_END,
+            REF(next) ? ARG(var) : BLANK_VALUE
+        )){
             return R_OUT_IS_THROWN;
-
+        }
         return R_OUT;
 
     case REB_BINARY:
@@ -204,7 +265,7 @@ REBNATIVE(do)
             REF(next) ? ARG(var) : BLANK_VALUE, // can't put void in block
             REF(only) ? TRUE_VALUE : FALSE_VALUE,
             END
-        )) {
+        )){
             return R_OUT_IS_THROWN;
         }
         return R_OUT; }
@@ -229,7 +290,7 @@ REBNATIVE(do)
         while (
             NOT_END(param)
             && (VAL_PARAM_CLASS(param) == PARAM_CLASS_LOCAL)
-        ) {
+        ){
             ++param;
         }
         if (NOT_END(param))
@@ -237,44 +298,28 @@ REBNATIVE(do)
 
         if (Eval_Value_Throws(D_OUT, source))
             return R_OUT_IS_THROWN;
-        return R_OUT;
-    }
+        return R_OUT; }
 
     case REB_FRAME: {
         REBCTX *c = VAL_CONTEXT(source);
 
-        // To allow efficient applications, this does not make a copy of the
-        // FRAME!.  This means the frame must not be currently running
-        // on the stack.
-        //
-        // !!! It may come to pass that a trick lets you reuse a stack context
-        // and unwind it as a kind of tail recursion to reuse it.  But one would
-        // not want that strange voodoo to be what DO does on a FRAME!,
-        // it would have to be another operation (REDO ?)
-        //
-        if (CTX_FRAME_IF_ON_STACK(c) != NULL)
-            fail (Error_Do_Running_Frame_Raw());
-
-        // Right now all stack based contexts are either running (stopped by
-        // the above) or expired (in which case their values are unavailable).
-        //
-        if (CTX_VARS_UNAVAILABLE(c))
+        if (CTX_VARS_UNAVAILABLE(c)) // frame already ran, no data left
             fail (Error_Do_Expired_Frame_Raw());
 
-        DECLARE_FRAME (f);
-
-        // Apply_Frame_Core sets up most of the Reb_Frame, but expects these
-        // arguments to be filled in.
+        // See REBNATIVE(redo) for how tail-call recursion works.
         //
-        f->out = D_OUT;
-        f->gotten = CTX_FRAME_FUNC_VALUE(VAL_CONTEXT(source));
-        f->original = f->phase = VAL_FUNC(f->gotten);
-        f->binding = VAL_BINDING(source);
+        REBFRM *f = CTX_FRAME_IF_ON_STACK(c);
+        if (f != NULL)
+            fail ("Use REDO to restart a running FRAME! (not DO)");
 
-        f->varlist = CTX_VARLIST(VAL_CONTEXT(source)); // need w/NULL def
-        SER(f->varlist)->misc.f = f;
-
-        return Apply_Frame_Core(f, Canon(SYM___ANONYMOUS__), NULL); }
+        REBSTR *opt_label = NULL; // no label available
+        return Apply_Def_Or_Exemplar(
+            D_OUT,
+            source->payload.any_context.phase,
+            VAL_BINDING(source),
+            opt_label,
+            NOD(VAL_CONTEXT(source))
+        ); }
 
     default:
         break;
@@ -286,6 +331,138 @@ REBNATIVE(do)
     // functions only, EVAL generalizes it.
     //
     fail (Error_Use_Eval_For_Eval_Raw());
+}
+
+
+//
+//  don't: native [
+//
+//  {Experimental function for skipping over a DO unit of code w/o evaluation}
+//
+//      return: [logic!]
+//          {If true, it was possible to determine the arity and skip it}
+//      source [block! varargs!]
+//          {The value to attempt to skip content out of}
+//      /next
+//          {Don't do next expression only, update block variable}
+//      var [any-word! blank!]
+//          "If not blank, then a variable updated with new block position"
+//  ]
+//
+REBNATIVE(dont)
+//
+// !!! This experimental code exploits DO_FLAG_NEUTRAL, which attempts to run
+// through the same code path as DO (e.g. Do_Core()) but disable any actual
+// side effects.
+//
+// Anytime an actual side-effect is required in order to figure out where an
+// expression would end (variadic functions, GROUP! evaluation in a PATH!) the
+// evaluator will throw to abort the scan.
+{
+    INCLUDE_PARAMS_OF_DONT;
+
+    REBVAL *source = ARG(source);
+
+    if (Do_Or_Dont_Shared_Throws(
+        D_CELL,
+        source,
+        DO_FLAG_NEUTRAL | (REF(next) ? DO_FLAG_NORMAL : DO_FLAG_TO_END),
+        REF(next) ? ARG(var) : BLANK_VALUE
+    )){
+        CATCH_THROWN(D_OUT, D_CELL);
+        assert(IS_BLANK(D_CELL)); // "throw name" (current invariant)
+        assert(IS_BAR(D_OUT)); // "thrown value" (current invariant)
+        return R_FALSE;
+    }
+
+    return R_TRUE;
+}
+
+
+//
+//  redo: native [
+//
+//  {Restart the function of a FRAME! from the top with its current state}
+//
+//      return: [<opt>]
+//          {Does not return at all (either errors or restarts).}
+//      restartee [frame! any-word!]
+//          {FRAME! to restart, or WORD! bound to FRAME! (e.g. REDO 'RETURN)}
+//      /other
+//          {Restart in a frame-compatible function ("Sibling Tail-Call")}
+//      sibling [function!]
+//          {A FUNCTION! derived from the same underlying FRAME! as restartee}
+//  ]
+//
+REBNATIVE(redo)
+//
+// This can be used to implement tail-call recursion:
+//
+// https://en.wikipedia.org/wiki/Tail_call
+//
+{
+    INCLUDE_PARAMS_OF_REDO;
+
+    REBVAL *restartee = ARG(restartee);
+    if (NOT(IS_FRAME(restartee))) {
+        if (NOT(Get_Context_Of(D_OUT, restartee)))
+            fail ("No context found from restartee in REDO");
+
+        if (NOT(IS_FRAME(D_OUT)))
+            fail ("Context of restartee in REDO is not a FRAME!");
+
+        Move_Value(restartee, D_OUT);
+    }
+
+    REBCTX *c = VAL_CONTEXT(restartee);
+
+    if (CTX_VARS_UNAVAILABLE(c)) // frame already ran, no data left
+        fail (Error_Do_Expired_Frame_Raw());
+
+    REBFRM *f = CTX_FRAME_IF_ON_STACK(c);
+    if (f == NULL)
+        fail ("Use DO to start a not-currently running FRAME! (not REDO)");
+
+    // If we were given a sibling to restart, make sure it is frame compatible
+    // (e.g. the product of ADAPT-ing, CHAIN-ing, ENCLOSE-ing, HIJACK-ing a
+    // common underlying function).
+    //
+    // !!! It is possible for functions to be frame-compatible even if they
+    // don't come from the same heritage (e.g. two functions that take an
+    // INTEGER! and have 2 locals).  Such compatibility may seem random to
+    // users--e.g. not understanding why a function with 3 locals is not
+    // compatible with one that has 2, and the test would be more expensive
+    // than the established check for a common "ancestor".
+    //
+    if (REF(other)) {
+        REBVAL *sibling = ARG(sibling);
+        if (FRM_UNDERLYING(f) != FUNC_UNDERLYING(VAL_FUNC(sibling)))
+            fail ("/OTHER function passed to REDO has incompatible FRAME!");
+
+        restartee->payload.any_context.phase = VAL_FUNC(sibling);
+        INIT_BINDING(restartee, VAL_BINDING(sibling));
+    }
+
+    // Phase needs to always be initialized in FRAME! values.
+    //
+    assert(
+        SER(FUNC_PARAMLIST(restartee->payload.any_context.phase))->header.bits
+        & ARRAY_FLAG_PARAMLIST
+    );
+
+    // We need to cooperatively throw a restart instruction up to the level
+    // of the frame.  Use REDO as the label of the throw that Do_Core() will
+    // identify for that behavior.
+    //
+    Move_Value(D_OUT, NAT_VALUE(redo));
+    INIT_BINDING(D_OUT, c);
+
+    // The FRAME! contains its ->phase and ->binding, which should be enough
+    // to restart the phase at the point of parameter checking.  Make that
+    // the actual value that Do_Core() catches.
+    //
+    CONVERT_NAME_TO_THROWN(D_OUT, restartee);
+    return R_OUT_IS_THROWN;
 }
 
 
@@ -354,12 +531,12 @@ repush:
             fail (Error_Multiple_Do_Errors_Raw(arg1, arg2));
         }
 
-        f->eval_type = REB_0; // invariant of Do_Next_In_Frame
+        Recover_Frame(f); // Frames otherwise not ready to use after a FAIL
 
         assert(IS_END(thrown_name));
         Init_Error(arg_or_error, error);
 
-        while (NOT_END(f->value) && NOT(IS_BAR(f->value)))
+        while (FRM_HAS_MORE(f) && NOT(IS_BAR(f->value)))
             Fetch_Next_In_Frame(f);
 
         goto repush;
@@ -367,7 +544,7 @@ repush:
 
     Init_Void(D_OUT); // default return result of DO-ALL []
 
-    while (NOT_END(f->value)) {
+    while (FRM_HAS_MORE(f)) {
         if (IS_BAR(f->value)) {
             //
             // BAR! is handled explicitly, because you might have f->value as
@@ -415,7 +592,7 @@ repush:
             CATCH_THROWN(arg_or_error, D_OUT);
             Move_Value(thrown_name, D_OUT); // THROWN cleared by CATCH_THROWN
 
-            while (NOT_END(f->value) && NOT(IS_BAR(f->value)))
+            while (FRM_HAS_MORE(f) && NOT(IS_BAR(f->value)))
                 Fetch_Next_In_Frame(f);
         }
     }
@@ -449,7 +626,7 @@ repush:
 //  {Invoke a function with all required arguments specified.}
 //
 //      return: [<opt> any-value!]
-//      value [function! any-word! any-path!]
+//      applicand [function! any-word! any-path!]
 //          {Function or specifying word (preserves word name for debug info)}
 //      def [block!]
 //          {Frame definition block (will be bound and evaluated)}
@@ -459,81 +636,47 @@ REBNATIVE(apply)
 {
     INCLUDE_PARAMS_OF_APPLY;
 
-    REBVAL *def = ARG(def);
+    REBVAL *applicand = ARG(applicand);
 
-    DECLARE_FRAME (f);
-
-#if !defined(NDEBUG)
-    RELVAL *first_def = VAL_ARRAY_AT(def);
-
-    // !!! Because APPLY has changed, help warn legacy usages by alerting
-    // if the first element of the block is not a SET-WORD!.  A BAR! can
-    // subvert the warning: `apply :foo [| comment {This is a new APPLY} ...]`
-    //
-    if (NOT_END(first_def)) {
-        if (!IS_SET_WORD(first_def) && !IS_BAR(first_def)) {
-            fail (Error_Apply_Has_Changed_Raw());
-        }
-    }
-#endif
-
-    // We don't limit to taking a FUNCTION! value directly, because that loses
-    // the symbol (for debugging, errors, etc.)  If caller passes a WORD!
-    // then we lookup the variable to get the function, but save the symbol.
-    //
-    REBSTR *name;
-    Get_If_Word_Or_Path_Arg(D_OUT, &name, ARG(value));
-    if (name == NULL)
-        name = Canon(SYM___ANONYMOUS__); // Do_Core requires non-NULL symbol
-
+    REBSTR *opt_label;
+    Get_If_Word_Or_Path_Arg(D_OUT, &opt_label, applicand);
     if (!IS_FUNCTION(D_OUT))
-        fail (Error_Apply_Non_Function_Raw(ARG(value))); // for SPECIALIZE too
+        fail (applicand);
+    Move_Value(applicand, D_OUT);
 
-    f->gotten = D_OUT;
-    f->out = D_OUT;
-
-    return Apply_Frame_Core(f, name, def);
+    return Apply_Def_Or_Exemplar(
+        D_OUT,
+        VAL_FUNC(applicand),
+        VAL_BINDING(applicand),
+        opt_label,
+        NOD(ARG(def))
+    );
 }
 
 
 //
-//  also: native [
+//  after: native [
 //
-//  {Returns the first value, but also evaluates the second.}
+//  {Returns the first value, but always evaluate the second branch after it.}
 //
 //      return: [<opt> any-value!]
+//          {Will be the same value as `returned`}
 //      returned [<opt> any-value!]
-//      evaluated [<opt> any-value!]
+//          {Value to return}
+//      code [block! function!]
+//          {Code that will always execute, with the result discarded}
 //  ]
 //
-REBNATIVE(also)
+REBNATIVE(after)
+//
+// The enfix form of this function is called ALSO (see as well: THEN, ELSE)
 {
-    INCLUDE_PARAMS_OF_ALSO;
+    INCLUDE_PARAMS_OF_AFTER;
 
-    UNUSED(PAR(evaluated)); // not used (but was evaluated)
+    const REBOOL only = FALSE;
+    if (Run_Branch_Throws(D_CELL, ARG(returned), ARG(code), only))
+        return R_OUT_IS_THROWN;
+
     Move_Value(D_OUT, ARG(returned));
     return R_OUT;
-}
-
-
-//
-//  comment: native [
-//
-//  {Ignores the argument value.}
-//
-//      return: [<opt>]
-//          {Nothing.}
-//      :value [block! any-string! binary! any-scalar!]
-//          "Literal value to be ignored."
-//  ]
-//
-REBNATIVE(comment)
-{
-    INCLUDE_PARAMS_OF_COMMENT;
-
-    // All the work was already done (at the cost of setting up
-    // state that would just have to be torn down).
-
-    UNUSED(PAR(value)); // avoid unused variable warning
-    return R_VOID;
 }

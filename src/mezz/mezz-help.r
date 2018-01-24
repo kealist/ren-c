@@ -25,19 +25,19 @@ dump-obj: function [
     clip-str: func [str] [
         ; Keep string to one line.
         trim/lines str
-        if (length str) > 48 [str: append copy/part str 45 "..."]
+        if (length of str) > 48 [str: append copy/part str 45 "..."]
         str
     ]
 
     form-val: func [val [any-value!]] [
         ; Form a limited string from the value provided.
-        if any-block? :val [return spaced ["length:" length-of val]]
+        if any-block? :val [return spaced ["length:" length of val]]
         if image? :val [return spaced ["size:" val/size]]
         if datatype? :val [return form val] 
         if function? :val [
             return clip-str any [title-of :val mold spec-of :val]
         ]
-        if object? :val [val: words-of val]
+        if object? :val [val: words of val]
         if typeset? :val [val: to-block val]
         if port? :val [val: reduce [val/spec/title val/spec/ref]]
         if gob? :val [return spaced ["offset:" val/offset "size:" val/size]]
@@ -47,7 +47,7 @@ dump-obj: function [
     form-pad: func [val size] [
         ; Form a value with fixed size (space padding follows).
         val: form val
-        insert/dup tail val #" " size - length-of val
+        insert/dup tail of val #" " size - length of val
         val
     ]
 
@@ -56,10 +56,10 @@ dump-obj: function [
         wild: all [set? 'pat | string? pat | find pat "*"]
 
         for-each [word val] obj [
-            type: type-of :val
+            type: type of :val
 
             str: either maybe [function! object!] :type [
-                spaced [word _ mold spec-of :val _ words-of :val]
+                spaced [word _ mold spec-of :val _ words of :val]
             ][
                 form word
             ]
@@ -84,7 +84,7 @@ dump-obj: function [
             ][
                 str: form-pad word 15
                 append str #" "
-                append str form-pad type 10 - ((length-of str) - 15)
+                append str form-pad type 10 - ((length of str) - 15)
                 keep spaced [
                     "  " str
                     if type [form-val :val]
@@ -96,15 +96,23 @@ dump-obj: function [
 ]
 
 
-dump: proc [
+dump: func [
     {Show the name of a value (or block of expressions) with the value itself}
-    :value
+
+    return: []
+        {Doesn't return anything, not even void (so like a COMMENT)}
+    :value [any-value! <...>]
     <local>
-        dump-one dump-val clip-string item
+        dump-one dump-val clip-string item set-word result
 ][
-    clip-string: function [str len][
-       either len < length-of str [
-          delimit [ copy/part str len - 3 "..." ] _
+    if bar? first value [
+        take value
+        leave
+    ] ;-- treat this DUMP as disabled, `dump | x`
+
+    clip-string: function [str len] [
+       either len < length of str [
+          unspaced [copy/part str len - 3 "..."]
        ][
           str
        ]
@@ -123,8 +131,8 @@ dump: proc [
 
     dump-one: proc [item][
         case [
-            string? item [
-                print ["---" clip-string item system/options/dump-size "---"] ;-- label it
+            string? item [ ;-- allow customized labels
+                print ["---" clip-string item system/options/dump-size "---"]
             ]
 
             word? item [
@@ -149,10 +157,25 @@ dump: proc [
         ]
     ]
 
-    either block? value [
-        for-each item value [dump-one item]
-    ][
-        dump-one value
+    case [
+        ; The reason this function is a quoting variadic is so that you can
+        ; write `dump x: 1 + 2` and get `x: => 3`.  This is just a convenience
+        ; to save typing over `blahblah: 1 + 2 dump blahblah`.
+        ;
+        ; !!! Should also support `dump [x: 1 + 2 y: 3 + 4]` as a syntax...
+        ;
+        set-word? first value [
+            set-word: first value
+            result: do/next value (quote pos:)
+            ;-- Note: don't need to TAKE
+            print [set-word "=>" result]
+        ]
+
+        block? first value [
+            for-each item take value [dump-one item]
+        ]
+    ] else [
+        dump-one take value
     ]
 ]
 
@@ -189,7 +212,7 @@ spec-of: function [
         select meta 'return-note
         select original-meta 'return-note
     ]
-    if return-type or return-note [
+    if return-type or (return-note) [
         append spec quote return:
         if return-type [append/only spec return-type]
         if return-note [append spec return-note]
@@ -204,7 +227,7 @@ spec-of: function [
         select original-meta 'parameter-notes
     ]
 
-    for-each param words-of :value [
+    for-each param words of :value [
         append spec param
         if any [type: select types param] [append/only spec type]
         if any [note: select notes param] [append spec note]
@@ -219,8 +242,8 @@ title-of: function [
 
     value [any-value!]
 ][
-    switch type-of :value [
-        :function! [
+    switch type of :value [
+        (function!) [
             all [
                 object? meta: meta-of :value
                 string? description: select meta 'description
@@ -228,13 +251,13 @@ title-of: function [
             ]
         ]
 
-        :datatype! [
+        (datatype!) [
             spec: spec-of value
             assert [string? spec] ;-- !!! Consider simplifying "type specs"
             spec/title
         ]
-
-        (blank)
+    ] else [
+        blank
     ]
 ]
 
@@ -247,10 +270,12 @@ browse: procedure [
 
 help: procedure [
     "Prints information about words and values (if no args, general help)."
-    'word [<end> any-value!]
-    /doc "Open web browser to related documentation."
+    :topic [<end> any-value!]
+        "WORD! whose value to explain, or other HELP target (try HELP HELP)"
+    /doc
+        "Open web browser to related documentation."
 ][
-    if not set? 'word [
+    if not set? 'topic [
         ;
         ; Was just `>> help` or `do [help]` or similar.
         ; Print out generic help message.
@@ -264,7 +289,11 @@ help: procedure [
 
                 help "insert"
 
-            To browse online web documents:
+            To browse online topics:
+
+                help #compiling
+
+            To browse online documentation:
 
                 help/doc insert
 
@@ -293,62 +322,58 @@ help: procedure [
 
             Other information:
 
-                bugs - open GitHub issues website
-                chat - open GitHub developer forum
                 about - see general product info
-                upgrade - check for newer versions
-                changes - show changelog (TBD)
+                bugs - open GitHub issues website
+                changes - show changelog
+                chat - open GitHub developer forum
                 install - install (when applicable)
                 license - show user license
+                topics - open help topics website
+                upgrade - check for newer versions
                 usage - program cmd line options
         }
         leave
     ]
 
-                ;docs - open DocBase document wiki website
-                ;demo - run demo launcher (from rebol.com)
+    ; HELP quotes, but someone might want to use an expression, e.g.
+    ; `help (...)`.  However, enfix functions which hard quote the left would
+    ; win over a soft-quoting non-enfix function that quotes to the right.
+    ; (It is generally discouraged to make hard-quoting left enfix functions,
+    ; but they exist...e.g. DEFAULT.)  To make sure HELP DEFAULT works, HELP
+    ; must hard quote and simulate its own soft quote semantics.
+    ;
+    if maybe [group! get-word! get-path!] :topic [
+        topic: reduce target
+    ]
 
+    r3n: https://r3n.github.io/
 
-;           Word completion:
-;
-;               The command line can perform word
-;               completion. Type a few chars and press TAB
-;               to complete the word. If nothing happens,
-;               there may be more than one word that
-;               matches. Press TAB again to see choices.
-;
-;               Local filenames can also be completed.
-;               Begin the filename with a %.
-;
-;           Other useful functions:
-;
-;               about - see general product info
-;               usage - view program options
-;               license - show terms of user license
-;               source func - view source of a function
-;               upgrade - updates your copy of REBOL
-;
-;           More information: http://www.rebol.com/docs.html
-
-    if all [word? :word | blank? context-of word] [
-        print [word "is an unbound WORD!"]
+    ;; help #topic (browse r3n for topic)
+    if issue? :topic [
+        say-browser
+        browse join-all [r3n "topics/" next to-string :topic]
         leave
     ]
 
-    if all [word? :word | not set? word] [
-        print [word "is bound to a context, but has no value."]
+    if all [word? :topic | blank? context of topic] [
+        print [topic "is an unbound WORD!"]
+        leave
+    ]
+
+    if all [word? :topic | not set? topic] [
+        print [topic "is a WORD! bound to a context, but has no value."]
         leave
     ]
 
     ; Open the web page for it?
     if all [
         doc
-        word? :word
-        any [function? get :word datatype? get :word]
+        word? :topic
+        maybe [function! datatype!] get :topic
     ][
-        item: form :word
+        item: form :topic
         browse join-of 
-        either function? get :word [
+        either function? get :topic [
             for-each [a b] [ ; need a better method !
                 "!" "-ex"
                 "?" "-q"
@@ -363,45 +388,45 @@ help: procedure [
             tmp: %.MD
             https://github.com/gchiu/reboldocs/blob/master/
         ][
-            remove back tail item ; the !
+            remove back tail of item ; the !
             tmp: %.html
             http://www.rebol.com/r3/docs/datatypes/
         ]
         [item tmp]
     ]
 
-    if all [word? :word | set? :word | datatype? get :word] [
-        types: dump-obj/match make lib system/contexts/user :word
+    if all [word? :topic | set? :topic | datatype? get :topic] [
+        types: dump-obj/match make lib system/contexts/user :topic
         if not empty? types [
-            print ["Found these" (uppercase form word) "words:" newline types]
+            print ["Found these" (uppercase form topic) "words:" newline types]
         ] else [
-            print [word {is a datatype}]
+            print [topic {is a datatype}]
         ]
         leave
     ]
 
     ; If arg is a string, search the system:
-    if string? :word [
-        types: dump-obj/match make lib system/contexts/user :word
+    if string? :topic [
+        types: dump-obj/match make lib system/contexts/user :topic
         sort types
         if not empty? types [
             print ["Found these related words:" newline types]
             leave
         ]
-        print ["No information on" word]
+        print ["No information on" topic]
         leave
     ]
 
     ; Print type name with proper singular article:
     type-name: func [value [any-value!]] [
-        value: mold type-of :value
-        clear back tail value
+        value: mold type of :value
+        clear back tail of value
         spaced [(either find "aeiou" first value ["an"]["a"]) value]
     ]
 
     ; Print literal values:
-    if not any [word? :word path? :word][
-        print [mold :word "is" type-name :word]
+    if not any [word? :topic | path? :topic][
+        print [mold :topic "is" type-name :topic]
         leave
     ]
 
@@ -409,24 +434,24 @@ help: procedure [
     ; we have to read the infixness off of the word before GETting it.
 
     ; Get value (may be a function, so handle with ":")
-    either path? :word [
-        print ["!!! NOTE: Infix testing not currently supported for paths !!!"]
-        lookback: false
+    either path? :topic [
+        print ["!!! NOTE: Enfix testing not currently supported for paths"]
+        enfixed: false
         if any [
-            error? set/opt 'value trap [get :word] ;trap reduce [to-get-path word]
+            error? value: trap [get :topic] ;trap reduce [to-get-path topic]
             not set? 'value
         ][
-            print ["No information on" word "(path has no value)"]
+            print ["No information on" topic "(path has no value)"]
             leave
         ]
     ][
-        lookback: lookback? :word
-        value: get :word
+        enfixed: enfixed? :topic
+        value: get :topic
     ]
 
     unless function? :value [
         print/only spaced [
-            (uppercase mold word) "is" (type-name :value) "of value: "
+            (uppercase mold topic) "is" (type-name :value) "of value: "
         ]
         print unspaced collect [
             either maybe [object! port!] value [
@@ -441,7 +466,7 @@ help: procedure [
 
     ; Must be a function...
     ; If it has refinements, strip them:
-    ;if path? :word [word: first :word]
+    ;if path? :topic [topic: first :topic]
 
     space4: unspaced [space space space space] ;-- use instead of tab
 
@@ -451,7 +476,7 @@ help: procedure [
     args: _ ;-- plain arguments
     refinements: _ ;-- refinements and refinement arguments
 
-    parse words-of :value [
+    parse words of :value [
         copy args any [word! | get-word! | lit-word! | issue!]
         copy refinements any [
             refinement! | word! | get-word! | lit-word! | issue!
@@ -459,12 +484,12 @@ help: procedure [
     ]
 
     ; Output exemplar calling string, e.g. LEFT + RIGHT or FOO A B C
-    ; !!! Should refinement args be shown for lookback case??
+    ; !!! Should refinement args be shown for enfixed case??
     ;
-    either lookback [
-        print [space4 args/1 (uppercase mold word) next args]
+    either enfixed [
+        print [space4 args/1 (uppercase mold topic) next args]
     ][
-        print [space4 (uppercase mold word) args refinements]
+        print [space4 (uppercase mold topic) args refinements]
     ]
 
     ; Dig deeply, but try to inherit the most specific meta fields available
@@ -515,7 +540,9 @@ help: procedure [
         :chainees [
             {a chained function}
         ]
-    ] else {a function}
+    ] else [
+        {a function}
+    ]
 
     print-newline
 
@@ -524,7 +551,7 @@ help: procedure [
             |
         space4 (any [description | "(undocumented)"])
             |
-        space4 (uppercase mold word) {is} classification {.}
+        space4 (uppercase mold topic) {is} classification
     ]
 
     print-args: procedure [list /indent-words] [
@@ -533,9 +560,9 @@ help: procedure [
             type: maybe [block! any-word!] select types to-word param
 
             ;-- parameter name and type line
-            either all [type | not refinement? param] [
+            if type and (not refinement? param) [
                 print/only [space4 param space "[" type "]" newline]
-            ][
+            ] else [
                 print/only [space4 param newline]
             ]
 
@@ -599,7 +626,7 @@ source: make function! [[
     case [
         tag? :arg [
             f: copy "unknown tag"
-            for-each location words-of system/locale/library [
+            for-each location words of system/locale/library [
                 if location: select load get location arg [
                     f: location/1
                     break
@@ -666,7 +693,7 @@ source: make function! [[
             print f
         ]
         true [
-            print [name "is a" mold type-of :f "and not a FUNCTION!"]
+            print [name "is a" mold type of :f "and not a FUNCTION!"]
         ]
     ]
     () ;-- return nothing, as with a PROCEDURE
@@ -688,21 +715,25 @@ what: procedure [
     for-each [word val] ctx [
         if function? :val [
             arg: either args [
-                arg: words-of :val
+                arg: words of :val
                 clear find arg /local
                 mold arg
             ][
                 title-of :val
             ]
             append list reduce [word arg]
-            size: max size length-of to-string word
+            size: max size length of to-string word
         ]
     ]
 
     vals: make string! size
     for-each [word arg] sort/skip list 2 [
         append/dup clear vals #" " size
-        print [head change vals word | :arg]
+        print [
+            head of change vals word
+                |
+            :arg
+        ]
     ]
 ]
 
@@ -732,4 +763,32 @@ chat: proc [
 ][
     say-browser
     browse http://chat.stackoverflow.com/rooms/291/rebol
+]
+
+; temporary solution to ensuring scripts run on a minimum build
+require-commit: procedure [
+    "checks current commit against required commit"
+    commit [string!]
+][
+    if find system/script/header 'commit [
+        c: :system/script/header/commit
+        if all [
+            find? c 'date
+            date: :c/date
+            rebol/build < date
+        ][
+            fail ["This script needs a build newer or equal to" date "so run `upgrade`"]            
+        ]
+        if all [
+            find? c 'id
+            id: :c/id
+            id <> commit
+        ][
+            print ["This script has only been tested again commit" id |
+                "If it doesn't run as expected you can try seeing if this commit is still available" |
+                unspaced ["by using the `do <dl-renc>` tool and look for r3-" copy/part id 7 "*"
+                if find/last form rebol/version "0.3.4" [%.exe]]
+            ]
+        ]
+    ]
 ]

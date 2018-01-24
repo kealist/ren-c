@@ -34,7 +34,7 @@ REBOL [
 ;
 ; This should be initialized by make-host-init.r, but set a default just in
 ; case
-host-prot: default _
+host-prot: default [_]
 
 boot-print: procedure [
     "Prints during boot when not quiet."
@@ -185,7 +185,7 @@ usage: procedure [
 ]
 
 boot-welcome:
-{Welcome to the Rebol console.  For more information please type in the commands below:
+{Welcome to Rebol.  For more information please type in the commands below:
 
   HELP    - For starting information
   ABOUT   - Information about your Rebol
@@ -228,9 +228,10 @@ host-script-pre-load: procedure [
 
 
 host-start: function [
-    "Loads extras, handles args, security, scripts."
-    return: [integer! function!]
-        {If integer, host should exit with that status; else a CONSOLE FUNCTION!}
+    "Called by HOST-CONSOLE.  Loads extras, handles args, security, scripts."
+
+    return: [block! group!]
+        {Instruction for C code to run in a sandbox (FAILs ok if GROUP!)}
     exec-path [file! blank!]
         {Path to the executable file}
     argv [block!]
@@ -238,9 +239,29 @@ host-start: function [
     boot-exts [block! blank!]
         {Extensions (modules) loaded at boot}
     <with> host-prot
-    <has>
+    <static>
         o (system/options) ;-- shorthand since options are often read/written
 ][
+    ; The core presumes no built-in I/O ability in the release build, hence
+    ; during boot PANIC and PANIC-VALUE can only do printf() in the debug
+    ; build.  While there's no way to hook the core panic() or panic_at()
+    ; calls, the rebPanic() API dispatches to PANIC and PANIC-VALUE.  Hook
+    ; them just to show we can...use I/O to print a message.
+    ;
+    hijack 'panic adapt (copy :panic) [
+        print "PANIC FUNCTION! called (explicitly or by rebPanic() API)"
+        ;
+        ; ...adaptation falls through to our copy of the original PANIC
+    ]
+    hijack 'panic-value adapt (copy :panic-value) [
+        print "PANIC-VALUE FUNCTION! called (explicitly or by rebPanic() API)"
+        ;
+        ; ...adaptation falls through to our copy of the original PANIC-VALUE
+    ]
+
+    ; can only output do not assume they have any ability to write out
+    ; information to the user, because the
+
     ; Currently there is just one monolithic "initialize all schemes", e.g.
     ; FILE:// and HTTP:// and CONSOLE:// -- this will need to be broken down
     ; into finer granularity.  Formerly all of them were loaded at the end
@@ -277,11 +298,20 @@ host-start: function [
 
     system/product: 'core
 
+    ; !!! The debugger is a work in progress.  But the design attempts to make
+    ; it an optional extension which doesn't need to be built into the EXE,
+    ; and can be loaded dynamically into any Rebol-based binary.  But it has
+    ; to spawn a console, and since the console is userspace and may vary
+    ; between EXEs...it has to be told where that function is.
     ;
+    if find system/contexts/user 'init-debugger [
+        system/contexts/user/init-debugger :host-console
+    ]
+
     ; helper functions
     ;
     die: func [
-        {A gracefully way to FAIL during startup}
+        {A graceful way to "FAIL" during startup}
         reason [string!]
             {Error message}
         /error e [error!]
@@ -293,7 +323,7 @@ host-start: function [
         if error [
             print either o/verbose [e] ["!! use --verbose for more detail"]
         ]
-        return 1
+        return [quit/with 1]
     ]
 
     to-dir: function [
@@ -303,7 +333,7 @@ host-start: function [
         dir [string!]
     ][
         if empty? dir [return _]
-        dir: clean-path/dir to-rebol-file dir
+        dir: clean-path/dir local-to-file dir
         all [exists? dir | dir]
     ]
 
@@ -350,7 +380,7 @@ host-start: function [
         system/user/home: o/home: home-dir
         resources-dir: get-resources-path   ;; _ if doesn't exist
         o/resources: resources-dir
-     ]
+    ]
 
     sys/script-pre-load-hook: :host-script-pre-load
 
@@ -372,7 +402,7 @@ host-start: function [
             o/boot: exec-path
             take argv ;consume argv[0] anyway
         ][ ;-- on most systems, argv[0] is the exe path
-            o/boot: clean-path to-rebol-file take argv
+            o/boot: clean-path local-to-file take argv
         ]
         o/bin: first split-path o/boot
     ]
@@ -386,6 +416,24 @@ host-start: function [
             first argv
             die join-all [switch-arg { parameter missing}]
         ]
+    ]
+
+    ; As we process command line arguments, we build up an "instruction" block
+    ; which is going to be passed back.  This way you can have multiple
+    ; --do "..." or script arguments, and they will be run in a sequence.
+    ;
+    ; The instruction block is run in a sandbox which prevents cancellation
+    ; or failure from crashing the interpreter.  (HOST-START is not allowed
+    ; to cancel or fail--it is an implementation helper called from
+    ; HOST-CONSOLE, which is special.  See notes in HOST-CONSOLE.)
+    ;
+    ; The directives at the start of the instruction dictate that Ctrl-C
+    ; during the startup instruction will exit with code 130, and any errors
+    ; that arise will be reported and result in exit code 1.
+    ;
+    instruction: copy [
+        [#quit-if-halt #countdown-if-error]
+            |
     ]
 
     until [tail? argv] [
@@ -408,6 +456,10 @@ host-start: function [
                 o/about: true   ;; show full banner (ABOUT) on startup
             )
         |
+            "--breakpoint" end (
+                c-debug-break-at to-integer param-or-die "BREAKPOINT"
+            )
+        |
             ["--cgi" | "-c"] end (
                 o/quiet: true
                 o/cgi: true
@@ -420,9 +472,20 @@ host-start: function [
             )
         |
             "--do" end (
+                ;
+                ; A string of code to run, e.g. `r3 --do "print {Hello}"`
+                ;
                 o/quiet: true ;-- don't print banner, just run code string
-                do-string: param-or-die "DO"
-                quit-when-done: default true ;-- override blank, not false
+                quit-when-done: default [true] ;-- override blank, not false
+                append instruction compose/only [
+                    ;
+                    ; Use /ONLY so that QUIT/WITH quits, vs. return DO value
+                    ;
+                    do/only (param-or-die "DO")
+                        |
+                    ; Use expression barrier for insulation
+                ]
+
             )
         |
             ["--halt" | "-h"] end (
@@ -431,11 +494,11 @@ host-start: function [
         |
             ["--help" | "-?"] end (
                 usage
-                quit-when-done: default true
+                quit-when-done: default [true]
             )
         |
             "--import" end (
-                lib/import to-rebol-file param-or-die "IMPORT"
+                lib/import local-to-file param-or-die "IMPORT"
             )
         |
             ["--quiet" | "-q"] end (
@@ -446,7 +509,7 @@ host-start: function [
                 ; !!! historically you could combine switches when used with
                 ; a single dash, but this feature should be part of a better
                 ; thought out implementation.  For now, any historically
-                ; significant combinations (e.g. used in make-make.r) will
+                ; significant combinations (e.g. used in make.r) will
                 ; be supported manually.  This is "quiet unsecure"
                 ;
                 o/quiet: true
@@ -495,8 +558,8 @@ host-start: function [
             )
         |
             "--script" end (
-                o/script: param-or-die "SCRIPT"
-                quit-when-done: default true ;-- overrides blank, not false
+                o/script: local-to-file param-or-die "SCRIPT"
+                quit-when-done: default [true] ;-- overrides blank, not false
             )
         |
             ["-t" | "--trace"] end (
@@ -509,7 +572,7 @@ host-start: function [
         |
             ["-v" | "-V" | "--version"] end (
                 boot-print ["Rebol 3" system/version] ;-- version tuple
-                quit-when-done: default true
+                quit-when-done: default [true]
             )
         |
             "-w" end (
@@ -530,12 +593,36 @@ host-start: function [
         take argv
     ]
 
+    ; Taking a command-line `--breakpoint NNN` parameter is helpful if a
+    ; problem is reproducible, and you have a tick count in hand from a
+    ; panic(), REBSER.tick, REBFRM.tick, REBVAL.extra.tick, etc.  But there's
+    ; an entanglement issue, as any otherwise-deterministic tick from a prior
+    ; run would be thrown off by the **ticks added by the userspace parameter
+    ; processing of the command-line for `--breakpoint`**!  :-/
+    ;
+    ; The /COMPENSATE option addresses this problem.  Pass it a reasonable
+    ; upper bound for how many ticks you think could have been added to the
+    ; parse, if `--breakpoint` was processed (even though it might not have
+    ; been processed).  Regardless of whether the switch was present or not,
+    ; the tick count rounds up to a reproducible value, using this method:
+    ;
+    ; https://math.stackexchange.com/q/2521219/
+    ;
+    ; At time of writing, 1000 ticks should be *way* more than enough for both
+    ; the PARSE steps and the evaluation steps `--breakpoint` adds.  Yet some
+    ; things could affect this, e.g. a complex userspace TRACE which was
+    ; run during boot.
+    ;
+    ; We TRAP it because this will fail in a release build.
+    ;
+    trap [c-debug-break-at/compensate 1000]
+
     ; As long as there was no `--script` pased on the command line explicitly,
     ; the first item after the options is implicitly the script.
     ;
     if all [not o/script | not tail? argv] [
-        o/script: to file! take argv
-        quit-when-done: default true
+        o/script: local-to-file take argv
+        quit-when-done: default [true]
     ]
 
     ; Whatever is left is the positional arguments, available to the script.
@@ -581,7 +668,7 @@ host-start: function [
     ;;       file (below) -> o/bin (would have been same)
 
 comment [
-    lib/secure (case [
+    lib/secure case [
         o/secure [
             o/secure
         ]
@@ -590,7 +677,7 @@ comment [
         ]
     ] else [
         compose [file throw (file) [allow read] %. allow] ; default
-    ])
+    ]
 ]
 
     ;
@@ -678,187 +765,35 @@ comment [
 
     ; Evaluate any script argument, e.g. `r3 test.r` or `r3 --script test.r`
     ;
-    either file? o/script [
-        trap/with [
-            do/only o/script ;-- /ONLY so QUIT/WITH exit code bubbles out
-        ] func [error <with> return] [
-            print error
-            return 1
+    ; Note: We can't do this by appending the instruction as we go along
+    ; processing the arguments, as `--do` does, because the arguments aren't
+    ; known at the moment of hitting the `--script` enough to fill in the
+    ; slots of the COMPOSE.
+    ;
+    ; This can be worked around with multiple do statements in a row, e.g.:
+    ;
+    ;     r3 --do "do %script1.reb" --do "do %script2.reb"
+    ;
+    if file? o/script [
+        append instruction compose/deep/only [
+            ;
+            ; Use DO/ONLY so QUIT/WITH exits vs. being DO's return value
+            ;
+            do/only/args (o/script) (script-args)
         ]
     ]
+
     host-start: 'done
 
-    ; Evaluate the DO string, e.g. `r3 --do "print {Hello}"`
-    ;
-    if do-string [
-        trap/with [
-            do/only do-string ;-- /ONLY so QUIT/WITH exit code bubbles out
-        ] func [error <with> return] [
-            print error
-            return 1
-        ]
-    ]
-
-    if quit-when-done [return 0]
-
-    ; Start CONSOLE if got this far.
-    ;
-    ; Instantiate console! object into system/console for skinning.  This
-    ; object can be updated %console-skin.reb if in system/options/resources
-    ;
-    ; See /os/host-console.r where this object is called from
-    ;
-
-    loud-print "Starting console..."
-    loud-print ""
-    proto-skin: make console! []
-    skin-error: _
-
-    if all [
-        skin-file: %console-skin.reb
-        not find o/suppress skin-file
-        o/resources
-        exists? skin-file: join-of o/resources skin-file
+    either quit-when-done [
+        append instruction [quit/with 0]
     ][
-        trap/with [
-            new-skin: do load skin-file
-
-            ;; if loaded skin returns console! object then use as prototype
-            if all [
-                object? new-skin
-                select new-skin 'repl ;; quacks like REPL, say it's a console!
-            ][
-                proto-skin: new-skin
-                proto-skin/updated?: true
-                proto-skin/name: any [proto-skin/name "updated"]
-            ]
-
-            proto-skin/loaded?: true
-            proto-skin/name: any [proto-skin/name "loaded"]
-            append o/loaded skin-file
-
-        ] func [error] [
-            skin-error: error       ;; show error later if --verbose
-            proto-skin/name: "error"
+        append instruction [
+            start-console
+                |
+            <needs-prompt>
         ]
     ]
 
-    proto-skin/name: any [proto-skin/name | "default"]
-    system/console: proto-skin
-
-    ;
-    ; banner time
-    ;
-    if o/about [
-        ;-- print fancy boot banner
-        ;
-        boot-print make-banner boot-banner
-    ] else [
-        boot-print [
-            "Rebol 3 (Ren/C branch)"
-            mold compose [version: (system/version) build: (system/build)]
-            newline
-        ]
-    ]
-
-    boot-print boot-welcome
-
-    ; verbose console skinning messages
-    loud-print [newline {Console skinning:} newline]
-    if skin-error [
-        loud-print [
-            {  Error loading console skin  -} skin-file | |
-            skin-error | |
-            {  Fix error and restart CONSOLE}
-        ]
-    ] else [
-       loud-print [
-            space space
-            either/only proto-skin/loaded? {Loaded skin} {Skin does not exist}
-            "-" skin-file
-            unspaced ["(CONSOLE " unless/only proto-skin/updated? {not } "updated)"]
-        ]
-    ]
-
-    ; Rather than have the host C code look up the CONSOLE function by name, it
-    ; is returned as a function value from calling the start.  It's a bit of
-    ; a hack, and might be better with something like the SYS_FUNC table that
-    ; lets the core call Rebol code.
-    ;
-    return :host-console
-]
-
-
-; Define console! object for skinning - stub for elsewhere?
-;
-
-console!: make object! [
-    name: _
-    repl: true      ;-- used to identify this as a console! object (quack!)
-    loaded?:  false ;-- if true then this is a loaded (external) skin
-    updated?: false ;-- if true then console! object found in loaded skin
-    counter: 0
-    last-result: _  ;-- last evaluated result (sent by HOST-CONSOLE)
-
-    ; Called on every line of input by HOST-CONSOLE in %os/host-console.r
-    ;
-    cycle: does [
-        if zero? ++ counter [print-greeting] ;-- only load skin on first cycle
-        counter
-    ]
-
-    ;; APPEARANCE (can be overridden)
-
-    prompt:   {>> }
-    result:   {== }
-    warning:  {!! }
-    error:    {** }                ;; not used yet
-    info:     to-string #{e29398}  ;; info sign!
-    greeting: _
-    print-prompt:   proc []  [print/only prompt]
-    print-result:   proc []  [print unspaced [result last-result]]
-    print-warning:  proc [s] [print unspaced [warning reduce s]]
-    print-error:    proc [e] [print e]
-    print-info:     proc [s] [print [info space space reduce s]]
-    print-greeting: proc []  [boot-print greeting]
-    print-gap:      proc []  [print-newline]
-
-    ;; BEHAVIOR (can be overridden)
-
-    input-hook: func [
-        {Receives line input, parse/transform, send back to CONSOLE eval}
-        s
-    ][
-        s
-    ]
-
-    dialect-hook: func [
-        {Receives code block, parse/transform, send back to CONSOLE eval}
-        s
-    ][
-        s
-    ]
-
-    shortcuts: make object! compose/deep [
-        q: [quit]
-        list-shortcuts: [print system/console/shortcuts]
-        changes: [
-            browse (join-all [
-                https://github.com/metaeducation/ren-c/blob/master/CHANGES.md#
-                join-all ["" system/version/1 system/version/2 system/version/3]
-            ])
-        ]
-    ]
-
-    ;; HELPERS (could be overridden!)
-
-    add-shortcut: proc [
-        {Add/Change console shortcut}
-        name  [any-word!]
-            {shortcut name}
-        block [block!]
-            {command(s) expanded to}
-    ][
-        extend shortcuts name block
-    ]
+    return instruction
 ]

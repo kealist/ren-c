@@ -123,17 +123,20 @@ static void Assert_Basics(void)
     // not work out as designed, it *should* be possible to comment this out
     // and keep running.
     //
-    if (sizeof(REBVAL) != sizeof(void*) * 4)
+    size_t sizeof_REBVAL = sizeof(REBVAL); // avoid constant conditional expr
+    if (sizeof_REBVAL != sizeof(void*) * 4)
         panic ("size of REBVAL is not sizeof(void*) * 4");
 
     assert(sizeof(REBEVT) == sizeof(REBVAL));
 
     // The REBSER is designed to place the `info` bits exactly after a REBVAL
     // so they can do double-duty as also a terminator for that REBVAL when
-    // enumerated as an ARRAY.
+    // enumerated as an ARRAY.  Put the offest into a variable to avoid the
+    // constant-conditional-expression warning.
     //
+    size_t offsetof_REBSER_info = offsetof(REBSER, info);
     if (
-        offsetof(REBSER, info) - offsetof(REBSER, content) != sizeof(REBVAL)
+        offsetof_REBSER_info - offsetof(REBSER, content) != sizeof(REBVAL)
     ){
         panic ("bad structure alignment for internal array termination");
     }
@@ -144,7 +147,7 @@ static void Assert_Basics(void)
     // reading, so there's little danger of hitting this unless there's
     // a big change.
     //
-    assert(REB_MAX + 1 < 256);
+    assert(REB_MAX_PLUS_ONE_TRASH < 256);
 
     // Make sure tricks for "internal END markers" are lined up as expected.
     //
@@ -276,7 +279,7 @@ static REBARR *Startup_Datatypes(REBARR *boot_types, REBARR *boot_typespecs)
         // a limited sense.)
         //
         assert(value == Get_Type(cast(enum Reb_Kind, n)));
-        SET_VAL_FLAG(CTX_VAR(Lib_Context, n), VALUE_FLAG_PROTECTED);
+        SET_VAL_FLAG(CTX_VAR(Lib_Context, n), CELL_FLAG_PROTECTED);
 
         Append_Value(catalog, KNOWN(word));
     }
@@ -303,12 +306,12 @@ static void Startup_True_And_False(void)
     REBVAL *true_value = Append_Context(Lib_Context, 0, Canon(SYM_TRUE));
     Init_Logic(true_value, TRUE);
     assert(VAL_LOGIC(true_value) == TRUE);
-    assert(IS_CONDITIONAL_TRUE(true_value));
+    assert(IS_TRUTHY(true_value));
 
     REBVAL *false_value = Append_Context(Lib_Context, 0, Canon(SYM_FALSE));
     Init_Logic(false_value, FALSE);
     assert(VAL_LOGIC(false_value) == FALSE);
-    assert(IS_CONDITIONAL_FALSE(false_value));
+    assert(IS_FALSEY(false_value));
 }
 
 
@@ -345,8 +348,8 @@ REBNATIVE(action)
     REBFUN *fun = Make_Function(
         Make_Paramlist_Managed_May_Fail(spec, flags),
         &Action_Dispatcher,
-        NULL, // no underlying function--this is fundamental
-        NULL // not providing a specialization
+        NULL, // no facade (use paramlist)
+        NULL // no specialization exemplar (or inherited exemplar)
     );
 
     Move_Value(FUNC_BODY(fun), ARG(verb));
@@ -367,7 +370,7 @@ REBNATIVE(action)
     // save the write action into a global.
     //
     if (VAL_WORD_SYM(ARG(verb)) == SYM_WRITE) {
-        INIT_CELL(&PG_Write_Action);
+        Prep_Non_Stack_Cell(&PG_Write_Action);
         Move_Value(&PG_Write_Action, D_OUT);
     }
 
@@ -443,9 +446,9 @@ static void Add_Lib_Keys_R3Alpha_Cant_Make(void)
 // quick, but a better solution should be reviewed in terms of an overall
 // string and UTF8 rethinking.
 //
-static void Init_Function_Tag(const char *name, REBVAL *slot)
+static void Init_Function_Tag(RELVAL *slot, const char *name)
 {
-    Init_Tag(slot, Make_UTF8_May_Fail(name));
+    Init_Tag(slot, Make_UTF8_May_Fail(cb_cast(name)));
     Freeze_Sequence(VAL_SERIES(slot));
 }
 
@@ -461,12 +464,11 @@ static void Init_Function_Tag(const char *name, REBVAL *slot)
 //
 static void Init_Function_Tags(void)
 {
-    Init_Function_Tag("with", ROOT_WITH_TAG);
-    Init_Function_Tag("...", ROOT_ELLIPSIS_TAG);
-    Init_Function_Tag("opt", ROOT_OPT_TAG);
-    Init_Function_Tag("end", ROOT_END_TAG);
-    Init_Function_Tag("local", ROOT_LOCAL_TAG);
-    Init_Function_Tag("durable", ROOT_DURABLE_TAG);
+    Init_Function_Tag(ROOT_WITH_TAG, "with");
+    Init_Function_Tag(ROOT_ELLIPSIS_TAG, "...");
+    Init_Function_Tag(ROOT_OPT_TAG, "opt");
+    Init_Function_Tag(ROOT_END_TAG, "end");
+    Init_Function_Tag(ROOT_LOCAL_TAG, "local");
 }
 
 
@@ -615,8 +617,8 @@ static REBARR *Startup_Natives(REBARR *boot_natives)
         REBFUN *fun = Make_Function(
             Make_Paramlist_Managed_May_Fail(KNOWN(spec), flags),
             Native_C_Funcs[n], // "dispatcher" is unique to this "native"
-            NULL, // no underlying function, this is fundamental
-            NULL // not providing a specialization
+            NULL, // no facade (use paramlist)
+            NULL // no specialization exemplar (or inherited exemplar)
         );
 
         // If a user-equivalent body was provided, we save it in the native's
@@ -627,10 +629,10 @@ static REBARR *Startup_Natives(REBARR *boot_natives)
             ++item;
             if (!IS_BLOCK(body))
                 panic (body);
-            *FUNC_BODY(fun) = *body;
+            Move_Value(FUNC_BODY(fun), body);
         }
 
-        Prep_Global_Cell(&Natives[n]);
+        Prep_Non_Stack_Cell(&Natives[n]);
         Move_Value(&Natives[n], FUNC_VALUE(fun));
 
         // Append the native to the Lib_Context under the name given.
@@ -748,32 +750,30 @@ static void Init_Root_Vars(void)
     // the root set.  Should that change, they could be explicitly added
     // to the GC's root set.
 
-    Prep_Global_Cell(&PG_Void_Cell[0]);
-    Prep_Global_Cell(&PG_Void_Cell[1]);
+    Prep_Non_Stack_Cell(&PG_Void_Cell[0]);
+    Prep_Non_Stack_Cell(&PG_Void_Cell[1]);
     Init_Void(&PG_Void_Cell[0]);
     TRASH_CELL_IF_DEBUG(&PG_Void_Cell[1]);
 
-    Prep_Global_Cell(&PG_Blank_Value[0]);
-    Prep_Global_Cell(&PG_Blank_Value[1]);
+    Prep_Non_Stack_Cell(&PG_Blank_Value[0]);
+    Prep_Non_Stack_Cell(&PG_Blank_Value[1]);
     Init_Blank(&PG_Blank_Value[0]);
     TRASH_CELL_IF_DEBUG(&PG_Blank_Value[1]);
 
-    Prep_Global_Cell(&PG_Bar_Value[0]);
-    Prep_Global_Cell(&PG_Bar_Value[1]);
+    Prep_Non_Stack_Cell(&PG_Bar_Value[0]);
+    Prep_Non_Stack_Cell(&PG_Bar_Value[1]);
     Init_Bar(&PG_Bar_Value[0]);
     TRASH_CELL_IF_DEBUG(&PG_Bar_Value[1]);
 
-    Prep_Global_Cell(&PG_False_Value[0]);
-    Prep_Global_Cell(&PG_False_Value[1]);
+    Prep_Non_Stack_Cell(&PG_False_Value[0]);
+    Prep_Non_Stack_Cell(&PG_False_Value[1]);
     Init_Logic(&PG_False_Value[0], FALSE);
     TRASH_CELL_IF_DEBUG(&PG_False_Value[1]);
 
-    Prep_Global_Cell(&PG_True_Value[0]);
-    Prep_Global_Cell(&PG_True_Value[1]);
+    Prep_Non_Stack_Cell(&PG_True_Value[0]);
+    Prep_Non_Stack_Cell(&PG_True_Value[1]);
     Init_Logic(&PG_True_Value[0], TRUE);
     TRASH_CELL_IF_DEBUG(&PG_True_Value[1]);
-
-    Prep_Global_Cell(&PG_Va_List_Pending);
 
     // We can't actually put an end value in the middle of a block, so we poke
     // this one into a program global.  It is not legal to bit-copy an
@@ -788,8 +788,10 @@ static void Init_Root_Vars(void)
 
     // The EMPTY_BLOCK provides EMPTY_ARRAY.  It is locked for protection.
     //
-    Init_Block(ROOT_EMPTY_BLOCK, Make_Array(0));
+    PG_Empty_Array = Make_Array(0);
+    Init_Block(ROOT_EMPTY_BLOCK, PG_Empty_Array);
     Deep_Freeze_Array(VAL_ARRAY(ROOT_EMPTY_BLOCK));
+    assert(IS_BLOCK(ROOT_EMPTY_BLOCK));
 
     REBSER *empty_series = Make_Binary(1);
     *BIN_AT(empty_series, 0) = '\0';
@@ -807,7 +809,6 @@ static void Init_Root_Vars(void)
     Init_Unreadable_Blank(ROOT_OPT_TAG);
     Init_Unreadable_Blank(ROOT_END_TAG);
     Init_Unreadable_Blank(ROOT_LOCAL_TAG);
-    Init_Unreadable_Blank(ROOT_DURABLE_TAG);
 
     // Evaluator not initialized, can't do system construction yet
     //
@@ -821,6 +822,17 @@ static void Init_Root_Vars(void)
     // Symbols system not initialized, can't init the function meta shim yet
     //
     Init_Unreadable_Blank(ROOT_FUNCTION_META);
+
+    // !!! Putting the stats map in the root object is a temporary solution
+    // to allowing a native coded routine to have a static which is guarded
+    // by the GC.  While it might seem better to move the stats into a
+    // mostly usermode implementation that hooks apply, this could preclude
+    // doing performance analysis on boot--when it would be too early for
+    // most user code to be running.  It may be that the debug build has
+    // this form of mechanism that can diagnose boot, while release builds
+    // rely on a usermode stats module.
+    //
+    Init_Map(ROOT_STATS_MAP, Make_Map(10));
 
     TERM_ARRAY_LEN(root, ROOT_MAX);
     ASSERT_ARRAY(root);
@@ -890,7 +902,7 @@ static void Init_System_Object(
         0 == CT_Context(
             Get_System(SYS_STANDARD, STD_FUNCTION_META),
             ROOT_FUNCTION_META,
-            TRUE
+            1 // "strict equality"
         )
     );
 
@@ -903,13 +915,7 @@ static void Init_System_Object(
 
     // Create system/codecs object
     //
-    {
-        REBCTX *codecs = Alloc_Context(REB_OBJECT, 10);
-        VAL_RESET_HEADER(CTX_VALUE(codecs), REB_OBJECT);
-        CTX_VALUE(codecs)->extra.binding = NULL;
-        CTX_VALUE(codecs)->payload.any_context.phase = NULL;
-        Init_Object(Get_System(SYS_CODECS, 0), codecs);
-    }
+    Init_Object(Get_System(SYS_CODECS, 0), Alloc_Context(REB_OBJECT, 10));
 }
 
 
@@ -937,32 +943,6 @@ static void Init_Contexts_Object(void)
     Init_Object(Get_System(SYS_CONTEXTS, CTX_LIB), Lib_Context);
     Init_Object(Get_System(SYS_CONTEXTS, CTX_USER), Lib_Context);
 }
-
-#ifndef NDEBUG
-//
-//  Init_Break_Point: C
-//
-// This initializes the break point from env in the debug build
-//
-static void Init_Break_Point(void)
-{
-    TG_Break_At = 0;
-
-    const char *env_break_at = getenv("R3_BREAK_AT");
-    if (env_break_at != NULL) {
-        i64 break_at = CHR_TO_INT(cb_cast(env_break_at));;
-        if(break_at > 0) {
-            Debug_Str(
-                "**\n"
-                "** R3_BREAK_AT is set in environment variable!\n"
-                "** Will break in Do_Core or crash (if not launched by a debugger)\n"
-                "**\n"
-            );
-            TG_Break_At = cast(REBUPT, break_at);
-        }
-    }
-}
-#endif
 
 
 //
@@ -1009,12 +989,13 @@ void Startup_Task(void)
     // The thrown arg is not intended to ever be around long enough to be
     // seen by the GC.
     //
-    Prep_Global_Cell(&TG_Thrown_Arg);
+    Prep_Non_Stack_Cell(&TG_Thrown_Arg);
     Init_Unreadable_Blank(&TG_Thrown_Arg);
 
     Startup_Raw_Print();
     Startup_Scanner();
     Startup_Mold(MIN_COMMON/4);
+    Startup_String();
     Startup_Collector();
 
     // Symbols system not initialized, can't init the errors just yet
@@ -1144,12 +1125,7 @@ void Startup_Core(void)
     Startup_StdIO();
 
     Assert_Basics();
-    PG_Boot_Time = OS_DELTA_TIME(0, 0);
-
-#ifndef NDEBUG
-    // This might call Debug_Str, which depends on StdIO, and must be called after Start_StdIO;
-    Init_Break_Point();
-#endif
+    PG_Boot_Time = OS_DELTA_TIME(0);
 
 //==//////////////////////////////////////////////////////////////////////==//
 //
@@ -1180,8 +1156,8 @@ void Startup_Core(void)
 
     Startup_Task();
 
-    // !!! REVIEW: Init_Function_Tags() uses BUF_UTF8, not
-    // available untilthis point in time.
+    // !!! REVIEW: Init_Function_Tags() uses BUF_UTF8, not available until
+    // this point in time.
     //
     Init_Function_Tags();
 
@@ -1197,18 +1173,26 @@ void Startup_Core(void)
     // includes the type list, word list, error message templates, system
     // object, mezzanines, etc.
 
-    REBSER *utf8 = Decompress(
-        Native_Specs, NAT_COMPRESSED_SIZE, NAT_UNCOMPRESSED_SIZE, FALSE, FALSE
+    const REBOOL gzip = FALSE;
+    const REBOOL raw = FALSE;
+    const REBOOL only = FALSE;
+    REBSER *utf8 = Inflate_To_Series(
+        Native_Specs,
+        NAT_COMPRESSED_SIZE,
+        NAT_UNCOMPRESSED_SIZE,
+        gzip,
+        raw,
+        only
     );
     if (utf8 == NULL || SER_LEN(utf8) != NAT_UNCOMPRESSED_SIZE)
         panic ("decompressed native specs size mismatch (try `make clean`)");
 
-    const char *tmp_boot_utf8 = "tmp-boot.r";
-    REBSTR *tmp_boot_filename = Intern_UTF8_Managed(
-        cb_cast(tmp_boot_utf8), strlen(tmp_boot_utf8)
-    );
-    REBARR *boot_array = Scan_UTF8_Managed(
-        BIN_HEAD(utf8), NAT_UNCOMPRESSED_SIZE, tmp_boot_filename
+    // Use Scan_Va_Managed() not because it's actually variadic, but because
+    // there are currently no other usages of the function (rigorous builds
+    // notice when things are defined and not used).
+    //
+    REBARR *boot_array = Scan_Va_Managed(
+        STR("tmp-boot.r"), BIN_HEAD(utf8), END
     );
     PUSH_GUARD_ARRAY(boot_array); // managed, so must be guarded
 
@@ -1219,6 +1203,14 @@ void Startup_Core(void)
     Startup_Symbols(VAL_ARRAY(&boot->words));
 
     // STR_SYMBOL(), VAL_WORD_SYM() and Canon(SYM_XXX) now available
+
+    // !!! There is an idea that so-called "Root" and "Task" variables might
+    // be held onto API nodes, whose lifetime is indefinite until program
+    // shutdown.  If that were the case then the API should be started up
+    // early...it depends on when the codebase is presumed free to start
+    // using rebXxxYyy() functions.
+    //
+    Startup_Api();
 
     PG_Boot_Phase = BOOT_LOADED;
 
@@ -1259,14 +1251,19 @@ void Startup_Core(void)
     Startup_True_And_False();
     Add_Lib_Keys_R3Alpha_Cant_Make();
 
-    Prep_Global_Cell(&Callback_Error);
-    Init_Unreadable_Blank(&Callback_Error);
-
 //==//////////////////////////////////////////////////////////////////////==//
 //
 // RUN CODE BEFORE ERROR HANDLING INITIALIZED
 //
 //==//////////////////////////////////////////////////////////////////////==//
+
+    // Initialize the "Do" handler to the default, Do_Core(), and the "Apply"
+    // of a FUNCTION! handler to Apply_Core().  These routines have no
+    // tracing, no debug handling, etc.  If those features are needed, an
+    // augmented function must be substituted.
+    //
+    PG_Do = &Do_Core;
+    PG_Apply = &Apply_Core;
 
     // boot->natives is from the automatically gathered list of natives found
     // by scanning comments in the C sources for `native: ...` declarations.
@@ -1398,9 +1395,9 @@ void Startup_Core(void)
 // Returns error from finalizing or NULL.
 //
 REBCTX *Startup_Mezzanine(
-    REBVAL *base_block,
-    REBVAL *sys_block,
-    REBVAL *mezz_block
+    RELVAL *base_block,
+    RELVAL *sys_block,
+    RELVAL *mezz_block
 ) {
     REBCTX *error;
     struct Reb_State state;
@@ -1423,12 +1420,13 @@ REBCTX *Startup_Mezzanine(
     // copy with some omissions), and where the mezzanine definitions are
     // bound to the lib context and DO'd.
     //
+    const REBOOL fully = TRUE; // error if all arguments aren't consumed
     DECLARE_LOCAL (result);
     if (Apply_Only_Throws(
         result,
-        TRUE, // generate error if all arguments aren't consumed
+        fully,
         Sys_Func(SYS_CTX_FINISH_INIT_CORE), // %sys-start.r function to call
-        mezz_block, // boot-mezz argument
+        KNOWN(mezz_block), // boot-mezz argument
         END
     )) {
         return Error_No_Catch_For_Throw(result);
@@ -1496,10 +1494,12 @@ void Shutdown_Core(void)
 
     Shutdown_Event_Scheme();
     Shutdown_CRC();
+    Shutdown_String();
     Shutdown_Mold();
     Shutdown_Scanner();
     Shutdown_Char_Cases();
 
+    Shutdown_Api();
     Shutdown_Symbols();
     Shutdown_Interning();
 

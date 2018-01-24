@@ -50,6 +50,29 @@
 // matches the set count.
 //
 
+inline static REBOOL Same_Binding(void *a_ptr, void *b_ptr) {
+    REBNOD *a = NOD(a_ptr);
+    REBNOD *b = NOD(b_ptr);
+    if (a == b)
+        return TRUE;
+    if (a->header.bits & NODE_FLAG_CELL) {
+        if (b->header.bits & NODE_FLAG_CELL)
+            return FALSE;
+        REBFRM *f_a = cast(REBFRM*, a);
+        if (f_a->varlist != NULL && NOD(f_a->varlist) == b)
+            return TRUE;
+        return FALSE;
+    }
+    if (b->header.bits & NODE_FLAG_CELL) {
+        REBFRM *f_b = cast(REBFRM*, b);
+        if (f_b->varlist != NULL && NOD(f_b->varlist) == a)
+            return TRUE;
+        return FALSE;
+    }
+    return FALSE;
+}
+
+
 // Modes allowed by Bind related functions:
 enum {
     BIND_0 = 0, // Only bind the words found in the context.
@@ -63,13 +86,29 @@ struct Reb_Binder {
 #if !defined(NDEBUG)
     REBCNT count;
 #endif
+
+#if defined(CPLUSPLUS_11)
+    //
+    // The C++ debug build can help us make sure that no binder ever fails to
+    // get an INIT_BINDER() and SHUTDOWN_BINDER() pair called on it, which
+    // would leave lingering binding values on REBSER nodes.
+    //
+    REBOOL initialized;
+    Reb_Binder () { initialized = FALSE; }
+    ~Reb_Binder () { assert(initialized == FALSE); }
+#endif
 };
 
 
 inline static void INIT_BINDER(struct Reb_Binder *binder) {
     binder->high = TRUE; //LOGICAL(SPORADICALLY(2)); sporadic?
+
 #if !defined(NDEBUG)
     binder->count = 0;
+
+    #ifdef CPLUSPLUS_11
+        binder->initialized = TRUE;
+    #endif
 #endif
 }
 
@@ -79,6 +118,10 @@ inline static void SHUTDOWN_BINDER(struct Reb_Binder *binder) {
     UNUSED(binder);
 #else
     assert(binder->count == 0);
+
+    #ifdef CPLUSPLUS_11
+        binder->initialized = FALSE;
+    #endif
 #endif
 }
 
@@ -93,14 +136,14 @@ inline static REBOOL Try_Add_Binder_Index(
     assert(index != 0);
     assert(GET_SER_INFO(canon, STRING_INFO_CANON));
     if (binder->high) {
-        if (canon->misc.bind_index.high != 0)
+        if (MISC(canon).bind_index.high != 0)
             return FALSE;
-        canon->misc.bind_index.high = index;
+        MISC(canon).bind_index.high = index;
     }
     else {
-        if (canon->misc.bind_index.low != 0)
+        if (MISC(canon).bind_index.low != 0)
             return FALSE;
-        canon->misc.bind_index.low = index;
+        MISC(canon).bind_index.low = index;
     }
 
 #if !defined(NDEBUG)
@@ -125,20 +168,20 @@ inline static void Add_Binder_Index(
 }
 
 
-inline static REBINT Try_Get_Binder_Index( // 0 if not present
+inline static REBINT Get_Binder_Index_Else_0( // 0 if not present
     struct Reb_Binder *binder,
     REBSTR *canon
 ){
     assert(GET_SER_INFO(canon, STRING_INFO_CANON));
 
     if (binder->high)
-        return canon->misc.bind_index.high;
+        return MISC(canon).bind_index.high;
     else
-        return canon->misc.bind_index.low;
+        return MISC(canon).bind_index.low;
 }
 
 
-inline static REBINT Try_Remove_Binder_Index( // 0 if failure, else old index
+inline static REBINT Remove_Binder_Index_Else_0( // return old value if there
     struct Reb_Binder *binder,
     REBSTR *canon
 ){
@@ -146,16 +189,16 @@ inline static REBINT Try_Remove_Binder_Index( // 0 if failure, else old index
 
     REBINT old_index;
     if (binder->high) {
-        old_index = canon->misc.bind_index.high;
+        old_index = MISC(canon).bind_index.high;
         if (old_index == 0)
             return 0;
-        canon->misc.bind_index.high = 0;
+        MISC(canon).bind_index.high = 0;
     }
     else {
-        old_index = canon->misc.bind_index.low;
+        old_index = MISC(canon).bind_index.low;
         if (old_index == 0)
             return 0;
-        canon->misc.bind_index.low = 0;
+        MISC(canon).bind_index.low = 0;
     }
 
 #if !defined(NDEBUG)
@@ -169,7 +212,7 @@ inline static void Remove_Binder_Index(
     struct Reb_Binder *binder,
     REBSTR *canon
 ){
-    REBINT old_index = Try_Remove_Binder_Index(binder, canon);
+    REBINT old_index = Remove_Binder_Index_Else_0(binder, canon);
 
 #if defined(NDEBUG)
     UNUSED(old_index);
@@ -185,8 +228,124 @@ enum {
     COLLECT_ANY_WORD = 1 << 1,
     COLLECT_DEEP = 1 << 2,
     COLLECT_NO_DUP = 1 << 3, // Do not allow dups during collection (for specs)
-    COLLECT_ENSURE_SELF = 1 << 4 // !!! Ensure SYM_SELF in context (temp)
+    COLLECT_ENSURE_SELF = 1 << 4, // !!! Ensure SYM_SELF in context (temp)
+    COLLECT_AS_TYPESET = 1 << 5
 };
+
+struct Reb_Collector {
+    REBFLGS flags;
+    REBDSP dsp_orig;
+    struct Reb_Binder binder;
+    REBCNT index;
+};
+
+
+//=////////////////////////////////////////////////////////////////////////=//
+//
+//  COPYING RELATIVE VALUES TO SPECIFIC
+//
+//=////////////////////////////////////////////////////////////////////////=//
+//
+// This can be used to turn a RELVAL into a REBVAL.  If the RELVAL is indeed
+// relative and needs to be made specific to be put into the target, then the
+// specifier is used to do that.
+//
+// It is nearly as fast as just assigning the value directly in the release
+// build, though debug builds assert that the function in the specifier
+// indeed matches the target in the relative value (because relative values
+// in an array may only be relative to the function that deep copied them, and
+// that is the only kind of specifier you can use with them).
+//
+// Interface designed to line up with Move_Value()
+//
+
+inline static REBVAL *Derelativize(
+    RELVAL *out, // relative destinations are overwritten with specified value
+    const RELVAL *v,
+    REBSPC *specifier
+){
+    Move_Value_Header(out, v);
+
+    if (IS_SPECIFIC(v))
+        out->extra = v->extra;
+    else {
+        assert(ANY_WORD(v) || ANY_ARRAY(v));
+
+    #if !defined(NDEBUG)
+        if (specifier == SPECIFIED) {
+            printf("Relative item used with SPECIFIED\n");
+            panic (v);
+        }
+    #endif
+
+        if (specifier->header.bits & NODE_FLAG_CELL) {
+            REBFRM *f = cast(REBFRM*, specifier);
+
+        #if !defined(NDEBUG)
+            if (VAL_RELATIVE(v) != FRM_UNDERLYING(f)) {
+                printf("Function mismatch in specific binding (TBD)\n");
+                printf("Panic on relative value\n");
+                panic(v);
+            }
+        #endif
+
+            // !!! Very conservatively reify.  Should share logic with the
+            // innards of Move_Value().  Should specifier always be passed
+            // in writable so it can be updated too?
+            //
+            INIT_BINDING(out, Context_For_Frame_May_Reify_Managed(f));
+        }
+        else {
+        #if !defined(NDEBUG)
+            if (
+                VAL_RELATIVE(v) !=
+                VAL_FUNC(CTX_FRAME_FUNC_VALUE(CTX(specifier)))
+            ){
+                printf("Function mismatch in specific binding, expected:\n");
+                PROBE(FUNC_VALUE(VAL_RELATIVE(v)));
+                printf("Panic on relative value\n");
+                panic (v);
+            }
+        #endif
+            INIT_BINDING(out, specifier);
+        }
+    }
+
+    out->payload = v->payload;
+
+    // in case the caller had a relative value slot and wants to use its
+    // known non-relative form... this is inline, so no cost if not used.
+    //
+    return KNOWN(out);
+}
+
+
+// In the C++ build, defining this overload that takes a REBVAL* instead of
+// a RELVAL*, and then not defining it...will tell you that you do not need
+// to use Derelativize.  Juse Move_Value() if your source is a REBVAL!
+//
+#ifdef CPLUSPLUS_11
+    REBVAL *Derelativize(RELVAL *dest, const REBVAL *v, REBSPC *specifier);
+#endif
+
+
+inline static void DS_PUSH_RELVAL(const RELVAL *v, REBSPC *specifier) {
+    ASSERT_VALUE_MANAGED(v); // would fail on END marker
+    DS_PUSH_TRASH;
+    Derelativize(DS_TOP, v, specifier);
+}
+
+inline static void DS_PUSH_RELVAL_KEEP_EVAL_FLIP(
+    const RELVAL *v,
+    REBSPC *specifier
+){
+    ASSERT_VALUE_MANAGED(v); // would fail on END marker
+    DS_PUSH_TRASH;
+    REBOOL flip = GET_VAL_FLAG(v, VALUE_FLAG_EVAL_FLIP);
+    Derelativize(DS_TOP, v, specifier);
+    if (flip)
+        SET_VAL_FLAG(DS_TOP, VALUE_FLAG_EVAL_FLIP);
+}
 
 
 //=////////////////////////////////////////////////////////////////////////=//
@@ -241,11 +400,32 @@ inline static REBVAL *Get_Var_Core(
     REBSPC *specifier,
     REBFLGS flags
 ) {
-    REBCTX *context;
-
     assert(ANY_WORD(any_word));
 
-    if (GET_VAL_FLAG(any_word, VALUE_FLAG_RELATIVE)) {
+    REBNOD *binding = VAL_BINDING(any_word);
+
+    if (binding->header.bits & NODE_FLAG_CELL) {
+        //
+        // DIRECT BINDING: This will be the case hit when a REBFRM* is used
+        // in a word's binding.  The frame should still be on the stack.
+        //
+        REBFRM *f = cast(REBFRM*, binding);
+        REBVAL *var = FRM_ARG(f, VAL_WORD_INDEX(any_word));
+
+        if (flags & GETVAR_MUTABLE) {
+            if (f->flags.bits & DO_FLAG_NATIVE_HOLD)
+                fail (Error(RE_PROTECTED_WORD, any_word)); // different error?
+            
+            if (GET_VAL_FLAG(var, CELL_FLAG_PROTECTED))
+                fail (Error(RE_PROTECTED_WORD, any_word));
+        }
+
+        return var;
+    }
+
+    REBCTX *context;
+
+    if (binding->header.bits & ARRAY_FLAG_PARAMLIST) {
         //
         // RELATIVE BINDING: The word was made during a deep copy of the block
         // that was given as a function's body, and stored a reference to that
@@ -253,7 +433,6 @@ inline static REBVAL *Get_Var_Core(
         // find the right function call on the stack (if any) for the word to
         // refer to (the FRAME!)
         //
-        assert(GET_VAL_FLAG(any_word, WORD_FLAG_BOUND)); // should be set too
 
     #if !defined(NDEBUG)
         if (specifier == SPECIFIED) {
@@ -262,13 +441,30 @@ inline static REBVAL *Get_Var_Core(
         }
     #endif
 
-        context = CTX(specifier);
+        if (specifier->header.bits & NODE_FLAG_CELL) {
+            REBFRM *f = cast(REBFRM*, specifier);
 
-        assert(
-            VAL_WORD_FUNC(any_word) == VAL_FUNC(CTX_FRAME_FUNC_VALUE(context))
-        );
+            assert(Same_Binding(FRM_UNDERLYING(f), binding));
+
+            REBVAL *var = FRM_ARG(f, VAL_WORD_INDEX(any_word));
+
+            if (flags & GETVAR_MUTABLE) {
+                if (f->flags.bits & DO_FLAG_NATIVE_HOLD)
+                    fail (Error(RE_PROTECTED_WORD, any_word)); // different?
+            
+                if (GET_VAL_FLAG(var, CELL_FLAG_PROTECTED))
+                    fail (Error(RE_PROTECTED_WORD, any_word));
+            }
+
+            return var;
+        }
+
+        context = CTX(specifier);
+        REBFUN *frm_func = VAL_FUNC(CTX_FRAME_FUNC_VALUE(context));
+        assert(Same_Binding(binding, frm_func));
+        UNUSED(frm_func);
     }
-    else if (GET_VAL_FLAG(any_word, WORD_FLAG_BOUND)) {
+    else if (binding->header.bits & ARRAY_FLAG_VARLIST) {
         //
         // SPECIFIC BINDING: The context the word is bound to is explicitly
         // contained in the `any_word` REBVAL payload.  Just extract it.
@@ -282,46 +478,43 @@ inline static REBVAL *Get_Var_Core(
     else {
         // UNBOUND: No variable location to retrieve.
 
-        if (flags & GETVAR_END_IF_UNAVAILABLE)
-            return m_cast(REBVAL*, END); // only const callers should use
-
-        fail (Error_Not_Bound_Raw(any_word));
-    }
-
-    REBCNT index = VAL_WORD_INDEX(any_word);
-    assert(index != 0);
-
-    REBVAL *key = CTX_KEY(context, index);
-#ifdef NDEBUG
-    UNUSED(key);
-#else
-    assert(VAL_WORD_CANON(any_word) == VAL_KEY_CANON(key));
-#endif
-
-    if (CTX_VARS_UNAVAILABLE(context)) {
-        //
-        // Currently if a context has a stack component, then the vars
-        // are "all stack"...so when that level is popped, all the vars
-        // will be unavailable.  There is a <durable> mechanism, but that
-        // makes all the variables come from an ordinary pool-allocated
-        // series.  Hybrid approaches which have "some stack and some
-        // durable" will be possible in the future, as a context can
-        // mechanically have both stackvars and a dynamic data pointer.
+        assert(binding == UNBOUND);
 
         if (flags & GETVAR_END_IF_UNAVAILABLE)
             return m_cast(REBVAL*, END); // only const callers should use
 
         DECLARE_LOCAL (unbound);
-        Init_Any_Word(
-            unbound,
-            VAL_TYPE(any_word),
-            VAL_WORD_SPELLING(any_word)
-        );
-
-        fail (Error_No_Relative_Raw(unbound));
+        Init_Word(unbound, VAL_WORD_SPELLING(any_word));
+        fail (Error_Not_Bound_Raw(unbound));
     }
 
-    REBVAL *var = CTX_VAR(context, index);
+    if (CTX_VARS_UNAVAILABLE(context)) {
+        //
+        // Currently the storage for variables in a function frame are all
+        // located on the chunk stack.  So when that level is popped, all the
+        // vars will be unavailable.
+        //
+        // Historically the system became involved with something known as a
+        // CLOSURE!, which used non-stack storage (like an OBJECT!) for all of
+        // its arguments and locals.  One aspect of closures was that
+        // recursions could uniquely identify their bindings (which is now a
+        // feature of all functions).  But the other aspect was indefinite
+        // lifetime of word bindings "leaked" after the closure was finished.
+        //
+        // The idea of allowing a single REBSER node to serve for both a
+        // durable portion and a stack-lifetime portion of a FRAME! is on the
+        // table, but not currently implemented.
+
+        if (flags & GETVAR_END_IF_UNAVAILABLE)
+            return m_cast(REBVAL*, END); // only const callers should use
+
+        fail (Error_No_Relative_Core(any_word));
+    }
+
+    REBCNT i = VAL_WORD_INDEX(any_word);
+    REBVAL *var = CTX_VAR(context, i);
+
+    assert(VAL_WORD_CANON(any_word) == VAL_KEY_CANON(CTX_KEY(context, i)));
 
     if (flags & GETVAR_MUTABLE) {
         //
@@ -337,9 +530,11 @@ inline static REBVAL *Get_Var_Core(
         // The PROTECT command has a finer-grained granularity for marking
         // not just contexts, but individual fields as protected.
         //
-        if (GET_VAL_FLAG(var, VALUE_FLAG_PROTECTED))
-            fail (Error_Protected_Word_Raw(any_word));
-
+        if (GET_VAL_FLAG(var, CELL_FLAG_PROTECTED)) {
+            DECLARE_LOCAL (unwritable);
+            Derelativize(unwritable, any_word, specifier);
+            fail (Error_Protected_Word_Raw(unwritable));
+        }
     }
 
     assert(!THROWN(var));
@@ -410,91 +605,6 @@ inline static REBSPC *Derive_Specifier(REBSPC *parent, const RELVAL *child) {
 }
 
 
-//=////////////////////////////////////////////////////////////////////////=//
-//
-//  COPYING RELATIVE VALUES TO SPECIFIC
-//
-//=////////////////////////////////////////////////////////////////////////=//
-//
-// This can be used to turn a RELVAL into a REBVAL.  If the RELVAL is indeed
-// relative and needs to be made specific to be put into the target, then the
-// specifier is used to do that.
-//
-// It is nearly as fast as just assigning the value directly in the release
-// build, though debug builds assert that the function in the specifier
-// indeed matches the target in the relative value (because relative values
-// in an array may only be relative to the function that deep copied them, and
-// that is the only kind of specifier you can use with them).
-//
-// Interface designed to line up with Move_Value()
-//
-
-inline static REBVAL *Derelativize(
-    RELVAL *out, // relative destinations are overwritten with specified value
-    const RELVAL *v,
-    REBSPC *specifier
-) {
-    assert(NOT_END(v));
-    assert(!IS_TRASH_DEBUG(v));
-
-    ASSERT_CELL_WRITABLE(out, __FILE__, __LINE__);
-
-    out->header.bits &= CELL_MASK_RESET;
-
-    if (IS_RELATIVE(v)) {
-    #if !defined(NDEBUG)
-        assert(ANY_WORD(v) || ANY_ARRAY(v));
-        if (specifier == SPECIFIED) {
-            printf("Relative item used with SPECIFIED\n");
-            panic (v);
-        }
-        else if (
-            VAL_RELATIVE(v)
-            != VAL_FUNC(CTX_FRAME_FUNC_VALUE(CTX(specifier)))
-        ){
-            printf("Function mismatch in specific binding, expected:\n");
-            PROBE(FUNC_VALUE(VAL_RELATIVE(v)));
-            printf("Panic on relative value\n");
-            panic (v);
-        }
-    #endif
-
-        out->header.bits |=
-            v->header.bits
-            & CELL_MASK_COPY
-            & ~cast(REBUPT, VALUE_FLAG_RELATIVE); // !!! flag is going away
-
-        out->extra.binding = cast(REBARR*, specifier);
-    }
-    else {
-        out->header.bits |= v->header.bits & CELL_MASK_COPY;
-        out->extra.binding = v->extra.binding;
-    }
-    out->payload = v->payload;
-
-    // in case the caller had a relative value slot and wants to use its
-    // known non-relative form... this is inline, so no cost if not used.
-    //
-    return KNOWN(out);
-}
-
-
-// In the C++ build, defining this overload that takes a REBVAL* instead of
-// a RELVAL*, and then not defining it...will tell you that you do not need
-// to use Derelativize.  Juse Move_Value() if your source is a REBVAL!
-//
-#ifdef __cplusplus
-    REBVAL *Derelativize(RELVAL *dest, const REBVAL *v, REBSPC *specifier);
-#endif
-
-
-inline static void DS_PUSH_RELVAL(const RELVAL *v, REBSPC *specifier) {
-    ASSERT_VALUE_MANAGED(v); // would fail on END marker
-    DS_PUSH_TRASH;
-    Derelativize(DS_TOP, v, specifier);
-}
-
-
 //
 // BINDING CONVENIENCE MACROS
 //
@@ -541,3 +651,4 @@ inline static void DS_PUSH_RELVAL(const RELVAL *v, REBSPC *specifier) {
 
 #define Unbind_Values_Deep(values) \
     Unbind_Values_Core((values), NULL, TRUE)
+

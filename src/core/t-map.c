@@ -49,10 +49,10 @@ REBINT CT_Map(const RELVAL *a, const RELVAL *b, REBINT mode)
 // Capacity is measured in key-value pairings.
 // A hash series is also created.
 //
-static REBMAP *Make_Map(REBCNT capacity)
+REBMAP *Make_Map(REBCNT capacity)
 {
     REBARR *pairlist = Make_Array_Core(capacity * 2, ARRAY_FLAG_PAIRLIST);
-    SER(pairlist)->link.hashlist = Make_Hash_Sequence(capacity);
+    LINK(pairlist).hashlist = Make_Hash_Sequence(capacity);
 
     return MAP(pairlist);
 }
@@ -179,7 +179,7 @@ REBINT Find_Key_Hashed(
         hash = zombie;
         n = hashes[hash];
         // new key overwrite zombie
-        *ARR_AT(array, (n - 1) * wide) = *key;
+        Derelativize(ARR_AT(array, (n - 1) * wide), key, specifier);
     }
     // Append new value the target series:
     if (mode > 1) {
@@ -280,7 +280,7 @@ void Expand_Hash(REBSER *ser)
 //
 // RETURNS: the index to the VALUE or zero if there is none.
 //
-static REBCNT Find_Map_Entry(
+REBCNT Find_Map_Entry(
     REBMAP *map,
     const RELVAL *key,
     REBSPC *key_specifier,
@@ -318,8 +318,11 @@ static REBCNT Find_Map_Entry(
     // a SET must always be done with an immutable key...because if it were
     // changed, there'd be no notification to rehash the map.
     //
-    if (!Is_Value_Immutable(key))
-        fail (Error_Map_Key_Unlocked_Raw(key));
+    if (!Is_Value_Immutable(key)) {
+        DECLARE_LOCAL (unlocked);
+        Derelativize(unlocked, key, key_specifier);
+        fail (Error_Map_Key_Unlocked_Raw(unlocked));
+    }
 
     // Must set the value:
     if (n) {  // re-set it:
@@ -346,41 +349,42 @@ static REBCNT Find_Map_Entry(
 //
 //  PD_Map: C
 //
-REBINT PD_Map(REBPVS *pvs)
+REB_R PD_Map(REBPVS *pvs, const REBVAL *picker, const REBVAL *opt_setval)
 {
-    REBOOL setting = LOGICAL(pvs->opt_setval && IS_END(pvs->item + 1));
+    assert(IS_MAP(pvs->out));
 
-    assert(IS_MAP(pvs->value));
+    if (opt_setval != NULL)
+        FAIL_IF_READ_ONLY_SERIES(VAL_SERIES(pvs->out));
 
-    if (setting)
-        FAIL_IF_READ_ONLY_SERIES(VAL_SERIES(pvs->value));
+    // Use case sensitivity when setting only
+    //
+    REBOOL cased = LOGICAL(opt_setval != NULL);
 
     REBINT n = Find_Map_Entry(
-        VAL_MAP(pvs->value),
-        pvs->picker,
+        VAL_MAP(pvs->out),
+        picker,
         SPECIFIED,
-        setting ? pvs->opt_setval : NULL,
+        opt_setval,
         SPECIFIED,
-        setting // `cased` flag for case-sensitivity--use when setting only
+        cased
     );
 
-    if (n == 0) {
-        Init_Void(pvs->store);
-        return PE_USE_STORE;
+    if (opt_setval != NULL) {
+        assert(n != 0);
+        return R_INVISIBLE;
     }
+
+    if (n == 0)
+        return R_VOID;
 
     REBVAL *val = KNOWN(
-        ARR_AT(MAP_PAIRLIST(VAL_MAP(pvs->value)), ((n - 1) * 2) + 1)
+        ARR_AT(MAP_PAIRLIST(VAL_MAP(pvs->out)), ((n - 1) * 2) + 1)
     );
-    if (IS_VOID(val)) {
-        Init_Void(pvs->store);
-        return PE_USE_STORE;
-    }
+    if (IS_VOID(val)) // zombie entry, means unused
+        return R_VOID;
 
-    pvs->value = val;
-    pvs->value_specifier = SPECIFIED;
-
-    return PE_OK;
+    Move_Value(pvs->out, val);
+    return R_OUT;
 }
 
 
@@ -592,6 +596,56 @@ REBCTX *Alloc_Context_From_Map(REBMAP *map)
 
 
 //
+//  MF_Map: C
+//
+void MF_Map(REB_MOLD *mo, const RELVAL *v, REBOOL form)
+{
+    REBMAP *m = VAL_MAP(v);
+
+    // Prevent endless mold loop:
+    if (Find_Pointer_In_Series(TG_Mold_Stack, m) != NOT_FOUND) {
+        Append_Unencoded(mo->series, "...]");
+        return;
+    }
+
+    Push_Pointer_To_Series(TG_Mold_Stack, m);
+
+    if (NOT(form)) {
+        Pre_Mold(mo, v);
+        Append_Codepoint(mo->series, '[');
+    }
+
+    // Mold all entries that are set.  As with contexts, void values are not
+    // valid entries but indicate the absence of a value.
+    //
+    mo->indent++;
+
+    RELVAL *key = ARR_HEAD(MAP_PAIRLIST(m));
+    for (; NOT_END(key); key += 2) {
+        assert(NOT_END(key + 1)); // value slot must not be END
+        if (IS_VOID(key + 1))
+            continue; // if value for this key is void, key has been removed
+
+        if (NOT(form))
+            New_Indented_Line(mo);
+        Emit(mo, "V V", key, key + 1);
+        if (form)
+            Append_Codepoint(mo->series, '\n');
+    }
+    mo->indent--;
+
+    if (NOT(form)) {
+        New_Indented_Line(mo);
+        Append_Codepoint(mo->series, ']');
+    }
+
+    End_Mold(mo);
+
+    Drop_Pointer_From_Series(TG_Mold_Stack, m);
+}
+
+
+//
 //  REBTYPE: C
 //
 REBTYPE(Map)
@@ -603,6 +657,40 @@ REBTYPE(Map)
     REBCNT tail;
 
     switch (action) {
+
+    case SYM_REFLECT: {
+        INCLUDE_PARAMS_OF_REFLECT;
+
+        UNUSED(ARG(value)); // covered by `val`
+        REBSYM property = VAL_WORD_SYM(ARG(property));
+        assert(property != SYM_0);
+
+        switch (property) {
+        case SYM_LENGTH:
+            Init_Integer(D_OUT, Length_Map(map));
+            return R_OUT;
+
+        case SYM_VALUES:
+            Init_Block(D_OUT, Map_To_Array(map, 1));
+            return R_OUT;
+
+        case SYM_WORDS:
+            Init_Block(D_OUT, Map_To_Array(map, -1));
+            return R_OUT;
+
+        case SYM_BODY:
+            Init_Block(D_OUT, Map_To_Array(map, 0));
+            return R_OUT;
+
+        case SYM_TAIL_Q:
+            return R_FROM_BOOL(LOGICAL(Length_Map(map) == 0));
+
+        default:
+            break;
+        }
+
+        fail (Error_Cannot_Reflect(REB_MAP, arg)); }
+
     case SYM_FIND:
     case SYM_SELECT_P: {
         INCLUDE_PARAMS_OF_FIND;
@@ -701,10 +789,6 @@ REBTYPE(Map)
         );
         return R_OUT; }
 
-    case SYM_LENGTH_OF:
-        Init_Integer(D_OUT, Length_Map(map));
-        return R_OUT;
-
     case SYM_COPY: {
         INCLUDE_PARAMS_OF_COPY;
 
@@ -738,27 +822,6 @@ REBTYPE(Map)
 
         Init_Map(D_OUT, map);
         return R_OUT;
-
-    case SYM_REFLECT: {
-        REBSYM sym = VAL_WORD_SYM(arg);
-
-        REBINT n;
-        if (sym == SYM_VALUES)
-            n = 1;
-        else if (sym == SYM_WORDS)
-            n = -1;
-        else if (sym == SYM_BODY)
-            n = 0;
-        else
-            fail (Error_Cannot_Reflect(REB_MAP, arg));
-
-        REBARR *array = Map_To_Array(map, n);
-        Init_Block(D_OUT, array);
-        return R_OUT;
-    }
-
-    case SYM_TAIL_Q:
-        return (Length_Map(map) == 0) ? R_TRUE : R_FALSE;
 
     default:
         break;

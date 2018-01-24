@@ -22,7 +22,7 @@ start-response: func [port res <local> code text type body] [
     write port unspaced [
         "HTTP/1.0" space code space code-map/:code crlf
         "Content-type:" space type crlf
-        "Content-length:" space length? body crlf
+        "Content-length:" space length of body crlf
         crlf
     ]
     ;; Manual chunking is only necessary because of several bugs in R3's
@@ -45,10 +45,10 @@ send-chunk: func [port] [
 
 handle-request: function [config req] [
     parse to-string req ["get " ["/ " | copy uri: to " "]]
-    uri: default "index.html"
+    uri: default ["index.html"]
     print ["URI:" uri]
     parse uri [some [thru "."] copy ext to end (type: mime-map/:ext)]
-    type: default "application/octet-stream"
+    type: default ["application/octet-stream"]
     if not exists? file: config/root/:uri [return error-response 404 uri]
     if error? try [data: read file] [return error-response 400 uri]
     reduce [200 type data]
